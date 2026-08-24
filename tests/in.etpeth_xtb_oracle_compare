@@ -1,0 +1,55 @@
+# Evaluate the complete ETP/ETH frame without dynamics, restraints, or
+# thermostat forces.  The companion Python runner compares this production
+# xTBloom path with an independently generated AmberTools/xTB binary64 label.
+
+clear
+plugin load ${dprc_plugin}
+units real
+dimension 3
+boundary p p p
+atom_style full
+atom_modify map array
+
+read_data ${data_file}
+reset_timestep 0
+group qm id 1:16
+# A command-line displacement permits central finite differences without
+# rewriting the hash-pinned data file.  Baseline callers pass exactly zero.
+variable atom1_x_delta equal ${atom1_x_displacement}
+set atom 1 x $(x[1]+v_atom1_x_delta)
+
+bond_style harmonic
+angle_style harmonic
+pair_style hybrid/overlay ${lj_style} 9.0 &
+  ${tip4p_style} 6 7 1 1 0.125 9.0
+include ${forcefield_file}
+pair_coeff 6*7 6*7 ${tip4p_style}
+pair_modify pair ${lj_style} tail yes
+special_bonds amber
+kspace_style ${kspace_style} 1.0e-6
+kspace_modify mesh 50 50 50 order 4 gewald 0.348831617901729
+
+fix qmmm qm ${qmmm_style} elements P O O C H O H cutoff 9.0 charge -2 &
+  uhf 0 method gfn2 accuracy 0.001 maxiter 250 etemp 300.0 mmhardness 0.0 &
+  kmax 8 8 8 ksqmax 100
+fix_modify qmmm energy yes
+
+neighbor 0.05 bin
+neigh_modify every 1 delay 0 check yes
+compute config_pressure all pressure NULL virial
+thermo 1
+thermo_style custom step pe f_qmmm evdwl etail ecoul elong ebond eangle &
+  c_config_pressure[1] c_config_pressure[2] c_config_pressure[3] &
+  c_config_pressure[4] c_config_pressure[5] c_config_pressure[6]
+thermo_modify format float %.17g lost error flush yes
+
+run 0 post no
+write_dump all custom ${dump_file} id type q xu yu zu fx fy fz &
+  modify sort id format float %.17g
+print "energy=$(pe:%.17g) correction=$(f_qmmm:%.17g) &
+pxx=$(c_config_pressure[1]:%.17g) pyy=$(c_config_pressure[2]:%.17g) &
+pzz=$(c_config_pressure[3]:%.17g) pxy=$(c_config_pressure[4]:%.17g) &
+pxz=$(c_config_pressure[5]:%.17g) pyz=$(c_config_pressure[6]:%.17g) &
+lx=$(lx:%.17g) ly=$(ly:%.17g) lz=$(lz:%.17g) &
+xy=$(xy:%.17g) xz=$(xz:%.17g) yz=$(yz:%.17g)" &
+  file ${result_file} screen no

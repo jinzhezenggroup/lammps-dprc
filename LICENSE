@@ -1,0 +1,14 @@
+Copyright (c) 2026 Jinzhe Zeng. All rights reserved.
+
+No license is currently granted to redistribute this repository or binaries
+produced from it. The initial repository is intended for private research and
+evaluation while the distribution boundary is resolved.
+
+In particular, the intended combined runtime uses LAMMPS, which identifies
+itself as GPL version 2, and xTBloom, which is GPL-3.0-or-later. Dynamic loading
+does not by itself resolve compatibility between those licenses. Do not
+distribute a combined binary or claim a redistribution license until the
+copyright owner has recorded an explicit licensing decision.
+
+This notice does not change or replace the licenses of LAMMPS, xTBloom,
+DeePMD-kit, CUDA, MPI, or any other dependency. See THIRD_PARTY_NOTICES.md.

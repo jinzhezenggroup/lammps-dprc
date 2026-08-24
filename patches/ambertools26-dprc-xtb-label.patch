@@ -1,0 +1,284 @@
+--- a/AmberTools/src/sander/runmd.F90
++++ b/AmberTools/src/sander/runmd.F90
+@@ -59,6 +59,8 @@
+                          dprc_label64_prefix, dprc_input_ntc, dprc_input_ntf
+   use quick_module, only : quick_qmmm_call_count, &
+                            quick_dprc_label_configuration_is_qualified
++  use xtb_module, only : xtb_qmmm_call_count, &
++                         xtb_dprc_label_configuration_is_qualified
+   use cns_xref, only : is_xref_on
+ #ifdef DSSP
+   use dssp, only : idssp
+@@ -375,11 +377,11 @@
+   logical ixdump, ivdump, itdump, ifdump
+   logical qsetup
+   _REAL_, allocatable, dimension(:) :: f_or
+-  logical :: dprc_label_enabled
++  logical :: dprc_label_enabled, dprc_label_xtb
+   integer :: dprc_env_length, dprc_env_status, dprc_io_status, dprc_unit
+   integer(c_int) :: dprc_publish_status, dprc_cleanup_status
+   integer(int64) :: dprc_expected_size, dprc_actual_size, &
+-                    dprc_quick_calls_before
++                    dprc_quick_calls_before, dprc_xtb_calls_before
+   character(len=8), parameter :: dprc_label_magic = 'DPRCLBL1'
+   character(len=8), parameter :: dprc_trailer_magic = 'DPRCEND1'
+   integer(int32), parameter :: dprc_label_schema = 1_int32
+@@ -387,6 +389,7 @@
+   integer(int32), parameter :: dprc_tip4p_redistributed = 1_int32
+   character(len=1024) :: dprc_label_prefix, dprc_label_path, &
+                          dprc_label_partial_path
++  character(len=32) :: dprc_label_engine
+   character(len=256) :: dprc_io_message
+   interface
+     function dprc_posix_link(old_path, new_path) bind(C, name='link') result(status)
+@@ -568,7 +571,9 @@
+   ! is inspected here even though trajmd already stored it, so setting a label
+   ! prefix on any other runmd entry path is rejected rather than ignored.
+   dprc_label_enabled = .false.
++  dprc_label_xtb = .false.
+   dprc_quick_calls_before = quick_qmmm_call_count
++  dprc_xtb_calls_before = xtb_qmmm_call_count
+   if (master) then
+     dprc_label_prefix = ''
+     dprc_env_length = 0
+@@ -589,6 +594,37 @@
+       call mexit(6,1)
+     endif
+     if (dprc_label_enabled) then
++      ! Historical PBE0 qualification invocations did not set an engine tag,
++      ! so absence retains their exact QUICK-PBE0 meaning.  The low-level xTB
++      ! route is an explicit opt-in and every other value fails closed.
++      dprc_label_engine = ''
++      dprc_env_length = 0
++      call get_environment_variable('SANDER_DPRC_LABEL64_ENGINE', &
++           dprc_label_engine, length=dprc_env_length, status=dprc_env_status)
++      if (dprc_env_status == -1) then
++        write(6,'(a)') 'SANDER_DPRC_LABEL64_ENGINE exceeds 32 characters.'
++        call mexit(6,1)
++      else if (dprc_env_status == 1) then
++        dprc_label_engine = 'QUICK-PBE0'
++      else if (dprc_env_status /= 0) then
++        write(6,'(a,i0)') 'Could not inspect SANDER_DPRC_LABEL64_ENGINE; status=', &
++             dprc_env_status
++        call mexit(6,1)
++      else if (dprc_env_length == 0) then
++        write(6,'(a)') 'SANDER_DPRC_LABEL64_ENGINE must not be empty when set.'
++        call mexit(6,1)
++      endif
++      select case (trim(dprc_label_engine))
++      case ('QUICK-PBE0')
++        dprc_label_xtb = .false.
++      case ('XTB-GFN2')
++        dprc_label_xtb = .true.
++      case default
++        write(6,'(2a)') 'Unsupported SANDER_DPRC_LABEL64_ENGINE: ', &
++             trim(dprc_label_engine)
++        call mexit(6,1)
++      end select
++
+       if (trim(dprc_label_prefix) /= trim(dprc_label64_prefix) .or. &
+           dprc_frame64_index < 1_int64 .or. dprc_frame64_index > 999999_int64) then
+         write(6,'(a)') 'DPRc frame identity or output prefix changed after input validation.'
+@@ -611,11 +647,20 @@
+              ' ntf=', dprc_input_ntf
+         call mexit(6,1)
+       endif
+-      if (.not. qmmm_nml%ifqnt .or. .not. qmmm_nml%qmtheory%ISQUICK .or. &
+-          qmmm_nml%qmmm_int /= 1 .or. qmmm_nml%qm_ewald /= 1 .or. &
++      if (.not. qmmm_nml%ifqnt .or. qmmm_nml%qmmm_int /= 1 .or. &
++          qmmm_nml%qm_ewald /= 1 .or. &
+           .not. qmmm_nml%qm_pme .or. .not. qmmm_nml%qmmm_switch .or. &
+           qmmm_nml%vsolv /= 0) then
+-        write(6,'(a)') 'DPRc labels require QUICK periodic QM/MM with qmmm_int=1, qm_ewald=1, qm_pme and switching.'
++        write(6,'(a)') 'DPRc labels require periodic QM/MM with qmmm_int=1, qm_ewald=1, qm_pme and switching.'
++        call mexit(6,1)
++      endif
++      if (dprc_label_xtb) then
++        if (.not. qmmm_nml%qmtheory%ISXTB) then
++          write(6,'(a)') 'XTB-GFN2 DPRc labels require qm_theory=XTB.'
++          call mexit(6,1)
++        endif
++      else if (.not. qmmm_nml%qmtheory%ISQUICK) then
++        write(6,'(a)') 'QUICK-PBE0 DPRc labels require qm_theory=QUICK.'
+         call mexit(6,1)
+       endif
+       ! runmd stores the squared classical cutoff in cut after input setup.
+@@ -635,14 +680,26 @@
+              qmmm_nml%ksqmaxq, qmmm_nml%adjust_q, qmmm_nml%qmshake, qmmm_nml%qmgb
+         call mexit(6,1)
+       endif
+-      if (quick_qmmm_call_count /= dprc_frame64_index - 1_int64) then
+-        write(6,'(2(a,i0))') 'DPRc labels require a fresh QUICK job and sequential calls; frame=', &
+-             dprc_frame64_index, ' prior_calls=', quick_qmmm_call_count
+-        call mexit(6,1)
+-      endif
+-      if (.not. quick_dprc_label_configuration_is_qualified()) then
+-        write(6,'(a)') 'DPRc labels require the qualified QUICK PBE0/6-31G* Hamiltonian and convergence settings.'
+-        call mexit(6,1)
++      if (dprc_label_xtb) then
++        if (xtb_qmmm_call_count /= dprc_frame64_index - 1_int64) then
++          write(6,'(2(a,i0))') 'DPRc labels require a fresh xTB job and sequential calls; frame=', &
++               dprc_frame64_index, ' prior_calls=', xtb_qmmm_call_count
++          call mexit(6,1)
++        endif
++        if (.not. xtb_dprc_label_configuration_is_qualified()) then
++          write(6,'(a)') 'DPRc labels require qualified GFN2-xTB, 300 K, accuracy 0.001, maxiter 250, and default MM hardness.'
++          call mexit(6,1)
++        endif
++      else
++        if (quick_qmmm_call_count /= dprc_frame64_index - 1_int64) then
++          write(6,'(2(a,i0))') 'DPRc labels require a fresh QUICK job and sequential calls; frame=', &
++               dprc_frame64_index, ' prior_calls=', quick_qmmm_call_count
++          call mexit(6,1)
++        endif
++        if (.not. quick_dprc_label_configuration_is_qualified()) then
++          write(6,'(a)') 'DPRc labels require the qualified QUICK PBE0/6-31G* Hamiltonian and convergence settings.'
++          call mexit(6,1)
++        endif
+       endif
+       if (qmmm_nml%qmcharge /= -2 .or. qmmm_nml%spin /= 1 .or. &
+           qmmm_struct%nquant /= 16 .or. qmmm_struct%nlink /= 0 .or. &
+@@ -701,6 +758,7 @@
+       endif
+ #endif
+       dprc_quick_calls_before = quick_qmmm_call_count
++      dprc_xtb_calls_before = xtb_qmmm_call_count
+     endif
+   endif
+
+@@ -1202,9 +1260,20 @@
+     ! integration logic can modify it.  The force call has already completed
+     ! Ewald/CEW assembly, MPI collection, and virtual-site force redistribution.
+     if (master .and. dprc_label_enabled) then
+-      if (quick_qmmm_call_count /= dprc_quick_calls_before + 1_int64) then
+-        write(6,'(2(a,i0))') 'DPRc label requires exactly one QUICK call; before=', &
+-             dprc_quick_calls_before, ' after=', quick_qmmm_call_count
++      if (dprc_label_xtb) then
++        if (xtb_qmmm_call_count /= dprc_xtb_calls_before + 1_int64 .or. &
++            quick_qmmm_call_count /= dprc_quick_calls_before) then
++          write(6,'(4(a,i0))') 'DPRc xTB label call-count mismatch; xTB before=', &
++               dprc_xtb_calls_before, ' after=', xtb_qmmm_call_count, &
++               ' QUICK before=', dprc_quick_calls_before, &
++               ' after=', quick_qmmm_call_count
++          call mexit(6,1)
++        endif
++      else if (quick_qmmm_call_count /= dprc_quick_calls_before + 1_int64 .or. &
++               xtb_qmmm_call_count /= dprc_xtb_calls_before) then
++        write(6,'(4(a,i0))') 'DPRc QUICK label call-count mismatch; QUICK before=', &
++             dprc_quick_calls_before, ' after=', quick_qmmm_call_count, &
++             ' xTB before=', dprc_xtb_calls_before, ' after=', xtb_qmmm_call_count
+         call mexit(6,1)
+       endif
+       if (.not. ieee_is_finite(ener%pot%tot) .or. &
+@@ -1286,7 +1355,8 @@
+              dprc_cleanup_status
+         call mexit(6,1)
+       endif
+-      write(6,'(2a)') 'DPRc binary64 label: ', trim(dprc_label_path)
++      write(6,'(4a)') 'DPRc binary64 label (', trim(dprc_label_engine), &
++           '): ', trim(dprc_label_path)
+     endif
+
+     ! This force call does not count as a "step". CALL NMRDCP to decrement
+--- a/AmberTools/src/sander/xtb_module.F90
++++ b/AmberTools/src/sander/xtb_module.F90
+@@ -66,6 +66,7 @@
+
+ module xtb_module
+
++  use iso_fortran_env, only : int64
+   !use constants, only: A_TO_BOHRS, AU_TO_KCAL
+   use constants, only: CODATA08_A_TO_BOHRS, CODATA08_AU_TO_KCAL
+   use qm_ewald_comm
+@@ -82,7 +83,13 @@
+   implicit none
+   private
+
+-  public :: get_xtb_qmmm_forces
++  public :: get_xtb_qmmm_forces, xtb_qmmm_call_count, &
++            xtb_dprc_label_configuration_is_qualified
++
++  ! Monotonic count of successful xTB energy/gradient evaluations.  The DPRc
++  ! binary64 writer snapshots this counter around each force call so hidden
++  ! re-entry cannot publish a label assembled from multiple xTB calculations.
++  integer(int64), save :: xtb_qmmm_call_count = 0_int64
+
+ #ifdef XTB
+
+@@ -201,12 +208,50 @@
+
+   type(XTBIface),save :: XTBstate
+   type(XTBCallbackT),save :: XTBcallback
++  logical, save :: xtb_nml_prevalidated = .false.
+
+ #endif
+
+
+ contains
+
++  ! Read and freeze the exact GFN2-xTB settings used by the production
++  ! xTBloom path before the first force evaluation.  Keeping this guard
++  ! separate from the QUICK qualification prevents either low- or high-level
++  ! label mode from weakening the other's Hamiltonian contract.
++  logical function xtb_dprc_label_configuration_is_qualified()
++
++    implicit none
++
++#ifdef XTB
++    type(xtb_nml_type) :: candidate
++
++    call read_xtb_nml(candidate)
++    xtb_dprc_label_configuration_is_qualified = &
++         trim(candidate%qm_level) == 'GFN2-XTB' .and. &
++         abs(candidate%tfermi - 300.0d0) <= 1.0d-12 .and. &
++         abs(candidate%accuracy - 1.0d-3) <= 1.0d-15 .and. &
++         candidate%maxiter == 250 .and. &
++         abs(candidate%mmhardness) <= 1.0d-15 .and. &
++         .not. candidate%debug
++    if (.not. xtb_dprc_label_configuration_is_qualified) then
++       write(6,'(a,a,3(a,es24.16),a,i0,a,l1)') &
++            'Observed xTB qm_level=', trim(candidate%qm_level), &
++            ' tfermi=', candidate%tfermi, ' accuracy=', candidate%accuracy, &
++            ' mmhardness=', candidate%mmhardness, &
++            ' maxiter=', candidate%maxiter, ' debug=', candidate%debug
++    else if (xtb_qmmm_call_count == 0_int64) then
++       ! Avoid a time-of-check/time-of-use gap if the mdin file is replaced
++       ! between the runmd guard and newXTBIface's lazy initialization.
++       XTBstate%xtb_nml = candidate
++       xtb_nml_prevalidated = .true.
++    endif
++#else
++    xtb_dprc_label_configuration_is_qualified = .false.
++#endif
++
++  end function xtb_dprc_label_configuration_is_qualified
++
+
+ #ifdef XTB
+
+@@ -329,7 +374,11 @@
+
+     logical :: exitRun
+
+-    call read_xtb_nml(self%xtb_nml)
++    if (xtb_nml_prevalidated) then
++       xtb_nml_prevalidated = .false.
++    else
++       call read_xtb_nml(self%xtb_nml)
++    endif
+
+     call mctc_init('xtb/sander',11,.true.)
+
+@@ -578,6 +627,7 @@
+            call sander_bomb('get_xtb_qmmm_forces','xtb SCF failed', &
+                'Check the above message from xtb.')
+        end if
++       xtb_qmmm_call_count = xtb_qmmm_call_count + 1_int64
+
+        !
+        ! Extract the atomic charges
+@@ -991,4 +1041,3 @@
+ #endif
+
+ end module xtb_module
+-

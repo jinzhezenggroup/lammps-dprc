@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "id": "etpeth-gfn2-xtb-qmmm-umbrella-48",
+  "description": "ETP/ETH 48-window xTBloom GFN2-xTB QM/MM umbrella workload",
+  "source": {
+    "name": "dprc-tutorial",
+    "upstream": "https://github.com/njzjz/dprc-tutorial",
+    "revision": "f8716f28b03ef09734b74ae7f2ca67ab45c3d40f",
+    "license": "NOASSERTION",
+    "clean_required_for_final_evidence": true,
+    "assets_complete": false,
+    "artifacts": [
+      {
+        "path": "parm7/ETP_ETH.parm7",
+        "sha256": "3e06736e704c80ed555bf3b36d6b0f4caa5a2c0f1fe88d0a037575a0fefa064f",
+        "classification": "upstream topology source"
+      },
+      {
+        "path": "rst7/init_-1.50.rst7",
+        "sha256": "dda7d13d3cea6a41c499a8189f0b5ff0f38104956e7bd70e3ecedb84056539e2",
+        "classification": "upstream single-window starting coordinates"
+      },
+      {
+        "path": "lammps/ETP_ETH.data",
+        "sha256": "930b43445009e8e2506308dbf87388a3d33358f72e07fb82eff3376e48e2280d",
+        "classification": "runtime input generated outside this repository",
+        "required_for_runtime": true
+      },
+      {
+        "path": "lammps/forcefield_qmmm_hybrid.inc",
+        "sha256": "fc8c419b7444178dadbb44b869ed8a901e5d0ef8c895f9ef6570ab7fa37c8203",
+        "classification": "runtime force-field input generated outside this repository",
+        "required_for_runtime": true
+      },
+      {
+        "path": "lammps/metadata.json",
+        "sha256": "d46cab23443b0a1fea74821698f86c66269ba48d24566ed88963eb3922c32454",
+        "classification": "conversion metadata"
+      },
+      {
+        "path": "lammps/etpeth.colvars",
+        "sha256": "5644f8a5dc7401cfde94e6c152bae87e9a457f0537e46f871386230877de3482",
+        "classification": "single-window workflow reference"
+      },
+      {
+        "path": "lammps/in.xtb_qmmm_md",
+        "sha256": "cdcdbe127652b8694ef7dc2111d80055d15a0da39c6f2847d06bc2fbdde0a850",
+        "classification": "single-window workflow reference"
+      },
+      {
+        "path": "lammps/convert_amber_to_lammps.py",
+        "sha256": "c97149f6bf7c53261cbb37c80d84e646f0f0bfcc68f5f1a64589cf552438ccb1",
+        "classification": "external deterministic conversion script"
+      }
+    ]
+  },
+  "system": {
+    "lammps_atoms": 8938,
+    "qm_atom_ids": [1, 16],
+    "qm_charge": -2,
+    "qm_uhf": 0,
+    "elements_by_lammps_type": ["P", "O", "O", "C", "H", "O", "H"],
+    "water_types": [6, 7],
+    "cutoff_angstrom": 9.0,
+    "pppm_mesh": [50, 50, 50],
+    "pppm_order": 4,
+    "pppm_gewald": 0.348831617901729
+  },
+  "umbrella": {
+    "start_tenths_angstrom": -31,
+    "stop_tenths_angstrom": 16,
+    "step_tenths_angstrom": 1,
+    "count": 48,
+    "available_initial_center_tenths_angstrom": -15,
+    "reaction_coordinate": {
+      "expression": "distance(5,1)-distance(1,12)",
+      "force_constant_kcal_mol_angstrom2": 200.0
+    },
+    "attack_angle": {
+      "atom_ids": [5, 1, 12],
+      "center_degree": 180.0,
+      "force_constant_kcal_mol_degree2": 0.05
+    }
+  },
+  "dynamics": {
+    "timestep_fs": 1.0,
+    "temperature_kelvin": 298.0,
+    "langevin_damping_fs": 200.0,
+    "base_seed": 4928459,
+    "neighbor_skin_angstrom": 0.05,
+    "neighbor_every": 1,
+    "colvars_frequency_steps": 25,
+    "colvars_checkpoint_boundary_tolerance": {
+      "reaction_coordinate_angstrom": 1e-12,
+      "attack_angle_degree": 1e-10
+    },
+    "thermo_frequency_steps": 100,
+    "trajectory_frequency_steps": 1000
+  },
+  "xtb": {
+    "method": "gfn2",
+    "accuracy": 0.001,
+    "max_iterations": 250,
+    "electronic_temperature_kelvin": 300.0,
+    "legacy_mm_hardness": 0.0,
+    "kmax": [8, 8, 8],
+    "ksqmax": 100
+  },
+  "dprc": {
+    "architecture": "DPA4c",
+    "environment_cutoff_angstrom": 6.0,
+    "deepmd_type_map": ["P", "O", "O", "C", "H", "OW", "HW"],
+    "target_definition": "periodic PBE0 QM/MM minus matching xTBloom GFN2-xTB QM/MM",
+    "model_status": "unavailable"
+  },
+  "protocol": {
+    "smoke_steps": 5,
+    "anchor_relaxation_steps": 20000,
+    "seed_walk_steps_per_center": 3000,
+    "seed_walk_force_constant_kcal_mol_angstrom2": 1000.0,
+    "equilibration_steps_per_window": 100000,
+    "production_steps_per_window": 250000,
+    "production_trials": 3,
+    "seed_acceptance": {
+      "max_abs_reaction_coordinate_error_angstrom": 0.15,
+      "max_abs_attack_angle_error_degree": 30.0,
+      "require_zero_dangerous_builds": true
+    },
+    "overlap_acceptance": {
+      "minimum_adjacent_overlap_coefficient": 0.05,
+      "target_adjacent_overlap_coefficient": 0.2,
+      "minimum_effective_samples_per_window": 50
+    }
+  },
+  "execution": {
+    "synchronized_partitions": true,
+    "stable_slot_order": "ascending_center",
+    "classical_path": "cpu-reference",
+    "xTBloom_descriptor_memory": "host",
+    "dprc_enabled": false,
+    "deepmd_required": false,
+    "plumed_required": false
+  }
+}

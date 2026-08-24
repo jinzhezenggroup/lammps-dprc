@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "dependencies": [
+    {
+      "name": "lammps",
+      "path": "../lammps",
+      "upstream": "https://github.com/lammps/lammps",
+      "revision": "7bd373ebc61a8028be955e6be862d5a091fd59c5",
+      "license": "GPL-2.0-only",
+      "classification": "build headers, generated-source inputs, and runtime host",
+      "required": true,
+      "vendored": false,
+      "artifacts": [
+        {
+          "path": "src/QMMM-XTB/fix_qmmm_xtb.cpp",
+          "sha256": "921cdd2cc3be8623b8da030d1078e4eb21200aa08e9cb0cedcebf5024a8e3454",
+          "classification": "pinned input transformed into build-tree private fused source"
+        },
+        {
+          "path": "src/QMMM-XTB/fix_qmmm_xtb.h",
+          "sha256": "886d7e9a6bf55952c06b554f6c329b4d2e2d3d8132c48afe670c1009be612e77",
+          "classification": "pinned input transformed into build-tree private fused source"
+        },
+        {
+          "path": "src/QMMM-XTB/pppm_tip4p_xtb.h",
+          "sha256": "2f2167b3b435fde0e9262a01f362a472f6d255d0f0409b1e82ce9ff5f1eba422",
+          "classification": "pinned input transformed into build-tree private fused source"
+        },
+        {
+          "path": "src/QMMM-XTB/pppm_xtb.h",
+          "sha256": "eb326b5bc8ed233ccd58e32c2e11c529033b3b12d9881eadcd4f0577f15957a5",
+          "classification": "pinned input transformed into build-tree private fused source"
+        },
+        {
+          "path": "src/QMMM-XTB/qmmm_xtb_ewald.cpp",
+          "sha256": "08bad9de3e1c01a00434db260611795cebcb60de6c8952a30f09bf2524ce7f6e",
+          "classification": "pinned input compiled into the build-tree private fused implementation"
+        },
+        {
+          "path": "src/QMMM-XTB/qmmm_xtb_ewald.h",
+          "sha256": "8b23a5c39c1b8d676c6695b67334f860e938888be2a99eeb76e74a38481753ca",
+          "classification": "pinned input compiled into the build-tree private fused implementation"
+        },
+        {
+          "path": "src/QMMM-XTB/qmmm_xtb_pppm.cpp",
+          "sha256": "8c85ce5d1bfb68b1f58ab7b84ac89c4c4c2fa2b5bd57a9315c427426447f7b23",
+          "classification": "pinned input transformed into build-tree private fused source"
+        }
+      ]
+    },
+    {
+      "name": "xtbloom",
+      "path": "../xtbloom",
+      "upstream": "https://github.com/jinzhezenggroup/xtbloom",
+      "revision": "3c474e1c1b639098f72ae7523472bd5f65ad3ab5",
+      "license": "GPL-3.0-or-later WITH project CUDA/MKL additional permission",
+      "classification": "public C ABI header and runtime-provided shared library",
+      "required": true,
+      "vendored": false,
+      "artifacts": [
+        {
+          "path": "data/parameters/gfn1.json",
+          "sha256": "0ecdc3f5f12990c5a7e0f0bd7e6fe931ecf72d7630e6a6a3cc396c51766a40a0",
+          "classification": "canonical input for the build-tree legacy MM-hardness table"
+        },
+        {
+          "path": "data/parameters/gfn2.json",
+          "sha256": "de0f20e90b592b7b92f107eb672bd3dd29c1096f904d7a472b05693f9238ed1a",
+          "classification": "canonical input for the build-tree legacy MM-hardness table"
+        }
+      ]
+    },
+    {
+      "name": "deepmd-kit-pr-5943",
+      "path": "../deepmd-kit",
+      "upstream": "https://github.com/deepmodeling/deepmd-kit/pull/5943",
+      "revision": "835a42f001b41e1bee0646b7e1403855b7fe6340",
+      "license": "LGPL-3.0-or-later",
+      "classification": "open compact-evaluation reference and optional separately loaded runtime plugin",
+      "required": false,
+      "vendored": false,
+      "related_revisions": [
+        {
+          "name": "dpa4c-merge",
+          "upstream": "https://github.com/deepmodeling/deepmd-kit/pull/5972",
+          "revision": "bdb40072d57109e25e17842d24e1f0a926c00632",
+          "status": "not combined with the open compact-evaluation revision"
+        }
+      ]
+    },
+    {
+      "name": "dprc-tutorial",
+      "path": "../dprc-tutorial",
+      "upstream": "https://github.com/njzjz/dprc-tutorial",
+      "revision": "f8716f28b03ef09734b74ae7f2ca67ab45c3d40f",
+      "license": "NOASSERTION",
+      "classification": "external workload and workflow reference",
+      "required": false,
+      "vendored": false
+    }
+  ]
+}

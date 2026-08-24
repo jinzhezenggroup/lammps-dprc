@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "id": "quick-pbe0-6-31g-star-cuda",
+  "qualification_state": "engine-qualified-periodic-labeler-pending",
+  "distribution": "external private runtime; no AmberTools or QUICK binary is bundled",
+  "source": {
+    "name": "AmberTools",
+    "version": "26.0.0",
+    "upstream": "https://ambermd.org/AmberTools.php",
+    "archive": {
+      "name": "AmberTools26.tar.bz2",
+      "sha256": "5d46eef3c2bb7d5bf9e8c0c38add34406ea67e3f0e4097ac9d11d8a544538c9c"
+    },
+    "official_update": {
+      "name": "update.1",
+      "sha256": "8a2406339cafef5730eabc4fb0d39d4a47b29655048fb7887625c4b3edd134d9"
+    },
+    "cuda_compatibility_patch": {
+      "path": "patches/ambertools26-cuda-12.9.patch",
+      "sha256": "02e4a34705b10359306680349c6da5ddeea1f1d0e4de4a2257a8a5af52a31154",
+      "baseline_cuda_config_sha256": "0953f2ce764ed65a9735cd8d66552aa22f87cd861ece5f06211f792c0e020f0a",
+      "patched_cuda_config_sha256": "f3191f2e3dcd93e94ba217a8fd74468b1b3fff533829e630118efbbe0c4b2945",
+      "scope": "extend the existing CUDA 12.7 build branch through CUDA 12.x without changing its architecture flags"
+    },
+    "quick_version": "25.03",
+    "quick_upstream": "https://quick-docs.readthedocs.io/",
+    "licenses": {
+      "ambertools_default": "GPL-3.0-only with component exceptions documented upstream",
+      "quick": "MPL-2.0"
+    },
+    "license_files": {
+      "ambertools": {
+        "path": "AmberTools/LICENSE",
+        "sha256": "912af0215a173b10e44c254b1ee2ed844393298a503bea4596216afcb42ec509"
+      },
+      "quick": {
+        "path": "AmberTools/src/quick/license",
+        "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+      }
+    }
+  },
+  "build": {
+    "build_type": "Release",
+    "compiler_family": "GNU 13.4.0",
+    "cuda_toolkit": "12.9.86",
+    "quick_user_arch": "blackwell2",
+    "cmake_cache_sha256": "a437db54b942bd51af87e72bab4acf764fc40cda8be1793402b7c86380f9ed64",
+    "linker_flags": "-Wl,-rpath-link,<toolchain-lib-directory> -Wl,-rpath,<toolchain-lib-directory> -Wl,--enable-new-dtags",
+    "public_path_policy": "The private absolute toolchain path is redacted; the retained hashes and raw private evidence identify the qualified runtime bytes.",
+    "loader_contract": "executables and dependent shared libraries use DT_RUNPATH; LD_PRELOAD is unset",
+    "runtime_cxx_library_sha256": "4db7db432420e28a0c42bed38f7b33cfe1a97aa3a5ce7c92ddd2f4e5afe16ceb",
+    "runtime_gcc_library_sha256": "518553cb760166496a9844a8fdd8acaffed9229a581992a424e0ffd36098df52"
+  },
+  "artifacts": {
+    "sander.quick.cuda": "3caa4848242bc311aeb9efa53801baa35a266b37f8394f21a807814f5c11b72e",
+    "quick.cuda": "b92d0efa2569094c8009f7b239b842d06ae8d2cd79464fe4e3fae4a5b4c5b198",
+    "libquick_cuda.so": "2bca08d9c4707a8e039b652244256be7a608767c9a7fcb6ac3daa00253f07232"
+  },
+  "method": {
+    "name": "PBE0",
+    "quick_keyword": "PBE0",
+    "libxc_version": "4.3.4",
+    "libxc_name": "PBEH (PBE0)",
+    "libxc_family": "HYBRID GGA",
+    "libxc_kind": "EXCHANGE CORRELATION"
+  },
+  "basis": {
+    "name": "6-31G*",
+    "quick_definition": "6-31GD.BAS",
+    "definition_sha256": "6100c60d37228a04773b529bbf62c81d89fb210cf890e0318dbd50cfb46c11db",
+    "basis_link_sha256": "e2dde37d303c0586f5b176082e3c06580f391e8b2d3433756666cccf73dcff57"
+  },
+  "scf": {
+    "maximum_cycles": 250,
+    "density_rms": 1e-08,
+    "failure_policy": "a nonconverged or incomplete frame is recorded and excluded from labels; no partial force slice is published"
+  },
+  "qualification": {
+    "suggested_run_directory": "../lammps-dprc-runs/quick-cuda-qmmm-pbe0-v1/pbe0-6-31g-star",
+    "fixture": "AmberTools alanine-dipeptide EXTERN QM/MM two-step MD",
+    "expected_force_calls": 2,
+    "expected_qm_gradient_vectors_per_call": 12,
+    "expected_mm_gradient_vectors_per_call": 10,
+    "raw_artifacts": {
+      "mdin": "e4d61e929b32795d96110cae476335f00c778438985dad6de906931ced5a12fa",
+      "aladip.prmtop": "e85e1fd308f8d0e74a9e46af7793580f11598ff2d111ce372416f2b4aaac8e5c",
+      "aladip.restrt": "2ea2fe14da605ef504f927256588ac74c19c4002b0f3271d8033d2fd683849e2",
+      "aladip.pbe0-6-31g-star.cuda.mdout": "55681ab2b06d037bf31ec6adde1c4cdcb8a8373008622396fcc5c12ec33df864",
+      "aladip.pbe0-6-31g-star.cuda.restrt": "8490ac0ca613b0a4c5377d619b91a4859c2f00818dce1815d5cb066e06b72177",
+      "aladip.pbe0-6-31g-star.cuda.nc": "4cbff278f0499ec5b718a1244e6a389f036a3f24fe64213ec98b523ebf13a496",
+      "quick.cuda.archive": "9760e4c436885f1cf45d7d019d0ee3e71e7b7517accd58bd91b8cad677d3471a",
+      "quick-traces/QUICK_job.000001.in": "db0d5671d90aa9fa618e3a9c3e417855cfc928455e01741c457eeb7024f2d3e5",
+      "quick-traces/QUICK_job.000001.out": "cd26008d8139057cef7434e372af3630dd48e1fe0010d3676f1e219090d3e559",
+      "quick-traces/QUICK_job.000002.in": "3abeb3ea9c6be2601f2c2faf48718cb0ec0755cb38ce6fedad73116a072f8cdc",
+      "quick-traces/QUICK_job.000002.out": "00dc14194145a3cc7ec55ecb675f17e96f0ccb617ae36fd3cf226383ea7af7a0",
+      "gpu-telemetry.csv": "55c5fceb8776b16ad8861e38d5cf5c8803417c10b53e672f31de68f2752b1d38",
+      "environment.txt": "e4cd5d9d99f2efc8c0376b732b197f4234bbf7bcdeff0583bba68825bac5214e",
+      "time.txt": "ef980fbae740a6102de8652699afb3d1ef7e620a7d9f2ead18200352d65f7c46"
+    },
+    "limitations": [
+      "the fixture is nonperiodic and does not qualify the ETP/ETH periodic embedding",
+      "the fixture does not qualify TIP4P M-site force redistribution",
+      "the fixture does not provide an independent PBE0 energy or force oracle",
+      "the fixture timing is installation evidence, not the aggregate umbrella-sampling performance metric"
+    ]
+  }
+}

@@ -1,0 +1,750 @@
+diff --git a/AmberTools/src/sander/trajene.F90 b/AmberTools/src/sander/trajene.F90
+index fdeb639..74d6873 100644
+--- a/AmberTools/src/sander/trajene.F90
++++ b/AmberTools/src/sander/trajene.F90
+@@ -5,6 +5,8 @@
+ 
+ module trajenemod
+ 
++use iso_fortran_env, only : int64
++
+ ! MODULE: TRAJENEMOD
+ ! ================== TRAJECTORY ENERGY POST-PROCESSING ===================
+ ! Daniel R. Roe, 2009
+@@ -15,6 +17,20 @@ public
+ 
+ integer,public,save :: orig_ig = -1
+ 
++! mdread2 snapshots these values before it applies convenience rewrites such
++! as forcing ntf=1 for noshakemask.  DPRc label qualification must bind the
++! user's requested force protocol, not only Sander's later effective state.
++integer,public,save :: dprc_input_ntc = -1
++integer,public,save :: dprc_input_ntf = -1
++
++! These values are set only after a complete DPRCFRM1 header, payload extent,
++! and completion trailer have been validated.  runmd uses them to prevent an
++! ordinary binary32 NetCDF trajectory widened to REAL*8 from being published as
++! a binary64 training label.
++logical,public,save :: dprc_frame64_active = .false.
++integer(int64),public,save :: dprc_frame64_index = 0_int64
++character(len=1024),public,save :: dprc_label64_prefix = ''
++
+ 
+ contains
+ 
+@@ -282,6 +292,8 @@ end subroutine trajene
+ !+ [Enter a one-line description of subroutine trajene here]
+ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+                                                        !\/-----\/--For Debug
++   use iso_fortran_env, only : int32, int64
++   use ieee_arithmetic, only : ieee_is_finite
+    use nblist,only: fill_tranvec,a,b,c,alpha,beta,gamma, nbflag,cutoffnb
+    use constants,only: one,half
+    use state
+@@ -321,9 +333,20 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+    ! INTERNAL VARIABLES
+    integer member,j,xstop,vstop
+    integer newnfft1,newnfft2,newnfft3
+-   _REAL_ carrms,oldbox(3)
++   _REAL_ carrms,oldbox(3),oldangles(3),dprc_cell_gram
+    logical loutfm, is_netcdf
+-   integer i
++   logical is_dprc_binary64, dprc_frame_requested, dprc_label_requested
++   integer i, dprc_env_length, dprc_env_status, dprc_io_status, dprc_unit
++   integer(int32) dprc_schema, dprc_endian
++   integer(int64) dprc_atom_count, dprc_frame_count, dprc_file_size, &
++                  dprc_expected_size, dprc_record_size, dprc_trailer_size
++   character(len=8) dprc_magic, dprc_trailer_magic
++   character(len=1024) dprc_frame_path, dprc_label_prefix
++   character(len=256) dprc_io_message
++   character(len=8), parameter :: dprc_expected_magic = 'DPRCFRM1'
++   character(len=8), parameter :: dprc_expected_trailer = 'DPRCEND1'
++   integer(int32), parameter :: dprc_expected_schema = 1_int32
++   integer(int32), parameter :: dprc_expected_endian = int(z'01020304', int32)
+    ! _REAL_, allocatable :: dedCharge_avg(:)
+    ! _REAL_, allocatable :: dedLJA_avg(:)
+    ! _REAL_, allocatable :: dedLJB_avg(:)
+@@ -361,6 +384,11 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+ !------------------------------------------------
+    loutfm = ioutfm <= 0
+    is_netcdf=.false.
++   is_dprc_binary64=.false.
++   dprc_frame64_active=.false.
++   dprc_frame64_index=0_int64
++   dprc_label64_prefix=''
++   dprc_unit=-1
+    velocityVID = -1
+    oldbox(1:3) = 0.d0
+ 
+@@ -388,8 +416,107 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+       xstop=lcrd+(natom*3)-1
+       vstop=lvel+(natom*3)-1
+ 
+-      ! Open the inptraj file for coordinate reading
+-      if (NC_checkTraj(inptraj)) then
++      ! The ordinary Amber trajectory path stores coordinates as binary32.
++      ! Production DPRc labels opt in to a compact, versioned binary64 stream
++      ! so no coordinate is rounded before the QM/MM force evaluation.
++      dprc_frame_path = ''
++      dprc_label_prefix = ''
++      dprc_env_length = 0
++      call get_environment_variable('SANDER_DPRC_FRAME64_PATH', &
++           dprc_frame_path, length=dprc_env_length, status=dprc_env_status)
++      if (dprc_env_status == -1) then
++         write(6,'(a)') 'SANDER_DPRC_FRAME64_PATH exceeds 1024 characters.'
++         call mexit(6,1)
++      else if (dprc_env_status /= 0 .and. dprc_env_status /= 1) then
++         write(6,'(a,i0)') 'Could not inspect SANDER_DPRC_FRAME64_PATH; status=', &
++              dprc_env_status
++         call mexit(6,1)
++      endif
++
++      dprc_frame_requested = dprc_env_status == 0 .and. dprc_env_length > 0
++      dprc_env_length = 0
++      call get_environment_variable('SANDER_DPRC_LABEL64_PREFIX', &
++           dprc_label_prefix, length=dprc_env_length, status=dprc_env_status)
++      if (dprc_env_status == -1) then
++         write(6,'(a)') 'SANDER_DPRC_LABEL64_PREFIX exceeds 1024 characters.'
++         call mexit(6,1)
++      else if (dprc_env_status /= 0 .and. dprc_env_status /= 1) then
++         write(6,'(a,i0)') 'Could not inspect SANDER_DPRC_LABEL64_PREFIX; status=', &
++              dprc_env_status
++         call mexit(6,1)
++      endif
++      dprc_label_requested = dprc_env_status == 0 .and. dprc_env_length > 0
++
++      if (dprc_frame_requested .neqv. dprc_label_requested) then
++         write(6,'(a)') 'SANDER_DPRC_FRAME64_PATH and SANDER_DPRC_LABEL64_PREFIX must be set together.'
++         call mexit(6,1)
++      endif
++
++      if (dprc_frame_requested) then
++         if (storage_size(x(lcrd)) /= 64) then
++            write(6,'(a)') 'DPRc frame input requires a binary64 Sander build.'
++            call mexit(6,1)
++         endif
++         if (dprc_env_length > len(dprc_label64_prefix)-19) then
++            write(6,'(a)') 'SANDER_DPRC_LABEL64_PREFIX leaves no room for a frame suffix.'
++            call mexit(6,1)
++         endif
++         if (ntb <= 0) then
++            write(6,'(a)') 'DPRc binary64 frames require periodic ntb > 0 input.'
++            call mexit(6,1)
++         endif
++         open(newunit=dprc_unit, file=trim(dprc_frame_path), status='old', &
++              action='read', access='stream', form='unformatted', &
++              convert='little_endian', iostat=dprc_io_status, iomsg=dprc_io_message)
++         if (dprc_io_status /= 0) then
++            write(6,'(3a)') 'Could not open DPRc binary64 frame ', &
++                 trim(dprc_frame_path), ': '//trim(dprc_io_message)
++            call mexit(6,1)
++         endif
++         inquire(unit=dprc_unit, size=dprc_file_size, iostat=dprc_io_status, &
++                 iomsg=dprc_io_message)
++         if (dprc_io_status /= 0) then
++            write(6,'(3a)') 'Could not inspect DPRc binary64 frame ', &
++                 trim(dprc_frame_path), ': '//trim(dprc_io_message)
++            call mexit(6,1)
++         endif
++         read(dprc_unit, iostat=dprc_io_status, iomsg=dprc_io_message) &
++              dprc_magic, dprc_schema, dprc_endian, dprc_atom_count, &
++              dprc_frame_count
++         if (dprc_io_status /= 0 .or. dprc_magic /= dprc_expected_magic .or. &
++             dprc_schema /= dprc_expected_schema .or. &
++             dprc_endian /= dprc_expected_endian .or. &
++             dprc_atom_count /= int(natom,int64) .or. dprc_frame_count < 1_int64 .or. &
++             dprc_frame_count > 999999_int64) then
++            write(6,'(a)') 'Invalid or incompatible DPRc binary64 frame header.'
++            call mexit(6,1)
++         endif
++         dprc_record_size = 24_int64*dprc_atom_count + 48_int64
++         if (dprc_frame_count > (huge(dprc_expected_size)-48_int64)/dprc_record_size) then
++            write(6,'(a)') 'DPRc binary64 frame extent overflows int64.'
++            call mexit(6,1)
++         endif
++         dprc_expected_size = 48_int64 + dprc_frame_count*dprc_record_size
++         if (dprc_file_size /= dprc_expected_size) then
++            write(6,'(2(a,i0))') 'DPRc binary64 frame size mismatch: actual=', &
++                 dprc_file_size, ' expected=', dprc_expected_size
++            call mexit(6,1)
++         endif
++         read(dprc_unit, pos=dprc_expected_size-15_int64, iostat=dprc_io_status, &
++              iomsg=dprc_io_message) dprc_trailer_magic, dprc_trailer_size
++         if (dprc_io_status /= 0 .or. dprc_trailer_magic /= dprc_expected_trailer .or. &
++             dprc_trailer_size /= dprc_expected_size) then
++            write(6,'(a)') 'Invalid DPRc binary64 frame completion trailer.'
++            call mexit(6,1)
++         endif
++         title = 'DPRC binary64 trajectory'
++         write(6,'(a,i0)') 'TRAJMD: DPRc binary64 frames= ', dprc_frame_count
++         write(6,'(a,i0)') 'TRAJMD: DPRc binary64 atoms= ', dprc_atom_count
++         is_dprc_binary64=.true.
++         dprc_frame64_active=.true.
++         dprc_label64_prefix=trim(dprc_label_prefix)
++      ! Open the ordinary inptraj file for coordinate reading.
++      else if (NC_checkTraj(inptraj)) then
+ #ifdef BINTRAJ
+          ! Open NETCDF format trajectory file
+          if (NC_openRead(inptraj, ncid)) then
+@@ -578,7 +705,25 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+    
+       
+          !       --- read next coordinate set from trajectory
+-         if (.not.is_netcdf) then
++         if (is_dprc_binary64) then
++            if (int(member,int64)>dprc_frame_count) goto 1000
++            if (member == 1) then
++               read(dprc_unit, pos=33_int64, iostat=dprc_io_status, &
++                    iomsg=dprc_io_message) (x(j),j=lcrd,xstop)
++            else
++               read(dprc_unit, iostat=dprc_io_status, iomsg=dprc_io_message) &
++                    (x(j),j=lcrd,xstop)
++            endif
++            if (dprc_io_status /= 0) then
++               write(6,'(3a)') 'Could not read DPRc binary64 coordinates: ', &
++                    trim(dprc_io_message), ''
++               goto 1010
++            endif
++            if (.not. all(ieee_is_finite(x(lcrd:xstop)))) then
++               write(6,'(a)') 'DPRc binary64 coordinates contain a non-finite value.'
++               goto 1010
++            endif
++         else if (.not.is_netcdf) then
+             read(INPTRAJ_UNIT,'(10f8.3)',end=1000,err=1010) (x(j),j=lcrd,xstop)
+ #ifdef BINTRAJ
+          else
+@@ -615,11 +760,41 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+             oldbox(1) = box(1)
+             oldbox(2) = box(2)
+             oldbox(3) = box(3)
++            oldangles(1) = alpha
++            oldangles(2) = beta
++            oldangles(3) = gamma
+             !write(6,*) "DEBUG: OLDBOX: ",oldbox(1),oldbox(2),oldbox(3)
+             !write(6,*) "DEBUG: OLDabc: ",a,b,c
+             
+             ! 2- Read in current box coords.
+-            if (.not.is_netcdf) then
++            if (is_dprc_binary64) then
++               read(dprc_unit, iostat=dprc_io_status, iomsg=dprc_io_message) &
++                    box(1:3), alpha, beta, gamma
++               if (dprc_io_status /= 0) then
++                  write(6,'(3a)') 'Could not read DPRc binary64 cell: ', &
++                       trim(dprc_io_message), ''
++                  goto 1020
++               endif
++               if (.not. all(ieee_is_finite(box(1:3))) .or. &
++                   .not. ieee_is_finite(alpha) .or. .not. ieee_is_finite(beta) .or. &
++                   .not. ieee_is_finite(gamma) .or. any(box(1:3) <= 0.d0) .or. &
++                   alpha <= 0.d0 .or. alpha >= 180.d0 .or. &
++                   beta <= 0.d0 .or. beta >= 180.d0 .or. &
++                   gamma <= 0.d0 .or. gamma >= 180.d0) then
++                  write(6,'(a)') 'DPRc binary64 frame contains an invalid periodic cell.'
++                  goto 1020
++               endif
++               dprc_cell_gram = 1.d0 + 2.d0*cos(alpha*acos(-1.d0)/180.d0)* &
++                    cos(beta*acos(-1.d0)/180.d0)*cos(gamma*acos(-1.d0)/180.d0) - &
++                    cos(alpha*acos(-1.d0)/180.d0)**2 - &
++                    cos(beta*acos(-1.d0)/180.d0)**2 - &
++                    cos(gamma*acos(-1.d0)/180.d0)**2
++               if (.not. ieee_is_finite(dprc_cell_gram) .or. &
++                   dprc_cell_gram <= 1.d-12) then
++                  write(6,'(a)') 'DPRc binary64 frame periodic cell has non-positive volume.'
++                  goto 1020
++               endif
++            else if (.not.is_netcdf) then
+                read(INPTRAJ_UNIT,'(3f8.3)',end=1000,err=1020) box(1), box(2), box(3)
+ #ifdef BINTRAJ
+             else
+@@ -632,7 +797,8 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+             !write(6,*) "DEBUG: BOX: ",box(1),box(2),box(3)
+             
+             ! 3- If the box size has changed, some parameters have to be recalc.
+-            if (box(1)/=oldbox(1).or.box(2)/=oldbox(2).or.box(3)/=oldbox(3)) then
++            if (box(1)/=oldbox(1).or.box(2)/=oldbox(2).or.box(3)/=oldbox(3).or. &
++                alpha/=oldangles(1).or.beta/=oldangles(2).or.gamma/=oldangles(3)) then
+                
+                !write (6,'(a)') "TRAJENE: Updating Box parameters"
+                ! 3.a - Update PME cell parameters
+@@ -698,6 +864,8 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+          write(6,'(a)')""
+          write(6,'(a,i6)') 'TRAJMD: START FRAME #',member
+ 
++         if (is_dprc_binary64) dprc_frame64_index = int(member,int64)
++
+          member=member+1
+ 
+          do i=1,3*natom+iscale
+@@ -805,6 +973,7 @@ subroutine trajmd(x,ix,ih,ipairs,ok,qsetup)
+ #ifdef BINTRAJ
+       if (is_netcdf) call NC_close(ncid)
+ #endif
++      if (is_dprc_binary64 .and. dprc_unit /= -1) close(dprc_unit)
+       
+       !call close_binary_dedparm()
+ 
+diff --git a/AmberTools/src/sander/mdread2.F90 b/AmberTools/src/sander/mdread2.F90
+--- a/AmberTools/src/sander/mdread2.F90
++++ b/AmberTools/src/sander/mdread2.F90
+@@ -78,7 +78,7 @@
+    use commandline_module, only: cpein_specified
+    use external_module
+    use UtilitiesModule, only: Upcase
+-   use trajenemod, only: orig_ig
++   use trajenemod, only: orig_ig, dprc_input_ntc, dprc_input_ntf
+    
+    implicit none
+    _REAL_ x(*)
+@@ -137,6 +137,13 @@
+    character(11), parameter :: error_hdr =      '| ERROR:   '
+ #endif
+ 
++   ! Preserve the user-supplied constraint/force flags before mdread2 applies
++   ! compatibility rewrites.  In particular, noshakemask silently changes
++   ! ntf>1 to ntf=1 later in this routine; such an input must not qualify for
++   ! the exact single-force DPRc labeling protocol.
++   dprc_input_ntc = ntc
++   dprc_input_ntf = ntf
++
+    ! -------------------------------------------------------------------
+    !      --- set up resat array, containing string identifying
+    !          residue for each atom
+diff --git a/AmberTools/src/sander/runmd.F90 b/AmberTools/src/sander/runmd.F90
+index 975c25e..d4d8530 100644
+--- a/AmberTools/src/sander/runmd.F90
++++ b/AmberTools/src/sander/runmd.F90
+@@ -51,7 +51,21 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
+ !------------------------------------------------------------------------------
+ ! modules used:  {{{
+ 
++  use iso_c_binding, only : c_char, c_int, c_null_char
++  use iso_fortran_env, only : int32, int64, real64
++  use ieee_arithmetic, only : ieee_is_finite
+   use state
++  use trajenemod, only : dprc_frame64_active, dprc_frame64_index, &
++                         dprc_label64_prefix, dprc_input_ntc, dprc_input_ntf
++  use quick_module, only : quick_qmmm_call_count, &
++                           quick_dprc_label_configuration_is_qualified
++  use cns_xref, only : is_xref_on
++#ifdef DSSP
++  use dssp, only : idssp
++#endif
++#ifdef DPRC
++  use dprcmod, only : dprc_nml
++#endif
+ 
+ #if !defined(DISABLE_NFE) && defined(NFE_ENABLE_BBMD)
+   use nfe_sander_hooks, only : nfe_on_mdstep => on_mdstep
+@@ -99,7 +113,8 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
+ 
+   use fastwt
+   use bintraj, only: end_binary_frame
+-  use nblist,only: fill_tranvec,volume,oldrecip,ucell,olducell,bcshift
++  use nblist,only: fill_tranvec,volume,oldrecip,ucell,olducell,bcshift, &
++                   alpha,beta,gamma
+ 
+   use nose_hoover_module, only: Thermostat_switch, Thermostat_integrate_1, &
+                                 Thermostat_integrate_2, &
+@@ -275,6 +290,7 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
+ #include "ew_frc.h"
+ #include "ew_cntrl.h"
+ #include "ew_mpole.h"
++#include "ew_pme_recip.h"
+ #include "def_time.h"
+ #include "extra_pts.h"
+ #include "../pbsa/pb_md.h"
+@@ -359,6 +375,31 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
+   logical ixdump, ivdump, itdump, ifdump
+   logical qsetup
+   _REAL_, allocatable, dimension(:) :: f_or
++  logical :: dprc_label_enabled
++  integer :: dprc_env_length, dprc_env_status, dprc_io_status, dprc_unit
++  integer(c_int) :: dprc_publish_status, dprc_cleanup_status
++  integer(int64) :: dprc_expected_size, dprc_actual_size, &
++                    dprc_quick_calls_before
++  character(len=8), parameter :: dprc_label_magic = 'DPRCLBL1'
++  character(len=8), parameter :: dprc_trailer_magic = 'DPRCEND1'
++  integer(int32), parameter :: dprc_label_schema = 1_int32
++  integer(int32), parameter :: dprc_label_endian = int(z'01020304', int32)
++  integer(int32), parameter :: dprc_tip4p_redistributed = 1_int32
++  character(len=1024) :: dprc_label_prefix, dprc_label_path, &
++                         dprc_label_partial_path
++  character(len=256) :: dprc_io_message
++  interface
++    function dprc_posix_link(old_path, new_path) bind(C, name='link') result(status)
++      import :: c_char, c_int
++      character(kind=c_char), dimension(*), intent(in) :: old_path, new_path
++      integer(c_int) :: status
++    end function dprc_posix_link
++    function dprc_posix_unlink(path) bind(C, name='unlink') result(status)
++      import :: c_char, c_int
++      character(kind=c_char), dimension(*), intent(in) :: path
++      integer(c_int) :: status
++    end function dprc_posix_unlink
++  end interface
+ #ifdef RISMSANDER
+   logical irismdump
+ #  ifdef RISM_DEBUG
+@@ -522,6 +558,147 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
+   nrx = nr3
+   if (ntwprt > 0) nrx = ntwprt*3
+   if (.not. allocated(f_or)) allocate(f_or(nr3))
++
++  ! Fail closed before the first force evaluation.  The environment variable
++  ! is inspected here even though trajmd already stored it, so setting a label
++  ! prefix on any other runmd entry path is rejected rather than ignored.
++  dprc_label_enabled = .false.
++  dprc_quick_calls_before = quick_qmmm_call_count
++  if (master) then
++    dprc_label_prefix = ''
++    dprc_env_length = 0
++    call get_environment_variable('SANDER_DPRC_LABEL64_PREFIX', &
++         dprc_label_prefix, length=dprc_env_length, status=dprc_env_status)
++    if (dprc_env_status == -1) then
++      write(6,'(a)') 'SANDER_DPRC_LABEL64_PREFIX exceeds 1024 characters.'
++      call mexit(6,1)
++    else if (dprc_env_status /= 0 .and. dprc_env_status /= 1) then
++      write(6,'(a,i0)') 'Could not inspect SANDER_DPRC_LABEL64_PREFIX; status=', &
++           dprc_env_status
++      call mexit(6,1)
++    endif
++    dprc_label_enabled = dprc_env_status == 0 .and. dprc_env_length > 0
++
++    if (dprc_label_enabled .neqv. dprc_frame64_active) then
++      write(6,'(a)') 'DPRc labels require a validated DPRCFRM1 input in the same trajmd call.'
++      call mexit(6,1)
++    endif
++    if (dprc_label_enabled) then
++      if (trim(dprc_label_prefix) /= trim(dprc_label64_prefix) .or. &
++          dprc_frame64_index < 1_int64 .or. dprc_frame64_index > 999999_int64) then
++        write(6,'(a)') 'DPRc frame identity or output prefix changed after input validation.'
++        call mexit(6,1)
++      endif
++      if (storage_size(x(1)) /= 64 .or. storage_size(f_or(1)) /= 64) then
++        write(6,'(a)') 'DPRc label output requires binary64 coordinates and forces.'
++        call mexit(6,1)
++      endif
++      if (natom /= 11912 .or. nr /= natom .or. numextra /= 2974) then
++        write(6,'(a,3(a,i0))') 'DPRc ETP/ETH topology mismatch:', &
++             ' natom=', natom, ' local_atoms=', nr, ' extra_points=', numextra
++        call mexit(6,1)
++      endif
++      if (imin /= 6 .or. nstlim /= 0 .or. ntb <= 0 .or. ntp /= 0 .or. &
++          ntt /= 0 .or. ntc /= 2 .or. ntf /= 1 .or. &
++          dprc_input_ntc /= 2 .or. dprc_input_ntf /= 1 .or. igb /= 0) then
++        write(6,'(a)') 'DPRc labels require periodic imin=6, nstlim=0, ntc=2, ntf=1, ntp=0, ntt=0, igb=0.'
++        write(6,'(2(a,i0))') 'Observed original cntrl ntc=', dprc_input_ntc, &
++             ' ntf=', dprc_input_ntf
++        call mexit(6,1)
++      endif
++      if (.not. qmmm_nml%ifqnt .or. .not. qmmm_nml%qmtheory%ISQUICK .or. &
++          qmmm_nml%qmmm_int /= 1 .or. qmmm_nml%qm_ewald /= 1 .or. &
++          .not. qmmm_nml%qm_pme .or. .not. qmmm_nml%qmmm_switch .or. &
++          qmmm_nml%vsolv /= 0) then
++        write(6,'(a)') 'DPRc labels require QUICK periodic QM/MM with qmmm_int=1, qm_ewald=1, qm_pme and switching.'
++        call mexit(6,1)
++      endif
++      ! runmd stores the squared classical cutoff in cut after input setup.
++      if (cut /= 81.0d0 .or. abs(dsum_tol - 1.0d-6) > 1.0d-12 .or. &
++          qmmm_nml%qmgb /= 0 .or. qmmm_nml%qmcut /= 9.0d0 .or. &
++          qmmm_nml%r_switch_lo /= 7.0d0 .or. &
++          qmmm_nml%r_switch_hi /= 9.0d0 .or. &
++          qmmm_nml%kmaxqx /= 8 .or. qmmm_nml%kmaxqy /= 8 .or. &
++          qmmm_nml%kmaxqz /= 8 .or. qmmm_nml%ksqmaxq /= 100 .or. &
++          qmmm_nml%adjust_q /= 2 .or. qmmm_nml%qmshake /= 0) then
++        write(6,'(a)') 'DPRc labels require the qualified 9 A switched QM/MM and PME operator settings.'
++        write(6,'(a,5(es24.16,1x))') 'Observed cut, dsum_tol, qmcut, switch_lo, switch_hi: ', &
++             cut, dsum_tol, qmmm_nml%qmcut, qmmm_nml%r_switch_lo, &
++             qmmm_nml%r_switch_hi
++        write(6,'(a,7(i0,1x))') 'Observed kmaxqx/y/z, ksqmaxq, adjust_q, qmshake, qmgb: ', &
++             qmmm_nml%kmaxqx, qmmm_nml%kmaxqy, qmmm_nml%kmaxqz, &
++             qmmm_nml%ksqmaxq, qmmm_nml%adjust_q, qmmm_nml%qmshake, qmmm_nml%qmgb
++        call mexit(6,1)
++      endif
++      if (quick_qmmm_call_count /= dprc_frame64_index - 1_int64) then
++        write(6,'(2(a,i0))') 'DPRc labels require a fresh QUICK job and sequential calls; frame=', &
++             dprc_frame64_index, ' prior_calls=', quick_qmmm_call_count
++        call mexit(6,1)
++      endif
++      if (.not. quick_dprc_label_configuration_is_qualified()) then
++        write(6,'(a)') 'DPRc labels require the qualified QUICK PBE0/6-31G* Hamiltonian and convergence settings.'
++        call mexit(6,1)
++      endif
++      if (qmmm_nml%qmcharge /= -2 .or. qmmm_nml%spin /= 1 .or. &
++          qmmm_struct%nquant /= 16 .or. qmmm_struct%nlink /= 0 .or. &
++          qmmm_struct%nquant_nlink /= 16) then
++        write(6,'(a)') 'DPRc labels require charge -2, singlet spin, 16 real QM atoms, and no link atoms.'
++        call mexit(6,1)
++      endif
++      if (.not. associated(qmmm_struct%iqmatoms)) then
++        write(6,'(a)') 'DPRc label QM atom identity is unavailable.'
++        call mexit(6,1)
++      endif
++      do i = 1, 16
++        if (qmmm_struct%iqmatoms(i) /= i) then
++          write(6,'(a,i0,a,i0)') 'DPRc label QM atom mismatch at slot ', i, &
++               ': atom=', qmmm_struct%iqmatoms(i)
++          call mexit(6,1)
++        endif
++      enddo
++      if (ilscivr /= 0 .or. ipimd /= 0 .or. sebomd_obj%do_sebomd .or. &
++          abfqmmm_param%abfqmmm /= 0 .or. plumed /= 0 .or. nmropt /= 0 .or. &
++          ievb /= 0 .or. icfe /= 0 .or. iamd /= 0 .or. scaledMD /= 0 .or. &
++          ineb /= 0 .or. ntr /= 0 .or. ibelly /= 0 .or. iamoeba /= 0 .or. &
++          ipgm /= 0 .or. iextpot /= 0 .or. infe /= 0 .or. itgtmd /= 0 .or. &
++          ifcap /= 0 .or. ifcr /= 0 .or. temap .or. is_xref_on .or. &
++          ipb /= 0 .or. icnstph /= 0 .or. icnste /= 0) then
++        write(6,'(a)') 'DPRc label mode rejects bias, alternate solvent, cap, charge reassignment, and modified-force paths.'
++        call mexit(6,1)
++      endif
++#ifdef DSSP
++      if (idssp /= 0) then
++        write(6,'(a)') 'DPRc label mode rejects DSSP force terms.'
++        call mexit(6,1)
++      endif
++#endif
++#ifdef RISMSANDER
++      if (rismprm%rism /= RISM_NONE) then
++        write(6,'(a)') 'DPRc label mode rejects RISM force terms.'
++        call mexit(6,1)
++      endif
++#endif
++#ifdef DPRC
++      if (dprc_nml%idprc /= 0) then
++        write(6,'(a)') 'DPRc reference labels reject pre-existing DPRc corrections.'
++        call mexit(6,1)
++      endif
++#endif
++#ifdef MPI
++      if (numtasks /= 1 .or. sandersize /= 1 .or. worldsize /= 1 .or. &
++          numgroup /= 1 .or. rem /= 0) then
++        write(6,'(a)') 'DPRc label mode is qualified only for one process without multisander or REMD.'
++        call mexit(6,1)
++      endif
++      if (ifsc /= 0) then
++        write(6,'(a)') 'DPRc label mode rejects softcore force mixing.'
++        call mexit(6,1)
++      endif
++#endif
++      dprc_quick_calls_before = quick_qmmm_call_count
++    endif
++  endif
++
+   if (abfqmmm_param%abfqmmm == 1) then
+ #ifdef MPI
+     call xdist(v, xx(lfrctmp), natom)
+@@ -1016,6 +1195,97 @@ subroutine runmd(xx, ix, ih, ipairs, x, winv, amass, f, v, vold, xr, xc, &
+       end if
+     end if
+ 
++    ! Export the exact single-point state before PLUMED, thermostat, or later
++    ! integration logic can modify it.  The force call has already completed
++    ! Ewald/CEW assembly, MPI collection, and virtual-site force redistribution.
++    if (master .and. dprc_label_enabled) then
++      if (quick_qmmm_call_count /= dprc_quick_calls_before + 1_int64) then
++        write(6,'(2(a,i0))') 'DPRc label requires exactly one QUICK call; before=', &
++             dprc_quick_calls_before, ' after=', quick_qmmm_call_count
++        call mexit(6,1)
++      endif
++      if (.not. ieee_is_finite(ener%pot%tot) .or. &
++          .not. ieee_is_finite(ener%pot%scf) .or. &
++          .not. all(ieee_is_finite(box(1:3))) .or. &
++          .not. ieee_is_finite(alpha) .or. .not. ieee_is_finite(beta) .or. &
++          .not. ieee_is_finite(gamma) .or. &
++          .not. all(ieee_is_finite(x(1:nr3))) .or. &
++          .not. all(ieee_is_finite(f_or(1:nr3)))) then
++        write(6,'(a)') 'DPRc label state contains a non-finite value.'
++        call mexit(6,1)
++      endif
++
++      write(dprc_label_path,'(a,".",i6.6,".bin")') &
++           trim(dprc_label64_prefix), dprc_frame64_index
++      dprc_label_partial_path = trim(dprc_label_path)//'.partial'
++      inquire(file=trim(dprc_label_path), exist=exstf1)
++      inquire(file=trim(dprc_label_partial_path), exist=exstf2)
++      if (exstf1 .or. exstf2) then
++        write(6,'(a)') 'DPRc label output or partial file already exists; refusing overwrite.'
++        call mexit(6,1)
++      endif
++
++      open(newunit=dprc_unit, file=trim(dprc_label_partial_path), status='new', &
++           action='write', access='stream', form='unformatted', &
++           convert='little_endian', iostat=dprc_io_status, iomsg=dprc_io_message)
++      if (dprc_io_status /= 0) then
++        write(6,'(3a)') 'Could not create DPRc binary64 label partial ', &
++             trim(dprc_label_partial_path), ': '//trim(dprc_io_message)
++        call mexit(6,1)
++      endif
++
++      ! Header (44 bytes), two energies, six cell values, coordinates and
++      ! forces, followed by a 16-byte completion trailer.
++      dprc_expected_size = 124_int64 + 48_int64*int(natom,int64)
++      write(dprc_unit, iostat=dprc_io_status, iomsg=dprc_io_message) &
++           dprc_label_magic, dprc_label_schema, dprc_label_endian, &
++           dprc_frame64_index, int(natom,int64), int(numextra,int64), &
++           dprc_tip4p_redistributed, &
++           real(ener%pot%tot,real64), real(ener%pot%scf,real64), &
++           real(box(1:3),real64), real(alpha,real64), real(beta,real64), &
++           real(gamma,real64), real(x(1:nr3),real64), &
++           real(f_or(1:nr3),real64), dprc_trailer_magic, dprc_expected_size
++      if (dprc_io_status /= 0) then
++        close(dprc_unit)
++        write(6,'(3a)') 'Could not write DPRc binary64 label partial ', &
++             trim(dprc_label_partial_path), ': '//trim(dprc_io_message)
++        call mexit(6,1)
++      endif
++      close(dprc_unit, iostat=dprc_io_status, iomsg=dprc_io_message)
++      if (dprc_io_status /= 0) then
++        write(6,'(3a)') 'Could not close DPRc binary64 label partial ', &
++             trim(dprc_label_partial_path), ': '//trim(dprc_io_message)
++        call mexit(6,1)
++      endif
++      inquire(file=trim(dprc_label_partial_path), size=dprc_actual_size, &
++              iostat=dprc_io_status, iomsg=dprc_io_message)
++      if (dprc_io_status /= 0 .or. dprc_actual_size /= dprc_expected_size) then
++        write(6,'(2(a,i0))') 'DPRc label partial size mismatch: actual=', &
++             dprc_actual_size, ' expected=', dprc_expected_size
++        call mexit(6,1)
++      endif
++
++      ! link(2) publishes the complete inode only when the final name does not
++      ! already exist.  This closes the exists+rename race without exposing a
++      ! partially written payload; both names are in the same directory.
++      dprc_publish_status = dprc_posix_link( &
++           trim(dprc_label_partial_path)//c_null_char, &
++           trim(dprc_label_path)//c_null_char)
++      if (dprc_publish_status /= 0_c_int) then
++        write(6,'(a,i0)') 'Could not atomically publish DPRc binary64 label without overwrite; link status=', &
++             dprc_publish_status
++        call mexit(6,1)
++      endif
++      dprc_cleanup_status = dprc_posix_unlink( &
++           trim(dprc_label_partial_path)//c_null_char)
++      if (dprc_cleanup_status /= 0_c_int) then
++        write(6,'(a,i0)') 'Published DPRc label but could not remove partial hard link; unlink status=', &
++             dprc_cleanup_status
++        call mexit(6,1)
++      endif
++      write(6,'(2a)') 'DPRc binary64 label: ', trim(dprc_label_path)
++    endif
++
+     ! This force call does not count as a "step". CALL NMRDCP to decrement
+     ! local NMR step counter and MTMDUNSTEP to decrease the local MTMD step
+     ! counter
+diff --git a/AmberTools/src/sander/quick_module.F90 b/AmberTools/src/sander/quick_module.F90
+index b24bdb6..c9f9b99 100644
+--- a/AmberTools/src/sander/quick_module.F90
++++ b/AmberTools/src/sander/quick_module.F90
+@@ -6,6 +6,7 @@
+ 
+ module quick_module
+ 
++  use iso_fortran_env, only : int64
+   use UtilitiesModule, only: Upcase
+   use qmmm_module, only: qmmm_nml, qmmm_mpi
+ #ifdef QUICK
+@@ -23,7 +24,14 @@ module quick_module
+ 
+   private
+ 
+-  public :: get_quick_qmmm_forces, quick_finalize
++  public :: get_quick_qmmm_forces, quick_finalize, quick_qmmm_call_count, &
++            quick_dprc_label_configuration_is_qualified
++
++  ! Monotonic per-process count of successful public QUICK energy/gradient
++  ! evaluations.  The DPRc label writer snapshots this around each runmd force
++  ! evaluation so hidden Hessian or special-dynamics re-entry cannot silently
++  ! publish a label assembled from multiple QUICK calls.
++  integer(int64), save :: quick_qmmm_call_count = 0_int64
+ 
+ #ifdef QUICK
+   ! QUICK namelist
+@@ -37,6 +45,7 @@ module quick_module
+   end type quick_nml_type
+ 
+   type(quick_nml_type) :: quick_nml
++  logical, save :: quick_nml_prevalidated = .false.
+ #endif
+ 
+   !
+@@ -57,6 +66,53 @@ module quick_module
+ 
+ contains
+ 
++  ! Re-read the caller's &quick namelist before the first force evaluation and
++  ! accept only the Hamiltonian used to qualify the ETP/ETH DPRc reference.
++  ! quick_nml itself is initialized lazily inside get_quick_qmmm_forces, so a
++  ! pre-force label guard must not inspect that uninitialized saved object.
++  logical function quick_dprc_label_configuration_is_qualified()
++
++    implicit none
++
++#ifdef QUICK
++    type(quick_nml_type) :: candidate
++
++    call read_quick_nml(candidate)
++    quick_dprc_label_configuration_is_qualified = &
++         len_trim(candidate%keywords) == 0 .and. &
++         trim(Upcase(candidate%method)) == 'PBE0' .and. &
++         trim(Upcase(candidate%basis)) == '6-31G*' .and. &
++         candidate%scf_cyc == 250 .and. &
++         candidate%denserms == 1.0d-8 .and. &
++         candidate%intcutoff == 1.0d-8 .and. &
++         candidate%xccutoff == 1.0d-8 .and. &
++         candidate%gradcutoff == 1.0d-7 .and. &
++         candidate%basiscutoff == 1.0d-6 .and. &
++         candidate%reuse_dmx .and. len_trim(candidate%export) == 0
++    if (.not. quick_dprc_label_configuration_is_qualified .and. &
++        qmmm_mpi%commqmmm_master) then
++      write(6,'(5(a,a))') 'Observed QUICK method=', trim(candidate%method), &
++           ' basis=', trim(candidate%basis), ' keywords=', trim(candidate%keywords), &
++           ' export=', trim(candidate%export), ''
++      write(6,'(a,i0,5(a,es24.16))') 'Observed QUICK scf_cyc=', candidate%scf_cyc, &
++           ' denserms=', candidate%denserms, ' intcutoff=', candidate%intcutoff, &
++           ' xccutoff=', candidate%xccutoff, ' gradcutoff=', candidate%gradcutoff, &
++           ' basiscutoff=', candidate%basiscutoff
++      write(6,'(a,l1)') 'Observed QUICK reuse_dmx=', candidate%reuse_dmx
++    endif
++    if (quick_dprc_label_configuration_is_qualified .and. &
++        quick_qmmm_call_count == 0_int64) then
++      ! Freeze the validated object so quick_input_setting cannot observe a
++      ! concurrently replaced mdin file between the guard and first use.
++      quick_nml = candidate
++      quick_nml_prevalidated = .true.
++    endif
++#else
++    quick_dprc_label_configuration_is_qualified = .false.
++#endif
++
++  end function quick_dprc_label_configuration_is_qualified
++
+   ! Calculate the QUICK qmmm force and energy
+   subroutine get_quick_qmmm_forces(nqmatoms, qmcoords, qmtypes, &
+        & nclatoms, clcoords, escf, dxyzqm, dxyzcl, use_cew)
+@@ -126,7 +182,8 @@ contains
+     call getQuickEnergyGradients(qmcoords, nclatoms, clcoords, escf, dxyzqm, dxyzcl, ierr)
+     if ( ierr /= 0 ) then
+         call sander_bomb('Error getting energy and gradient with Quick in getQuickEnergyGradients at quick_module.F90')
+-     end if
++    end if
++    quick_qmmm_call_count = quick_qmmm_call_count + 1_int64
+ 
+ #ifdef MPI
+     ! Quick returns the same energies and forces to all threads,
+@@ -199,8 +256,14 @@ contains
+ 
+     ! Only master reads the mdin input file
+     if (qmmm_mpi%commqmmm_master) then
+-      ! read input from mdin file
+-      call read_quick_nml(quick_nml)
++      ! DPRc label mode freezes the first-call namelist during its pre-force
++      ! qualification check.  Ordinary QUICK callers retain the legacy lazy
++      ! read here.
++      if (quick_nml_prevalidated) then
++        quick_nml_prevalidated = .false.
++      else
++        call read_quick_nml(quick_nml)
++      endif
+ 
+       ! Check if input flags are ok
+       if (quick_nml%keywords .eq. '' .and. quick_nml%method .eq. '') then

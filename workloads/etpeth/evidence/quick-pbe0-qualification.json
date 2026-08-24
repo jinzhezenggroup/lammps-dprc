@@ -1,0 +1,94 @@
+{
+  "basis": {
+    "basis_link_sha256": "e2dde37d303c0586f5b176082e3c06580f391e8b2d3433756666cccf73dcff57",
+    "definition_sha256": "6100c60d37228a04773b529bbf62c81d89fb210cf890e0318dbd50cfb46c11db",
+    "name": "6-31G*",
+    "quick_definition": "6-31GD.BAS"
+  },
+  "calls": [
+    {
+      "call_index": 1,
+      "energy_kcal_per_mol": -155756.12679685,
+      "mm_point_charge_gradient_vectors": 10,
+      "qm_link_gradient_vectors": 12,
+      "quick": {
+        "cycles": 17,
+        "energy_hartree": -248.213189416,
+        "maximum_change": 3.79426e-08,
+        "maximum_error": 2.30845e-08,
+        "path": "quick-traces/QUICK_job.000001.out",
+        "rms_change": 2.77346e-09,
+        "scf_seconds": 2.801937,
+        "sha256": "cd26008d8139057cef7434e372af3630dd48e1fe0010d3676f1e219090d3e559"
+      }
+    },
+    {
+      "call_index": 2,
+      "energy_kcal_per_mol": -155755.37960564,
+      "mm_point_charge_gradient_vectors": 10,
+      "qm_link_gradient_vectors": 12,
+      "quick": {
+        "cycles": 17,
+        "energy_hartree": -248.211998691,
+        "maximum_change": 3.63903e-08,
+        "maximum_error": 2.17821e-08,
+        "path": "quick-traces/QUICK_job.000002.out",
+        "rms_change": 2.70935e-09,
+        "scf_seconds": 2.769403,
+        "sha256": "00dc14194145a3cc7ec55ecb675f17e96f0ccb617ae36fd3cf226383ea7af7a0"
+      }
+    }
+  ],
+  "engine_manifest": {
+    "path": "config/quick_pbe0_engine.json",
+    "sha256": "83abd43eb02bf5be75055a2df842265e6c55598ee74625b206b82c010e89aa92"
+  },
+  "failed_frame_ledger": [],
+  "gpu_telemetry": {
+    "first_timestamp": "2026/08/23 09:08:09.227",
+    "last_timestamp": "2026/08/23 09:08:26.320",
+    "maximum_gpu_utilization_percent": 100.0,
+    "maximum_memory_mib": 16002.0,
+    "maximum_power_watts": 138.19,
+    "samples": 340
+  },
+  "limitations": [
+    "the fixture is nonperiodic and does not qualify the ETP/ETH periodic embedding",
+    "the fixture does not qualify TIP4P M-site force redistribution",
+    "the fixture does not provide an independent PBE0 energy or force oracle",
+    "the fixture timing is installation evidence, not the aggregate umbrella-sampling performance metric"
+  ],
+  "method": {
+    "libxc_family": "HYBRID GGA",
+    "libxc_kind": "EXCHANGE CORRELATION",
+    "libxc_name": "PBEH (PBE0)",
+    "libxc_version": "4.3.4",
+    "name": "PBE0",
+    "quick_keyword": "PBE0"
+  },
+  "qualification_scope": "engine-qualified-periodic-labeler-pending",
+  "qualified": true,
+  "runtime_artifacts": {
+    "libquick_cuda.so": "2bca08d9c4707a8e039b652244256be7a608767c9a7fcb6ac3daa00253f07232",
+    "quick.cuda": "b92d0efa2569094c8009f7b239b842d06ae8d2cd79464fe4e3fae4a5b4c5b198",
+    "sander.quick.cuda": "3caa4848242bc311aeb9efa53801baa35a266b37f8394f21a807814f5c11b72e"
+  },
+  "scf": {
+    "density_rms": 1e-08,
+    "failure_policy": "a nonconverged or incomplete frame is recorded and excluded from labels; no partial force slice is published",
+    "maximum_cycles": 250
+  },
+  "schema_version": 1,
+  "source": {
+    "ambertools_license_sha256": "912af0215a173b10e44c254b1ee2ed844393298a503bea4596216afcb42ec509",
+    "archive_sha256": "5d46eef3c2bb7d5bf9e8c0c38add34406ea67e3f0e4097ac9d11d8a544538c9c",
+    "cuda_compatibility_patch_sha256": "02e4a34705b10359306680349c6da5ddeea1f1d0e4de4a2257a8a5af52a31154",
+    "official_update_sha256": "8a2406339cafef5730eabc4fb0d39d4a47b29655048fb7887625c4b3edd134d9",
+    "quick_license_sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+  },
+  "timing": {
+    "exit_status": 0,
+    "maximum_resident_kbytes": 2965732,
+    "wall_clock": "0:17.12"
+  }
+}

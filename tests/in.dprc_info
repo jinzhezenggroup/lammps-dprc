@@ -1,0 +1,2 @@
+plugin load ${dprc_plugin}
+dprc/info ${dprc_marker}

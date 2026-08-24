@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "qualification": "private-diagnostic",
+  "date": "2026-08-24",
+  "claim": "Aggregate accepted umbrella MD steps per second per physical GPU",
+  "system": {
+    "name": "ETP/ETH",
+    "atom_count": 8938,
+    "qm_atom_count": 16,
+    "solvent": "TIP4P-Ew",
+    "pppm_mesh": [50, 50, 50]
+  },
+  "hardware": {
+    "cpu": "AMD EPYC 7K62 48-Core Processor",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpu_memory_mib": 32607
+  },
+  "software": {
+    "nvidia_driver": "580.95.05",
+    "mpich_hydra": "5.0.1",
+    "lammps_dprc_revision": "4b0a62ba48e2f456bbe90a392bec5828587e469f",
+    "lammps_revision": "7bd373ebc61a8028be955e6be862d5a091fd59c5",
+    "xtbloom_revision": "3c474e1c1b639098f72ae7523472bd5f65ad3ab5"
+  },
+  "protocol": {
+    "mpi_ranks_per_window": 1,
+    "physical_gpus": 1,
+    "warmup_steps_per_window": 25,
+    "sample_steps_per_window": 100,
+    "mm_repetitions": 5,
+    "qmmm_repetitions": 5,
+    "qmmm_dpa4c_repetitions": 3,
+    "statistic": "median synchronized aggregate throughput"
+  },
+  "runtime_artifacts": {
+    "xtbloom_sha256": "c19e0376100b283f933da896d09fab26f578367b3460f2e79c70daf03b8efa6c",
+    "deepmd_plugin_sha256": "0cf9e3b8a1c30b03c0778fcd24507ba26bf83f2720af84bdaa9a96b47bd931d0",
+    "dpa4c_model_sha256": "b44d9eef44009739fee9ef98d22328b7fb29e298e82ae77b8824e361d335dfde",
+    "dpa4c_model_status": "randomly initialized and scientifically unqualified"
+  },
+  "source_summaries": [
+    {
+      "run_id": "classical-optimized-long-diagnostic-20260823",
+      "sha256": "7fa336e9a92cf34f5aa23d6addf310007c3cf7c67de2444e99c56addbf5244ff"
+    },
+    {
+      "run_id": "qmmm-padded-point-slots-tuned-b1-b32-b48-diagnostic-20260823",
+      "sha256": "6118636319877d5dc5c36efa33f2ba8045f924828884f9732700f84317152710"
+    },
+    {
+      "run_id": "qmmm-padded-point-slots-tuned-b2-b16-diagnostic-20260823",
+      "sha256": "9241619b0203f588a207fe43efe328b286830bcbadf488f678f8ccbdd6bd106a"
+    },
+    {
+      "run_id": "dpa4c-partition-shared-window-20260824-r3",
+      "sha256": "567ff208eaf4e6e1b690120b463acf2e915ff15f47eeaa0e40ea82d7df4c54b1"
+    }
+  ],
+  "batch_32_incremental_seconds_per_100_steps": {
+    "mm_base": 2.68209,
+    "qmmm_increment": 5.13198,
+    "dpa4c_increment": 8.66163,
+    "total_qmmm_dpa4c": 16.47570
+  },
+  "sander_reference": {
+    "xtb_qmmm_steps_per_second_one_cpu_core": 6.916,
+    "old_qmmm_dprc_steps_per_second_one_cpu_core": 6.414,
+    "old_dprc_comparability": "not comparable because it used four copies of an older DeePMD test graph rather than DPA4c"
+  },
+  "batch_48_qmmm_dpa4c": {
+    "status": "failed",
+    "component": "xTBloom CUDA SCC plan creation",
+    "diagnostic": "xtbloom_plan_create status=4 error=11 field=2"
+  }
+}

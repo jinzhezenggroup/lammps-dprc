@@ -1,0 +1,35 @@
+/build/
+/cmake-build-*/
+/.cache/
+/.venv/
+__pycache__/
+*.py[cod]
+
+# LAMMPS runtime products
+log.lammps*
+screen.*
+*.restart*
+*.lammpstrj
+*.dcd
+*.xtc
+
+# Native build and profiler products
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.nsys-rep
+*.ncu-rep
+*.qdstrm
+*.sqlite
+*.sqlite.dbb
+*.csv.db
+*.prof
+
+# Models and large generated evidence are never committed by default.
+*.pb
+*.pth
+*.pt
+*.savedmodel/

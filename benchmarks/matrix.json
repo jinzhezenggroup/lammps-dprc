@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "claim": "correctness-qualified aggregate umbrella MD steps per second per physical GPU",
+  "target_workload": {
+    "source": "dprc-tutorial",
+    "atoms": 8938,
+    "qm_atoms": 16,
+    "triclinic": true,
+    "water_model": "TIP4P-Ew",
+    "real_space_cutoff_angstrom": 9.0,
+    "pppm_mesh": [50, 50, 50]
+  },
+  "axes": {
+    "mode": ["classical", "qmmm", "qmmm-dpa4c"],
+    "batch_size": [1, 2, 4, 8, 16, 32, 48],
+    "ranks_per_window": [1, 2, 4],
+    "scc_start": ["fresh", "warm"],
+    "precision": ["fp64-reference", "dprc-fp32", "xtb-mixed-safe"],
+    "dprc": [
+      "disabled",
+      "single-primary",
+      "single-primary-plus-periodic-four-model-deviation"
+    ],
+    "classical_backend": ["cpu-reference", "lammps-gpu-pair", "fused-qmmm-pppm"]
+  },
+  "mode_semantics": {
+    "classical": "complete Amber/TIP4P force field through the shared batched DPRc CUDA LJ/TIP4P/PPPM backend; no xTB or DPRc. The upstream GPU-pair plus CPU-PPPM path remains an explicit reference backend",
+    "qmmm": "batched xTBloom GFN2-xTB QM/MM plus fused batched LJ/TIP4P/PPPM",
+    "qmmm-dpa4c": "qmmm plus one compact DPA4c DPRc primary evaluated every step; an optional positive model-deviation frequency evaluates three additional qualified models only on deviation timesteps"
+  },
+  "measurement": {
+    "warmup_steps": 25,
+    "sample_steps": 100,
+    "repetitions": 5,
+    "model_deviation_frequency_default": 0,
+    "timing_boundary": "maximum synchronized LAMMPS loop time across partitions",
+    "setup_reported_separately": true
+  },
+  "required_correctness": [
+    "energy",
+    "forces",
+    "virial",
+    "qm_charges",
+    "point_charge_forces",
+    "scc_convergence",
+    "serial_batch_parity",
+    "free_energy_with_uncertainty"
+  ],
+  "primary_metrics": [
+    "aggregate_steps_per_second_per_gpu",
+    "aggregate_nanoseconds_per_day_per_gpu"
+  ]
+}

@@ -1,0 +1,52 @@
+# Two synchronized umbrella-like partitions. Partition one starts with an
+# extra nearby MM point, then moves it beyond the QM cutoff to force a
+# collective ragged-topology rebuild and a strict FRESH SCC restart.
+
+plugin load ${dprc_plugin}
+variable        extra world 0 1
+
+units           real
+atom_style      charge
+atom_modify     map array
+boundary        p p p
+
+region          cell block 0 20 0 20 0 20 units box
+create_box      3 cell
+create_atoms    1 single 9.60 10.0 10.0 units box
+create_atoms    1 single 10.40 10.0 10.0 units box
+create_atoms    2 single 5.00 10.0 10.0 units box
+create_atoms    3 single 15.00 10.0 10.0 units box
+if              "${extra} == 1" then &
+                "create_atoms 2 single 12.00 10.0 10.0 units box"
+
+mass            1 1.008
+mass            2 22.990
+mass            3 35.450
+set             atom 1 charge 0.0
+set             atom 2 charge 0.0
+set             atom 3 charge 1.0
+set             atom 4 charge -1.0
+if              "${extra} == 1" then "set atom 5 charge 0.25"
+group           qm id 1 2
+group           moving_mm id 5
+
+pair_style      coul/long 8.0
+pair_coeff      * *
+kspace_style    pppm/dprc 1.0e-5
+fix             qmmm qm qmmm/xtb/dprc elements H Na Cl cutoff 8.0 &
+                method gfn2 charge 0 uhf 0 accuracy 1.0e-3 maxiter 250 &
+                etemp 300.0 mmhardness 0.0
+fix             move_extra moving_mm move linear 7.0 0.0 0.0 units box
+
+thermo          1
+thermo_style    custom step pe f_qmmm
+run             1
+# Exercise LAMMPS's repeated Fix::init() lifecycle. With unchanged topology,
+# the second run retains the fixed broker plan and its WARM checkpoint.
+run             1
+# Exercise synchronized collective destruction and creation with a fresh plan.
+unfix           qmmm
+fix             qmmm qm qmmm/xtb/dprc elements H Na Cl cutoff 8.0 &
+                method gfn2 charge 0 uhf 0 accuracy 1.0e-3 maxiter 250 &
+                etemp 300.0 mmhardness 0.0
+run             0

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/lammps/lammps",
+  "revision": "7bd373ebc61a8028be955e6be862d5a091fd59c5",
+  "license": "GPL-2.0-only",
+  "patch": {
+    "path": "patches/lammps-qmmm-xtb-fused.patch",
+    "sha256": "8d4ceb3bc709f29edb068321a6b9f893aaf29d941d961b63f1d5eae6678307ba",
+    "derived_from": {
+      "path": "lammps-dprc-runs/fused-recovery/lammps-9ab8ca5-fused-final.patch",
+      "sha256": "f793e88d1ae7051eb5bbbaf7f6b9ac71e91f8ac460d4531713aa935d72f06ffd",
+      "baseline_revision": "9ab8ca565e0f71d967587e0bca2015f7d689f19f"
+    }
+  },
+  "files": [
+    {
+      "path": "src/QMMM-XTB/fix_qmmm_xtb.cpp",
+      "input_sha256": "921cdd2cc3be8623b8da030d1078e4eb21200aa08e9cb0cedcebf5024a8e3454",
+      "output_sha256": "3952ac0164e7edf442f5420f98d0c6bbd605bd51b40c6f92d8b05828290afa76"
+    },
+    {
+      "path": "src/QMMM-XTB/fix_qmmm_xtb.h",
+      "input_sha256": "886d7e9a6bf55952c06b554f6c329b4d2e2d3d8132c48afe670c1009be612e77",
+      "output_sha256": "f518f57762f297613b9a9a268c94f526b437c83bb93f69056e6e46b742b20398"
+    },
+    {
+      "path": "src/QMMM-XTB/pppm_tip4p_xtb.h",
+      "input_sha256": "2f2167b3b435fde0e9262a01f362a472f6d255d0f0409b1e82ce9ff5f1eba422",
+      "output_sha256": "4cc6a2b5d73770c842f6c872249e895a61e5dd6c51e1d56f068cf1dc1a5d8784"
+    },
+    {
+      "path": "src/QMMM-XTB/pppm_xtb.h",
+      "input_sha256": "eb326b5bc8ed233ccd58e32c2e11c529033b3b12d9881eadcd4f0577f15957a5",
+      "output_sha256": "38e1f8f5176d09c9e45b9ea86d60122c92885fd9b1d8bb9cf02ff3cdbb606165"
+    },
+    {
+      "path": "src/QMMM-XTB/qmmm_xtb_ewald.cpp",
+      "input_sha256": "08bad9de3e1c01a00434db260611795cebcb60de6c8952a30f09bf2524ce7f6e",
+      "output_sha256": "08bad9de3e1c01a00434db260611795cebcb60de6c8952a30f09bf2524ce7f6e"
+    },
+    {
+      "path": "src/QMMM-XTB/qmmm_xtb_ewald.h",
+      "input_sha256": "8b23a5c39c1b8d676c6695b67334f860e938888be2a99eeb76e74a38481753ca",
+      "output_sha256": "8b23a5c39c1b8d676c6695b67334f860e938888be2a99eeb76e74a38481753ca"
+    },
+    {
+      "path": "src/QMMM-XTB/qmmm_xtb_pppm.cpp",
+      "input_sha256": "8c85ce5d1bfb68b1f58ab7b84ac89c4c4c2fa2b5bd57a9315c427426447f7b23",
+      "output_sha256": "5763e433d0322302adfd7e0a2e5118fbcf72172c84e5a41aba560341d0af6817"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+batch_size,mm_steps_per_second_per_gpu,qmmm_steps_per_second_per_gpu,qmmm_dpa4c_steps_per_second_per_gpu,qmmm_vs_sander_xtb_ratio,status
+1,475.160961,26.924496,23.559401,3.893,diagnostic-passed-unqualified
+2,686.318246,53.717088,43.698845,7.767,diagnostic-passed-unqualified
+4,890.945984,99.317687,74.662665,14.361,diagnostic-passed-unqualified
+8,1032.433911,177.363142,116.406305,25.645,diagnostic-passed-unqualified
+16,1121.076233,281.432986,156.304951,40.693,diagnostic-passed-unqualified
+32,1193.099411,409.517703,194.225435,59.213,diagnostic-passed-unqualified
+48,1114.087168,427.575026,,61.824,qmmm-dpa4c-failed-xtbloom-plan-create

@@ -1,0 +1,979 @@
+--- a/src/QMMM-XTB/fix_qmmm_xtb.cpp
++++ b/src/QMMM-XTB/fix_qmmm_xtb.cpp
+@@ -22,8 +22,10 @@
+ #include "math_const.h"
+ #include "memory.h"
+ #include "modify.h"
++#include "neighbor.h"
+ #include "pair.h"
+-#include "pair_hybrid_overlay.h"
++#include "pair_hybrid.h"
++#include "platform.h"
+ #include "pppm_tip4p_xtb.h"
+ #include "pppm_xtb.h"
+ #include "qmmm_xtb_adapter.h"
+@@ -33,6 +35,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <exception>
+ #include <memory>
+@@ -43,8 +46,25 @@ using namespace LAMMPS_NS;
+ using namespace FixConst;
+ using namespace MathConst;
+ 
++extern "C" const char *lammps_qmmm_xtb_last_error();
++
+ namespace {
+ 
++std::string broadcast_adapter_error(MPI_Comm communicator, int rank, const char *fallback)
++{
++  std::string message;
++  if (rank == 0) {
++    const char *diagnostic = lammps_qmmm_xtb_last_error();
++    message = diagnostic && diagnostic[0] != '\0' ? diagnostic : fallback;
++  }
++
++  int length = rank == 0 ? static_cast<int>(message.size()) : 0;
++  MPI_Bcast(&length, 1, MPI_INT, 0, communicator);
++  if (rank != 0) message.resize(static_cast<std::size_t>(length));
++  if (length > 0) MPI_Bcast(message.data(), length, MPI_CHAR, 0, communicator);
++  return message;
++}
++
+ constexpr double BOHR_TO_ANGSTROM = 0.529177210903;
+ const char *ELEMENT_SYMBOLS[] = {
+     "H",  "He", "Li", "Be", "B",  "C",  "N",  "O",  "F",  "Ne", "Na", "Mg", "Al", "Si", "P",
+@@ -73,9 +93,14 @@
+     Fix(lmp, narg, arg), pair_long(nullptr), pair_coulomb_mm_only(false),
+     tip4p_qm_group_validated(false), xtb_method(2), qm_charge(0), qm_uhf(0), maxiter(250),
+     cutoff(-1.0), accuracy(1.0e-3), electronic_temperature(300.0), mm_hardness(0.0),
+-    image_alpha(-1.0), image_kmax({8, 8, 8}), image_ksqmax(64), nqm(0), pair_mm_energy(0.0),
++    image_alpha(-1.0), image_kmax({8, 8, 8}), image_ksqmax(64), nqm(0),
++    mm_topology_valid(false), mm_topology_refreshes(0), mm_topology_changes(0),
++    pair_mm_energy(0.0),
+     pair_full_energy(0.0), mm_kspace_energy(0.0), qm_energy(0.0), energy_correction(0.0),
+-    pppm_xtb(nullptr), pppm_tip4p_xtb(nullptr), image_ewald(new QMMMXTBEwald), adapter_active(false)
++    pppm_xtb(nullptr), pppm_tip4p_xtb(nullptr), image_ewald(new QMMMXTBEwald),
++    image_ewald_initialized(false), adapter_active(false),
++    profile_enabled(std::getenv("LAMMPS_QMMM_XTB_PROFILE") != nullptr), profile_steps(0),
++    profile_time{}
+ {
+   if (!atom->tag_enable) error->all(FLERR, "Fix qmmm/xtb requires atom IDs");
+   if (atom->map_style == Atom::MAP_NONE) error->all(FLERR, "Fix qmmm/xtb requires an atom map");
+@@ -185,10 +210,23 @@
+ 
+ FixQMMMXTB::~FixQMMMXTB()
+ {
++  if (profile_enabled && comm->me == 0 && profile_steps > 0) {
++    utils::logmesg(
++        lmp,
++        "fix qmmm/xtb profile over {} steps (ms/step): prep {:.3f}, "
++        "MM potential {:.3f}, MM KSpace {:.3f}, image response {:.3f}, "
++        "xTB {:.3f}, QM KSpace {:.3f}, periodic forces {:.3f}; "
++        "MM list refreshes {}, topology changes {}\n",
++        profile_steps, 1000.0 * profile_time[0] / profile_steps,
++        1000.0 * profile_time[1] / profile_steps, 1000.0 * profile_time[2] / profile_steps,
++        1000.0 * profile_time[3] / profile_steps, 1000.0 * profile_time[4] / profile_steps,
++        1000.0 * profile_time[5] / profile_steps, 1000.0 * profile_time[6] / profile_steps,
++        mm_topology_refreshes, mm_topology_changes);
++  }
+   if (comm->me == 0 && adapter_active) lammps_qmmm_xtb_destroy();
+ }
+ 
+ FixQMMMXTB::PairCoulombMapping FixQMMMXTB::classify_pair_coulomb_mapping(char *substyle)
+ {
+-  auto *hybrid = dynamic_cast<PairHybridOverlay *>(force->pair);
++  auto *hybrid = dynamic_cast<PairHybrid *>(force->pair);
+   if (!hybrid) return PairCoulombMapping::FULL;
+@@ -228,7 +266,8 @@
+   // the retained Lennard-Jones interactions when their mappings are pruned.
+   const bool coulomb_only_style = std::strcmp(substyle, "coul/long") == 0 ||
+       std::strcmp(substyle, "coul/long/omp") == 0 || std::strcmp(substyle, "tip4p/long") == 0 ||
+-      std::strcmp(substyle, "tip4p/long/omp") == 0;
++      std::strcmp(substyle, "tip4p/long/omp") == 0 ||
++      std::strcmp(substyle, "tip4p/long/dprc/batch") == 0;
+   if (coulomb_only_style && mm_only_mapping) return PairCoulombMapping::MM_ONLY;
+   return PairCoulombMapping::INVALID;
+ }
+@@ -245,6 +284,13 @@
+ 
+ void FixQMMMXTB::init()
+ {
++  // Explicit change_box commands are allowed between runs. Refresh the
++  // cell-dependent direct-Ewald coefficients at every LAMMPS init boundary.
++  image_ewald_initialized = false;
++  // Re-evaluate the cutoff+skin membership at the next force call. Keeping
++  // the old vector lets an unchanged new run preserve its xTB plan and WARM
++  // checkpoint after the membership audit.
++  mm_topology_valid = false;
+   pair_coulomb_mm_only = false;
+   tip4p_qm_group_validated = false;
+ 
+@@ -282,6 +328,7 @@
+     // style.  Non-Coulomb terms are identical in the two reference captures
+     // and cancel from the QM/MM correction.
+     const char *tip4p_styles[] = {"tip4p/long",
++                                  "tip4p/long/dprc/batch",
+                                   "tip4p/long/omp",
+                                   "lj/cut/tip4p/long",
+                                   "lj/cut/tip4p/long/omp",
+@@ -296,6 +343,12 @@
+   }
+   if (!pair_long)
+     error->all(FLERR, "Fix qmmm/xtb requires a compatible long-range Coulomb pair style");
++  if (!force->kspace->compute_flag)
++    error->all(FLERR, "Fix qmmm/xtb requires kspace_modify compute yes");
++  if (!force->pair->compute_flag)
++    error->all(FLERR, "Fix qmmm/xtb requires pair_modify compute yes");
++  if (!pair_long->compute_flag)
++    error->all(FLERR, "Fix qmmm/xtb requires its Coulomb pair sub-style to compute");
+   // PairHybrid::check_ijtype() uses the sub-style keyword as its public lookup
+   // interface.  Obtain the canonical keyword from the matched Pair instance.
+   char *pair_long_style = force->pair_match_ptr(pair_long);
+@@ -328,7 +381,11 @@ void FixQMMMXTB::init()
+                                     qm_charge, qm_uhf, accuracy, maxiter, electronic_temperature);
+   }
+   MPI_Bcast(&status, 1, MPI_INT, 0, world);
+-  if (status) error->all(FLERR, "Could not initialize the xTB QM/MM adapter");
++  if (status) {
++    const std::string diagnostic =
++        broadcast_adapter_error(world, comm->me, "adapter initialization failed");
++    error->all(FLERR, "Could not initialize the xTB QM/MM adapter: {}", diagnostic);
++  }
+   adapter_active = true;
+ }
+ 
+@@ -448,6 +505,48 @@
+   }
+ }
+ 
++void FixQMMMXTB::project_last_solve_potential(double *potential, int sensor_groupbit)
++{
++  if (pppm_tip4p_xtb)
++    pppm_tip4p_xtb->project_last_solve_potential(potential, sensor_groupbit);
++  else
++    pppm_xtb->project_last_solve_potential(potential, sensor_groupbit);
++}
++
++void FixQMMMXTB::cache_last_solve_as_mm()
++{
++  if (pppm_tip4p_xtb)
++    pppm_tip4p_xtb->cache_last_solve_as_mm();
++  else
++    pppm_xtb->cache_last_solve_as_mm();
++}
++
++void FixQMMMXTB::prepare_fused_full_solve()
++{
++  if (pppm_tip4p_xtb)
++    pppm_tip4p_xtb->prepare_fused_full_solve();
++  else
++    pppm_xtb->prepare_fused_full_solve();
++}
++
++void FixQMMMXTB::commit_fused_full_solve(int vflag)
++{
++  if (pppm_tip4p_xtb)
++    pppm_tip4p_xtb->commit_fused_full_solve(update->ntimestep, vflag, update->whichflag,
++                                             update->setupflag);
++  else
++    pppm_xtb->commit_fused_full_solve(update->ntimestep, vflag, update->whichflag,
++                                      update->setupflag);
++}
++
++void FixQMMMXTB::discard_fused_full_solve() noexcept
++{
++  if (pppm_tip4p_xtb)
++    pppm_tip4p_xtb->discard_fused_full_solve();
++  else
++    pppm_xtb->discard_fused_full_solve();
++}
++
+ void FixQMMMXTB::gather_qm_atoms(bool initialize)
+ {
+   int nlocal_qm = 0;
+@@ -544,10 +643,24 @@
+ 
+ void FixQMMMXTB::gather_mm_points()
+ {
+-  std::vector<MMPoint> local;
++  // Point-charge gamma values are part of xTBloom's immutable plan identity.
++  // Keep a cutoff+skin superset fixed between LAMMPS neighbor rebuilds and
++  // set shell-site charges to exact zero. Because every explicit xTB point
++  // term and the matching Ewald subtraction are linear in that charge, the
++  // shell contributes exactly zero while avoiding plan rebuilds when a site
++  // crosses the physical cutoff inside the current neighbor epoch.
++  const bool refresh_membership = !mm_topology_valid || neighbor->ago == 0;
+   const double cutsq = cutoff * cutoff;
+-  for (int i = 0; i < atom->nlocal; ++i) {
+-    if (atom->mask[i] & groupbit) continue;
++  const double shell_cutoff = cutoff + std::max(0.0, neighbor->skin);
++  const double shell_cutsq = shell_cutoff * shell_cutoff;
++  std::vector<MMPoint> local;
++  if (refresh_membership)
++    local.reserve(atom->nlocal);
++  else
++    local.reserve(mm_points.size());
++
++  auto append_local_point = [&](int i, bool require_shell_membership) {
++    if (i < 0 || i >= atom->nlocal || (atom->mask[i] & groupbit)) return;
+ 
+     double site[3], force_weights[3];
+     int force_indices[3];
+@@ -555,17 +668,20 @@
+     if (nforce < 1 || nforce > 3)
+       error->one(FLERR, "Invalid charge-site force mapping for fix qmmm/xtb");
+ 
+-    bool selected = false;
+-    for (int iqm = 0; iqm < nqm && !selected; ++iqm) {
++    bool active = false;
++    bool in_shell = false;
++    for (int iqm = 0; iqm < nqm && !(active && in_shell); ++iqm) {
+       double dx = site[0] - qm_x_wrapped[3 * iqm];
+       double dy = site[1] - qm_x_wrapped[3 * iqm + 1];
+       double dz = site[2] - qm_x_wrapped[3 * iqm + 2];
+       domain->minimum_image(FLERR, dx, dy, dz);
+-      selected = dx * dx + dy * dy + dz * dz < cutsq;
++      const double rsq = dx * dx + dy * dy + dz * dz;
++      active |= rsq < cutsq;
++      in_shell |= rsq < shell_cutsq;
+     }
+-    if (!selected) continue;
++    if (require_shell_membership && !in_shell) return;
+ 
+-    MMPoint point;
++    MMPoint point{};
+     point.tag = atom->tag[i];
+     // A virtual charge site has no chemical element of its own.  This also
+     // selects the documented extra-site hardness for implicit TIP4P M sites.
+@@ -577,17 +693,24 @@
+     point.x[0] = qm_x[0] + dx;
+     point.x[1] = qm_x[1] + dy;
+     point.x[2] = qm_x[2] + dz;
+-    point.charge = atom->q[i];
++    point.charge = active ? atom->q[i] : 0.0;
+     point.nforce = nforce;
+-    for (int iparent = 0; iparent < 3; ++iparent) {
+-      point.force_tags[iparent] = 0;
+-      point.force_weights[iparent] = 0.0;
+-    }
+     for (int iparent = 0; iparent < nforce; ++iparent) {
+       point.force_tags[iparent] = atom->tag[force_indices[iparent]];
+       point.force_weights[iparent] = force_weights[iparent];
+     }
+     local.push_back(point);
++  };
++
++  if (refresh_membership) {
++    for (int i = 0; i < atom->nlocal; ++i) append_local_point(i, true);
++  } else {
++    // Atom ownership cannot migrate between neighbor rebuilds. Updating the
++    // stable tags avoids a full N_MM x N_QM selection scan on ordinary steps.
++    for (const auto &point : mm_points) {
++      const int i = atom->map(point.tag);
++      if (i >= 0 && i < atom->nlocal) append_local_point(i, false);
++    }
+   }
+ 
+   int nlocal_mm = local.size();
+@@ -639,9 +762,28 @@
+ 
+   std::vector<int> order(total);
+   std::iota(order.begin(), order.end(), 0);
+-  std::sort(order.begin(), order.end(), [&](int i, int j) {
+-    return tags[i] < tags[j];
+-  });
++  std::sort(order.begin(), order.end(), [&](int i, int j) { return tags[i] < tags[j]; });
++
++  bool topology_changed = static_cast<std::size_t>(total) != mm_points.size();
++  if (!topology_changed) {
++    for (int imm = 0; imm < total && !topology_changed; ++imm) {
++      const int source = order[imm];
++      const MMPoint &old = mm_points[imm];
++      topology_changed = old.tag != tags[source] ||
++          old.atomic_number != atomic_numbers[source] || old.nforce != nforce[source];
++      for (int iparent = 0; iparent < 3 && !topology_changed; ++iparent)
++        topology_changed = old.force_tags[iparent] != force_tags[3 * source + iparent] ||
++            old.force_weights[iparent] != force_weights[3 * source + iparent];
++    }
++  }
++  if (!refresh_membership && topology_changed)
++    error->all(FLERR, "Fix qmmm/xtb MM point topology changed before a neighbor rebuild");
++
++  if (refresh_membership) {
++    ++mm_topology_refreshes;
++    if (topology_changed) ++mm_topology_changes;
++    mm_topology_valid = true;
++  }
+   mm_points.resize(total);
+   for (int imm = 0; imm < total; ++imm) {
+     const int source = order[imm];
+@@ -705,10 +847,13 @@
+   for (int i = 0; i < 6; ++i) captured_virial[i] = force->kspace->virial[i];
+ }
+ 
+-void FixQMMMXTB::compute_mm_shift(std::vector<double> &shift)
++void FixQMMMXTB::compute_mm_shift(std::vector<double> &shift, bool reuse_last_solve)
+ {
+   std::vector<double> potential(atom->nmax, 0.0);
+-  compute_group_potential(potential.data(), groupbit, groupbit, true);
++  if (reuse_last_solve)
++    project_last_solve_potential(potential.data(), groupbit);
++  else
++    compute_group_potential(potential.data(), groupbit, groupbit, true);
+ 
+   shift.assign(nqm, 0.0);
+   for (int i = 0; i < atom->nlocal; ++i) {
+@@ -770,7 +915,11 @@ void FixQMMMXTB::run_xtb(const std::vector<double> &mm_shift,
+   }
+ 
+   MPI_Bcast(&status, 1, MPI_INT, 0, world);
+-  if (status) error->all(FLERR, "xTB SCC calculation failed in fix qmmm/xtb");
++  if (status) {
++    const std::string diagnostic =
++        broadcast_adapter_error(world, comm->me, "adapter calculation failed");
++    error->all(FLERR, "xTB calculation failed in fix qmmm/xtb: {}", diagnostic);
++  }
+   MPI_Bcast(&energy_hartree, 1, MPI_DOUBLE, 0, world);
+   MPI_Bcast(qm_gradient.data(), 3 * nqm, MPI_DOUBLE, 0, world);
+   MPI_Bcast(qm_charge_scf.data(), nqm, MPI_DOUBLE, 0, world);
+@@ -818,6 +967,7 @@
+ 
+ void FixQMMMXTB::pre_force(int vflag)
+ {
++  double profile_start = profile_enabled ? platform::walltime() : 0.0;
+   v_init(vflag);
+   save_entry_forces();
+   gather_qm_atoms(false);
+@@ -827,39 +977,68 @@
+   set_qm_charges(0.0);
+   gather_mm_points();
+   if (!pair_coulomb_mm_only) capture_pair(pair_mm_force, pair_mm_energy, pair_mm_virial);
+-
+-  std::vector<double> mm_shift;
+-  compute_mm_shift(mm_shift);
++  if (profile_enabled) {
++    const double now = platform::walltime();
++    profile_time[0] += now - profile_start;
++    profile_start = now;
++  }
+ 
+   std::vector<double> unused_force;
+   std::array<double, 6> unused_virial;
+   capture_kspace(unused_force, mm_kspace_energy, unused_virial);
++  if (profile_enabled) {
++    const double now = platform::walltime();
++    profile_time[2] += now - profile_start;
++    profile_start = now;
++  }
++
++  std::vector<double> mm_shift;
++  compute_mm_shift(mm_shift, true);
++  cache_last_solve_as_mm();
++  if (profile_enabled) {
++    const double now = platform::walltime();
++    profile_time[1] += now - profile_start;
++    profile_start = now;
++  }
+ 
+-  const double alpha = image_alpha > 0.0
+-      ? image_alpha
+-      : 10.0 / std::cbrt(domain->xprd * domain->yprd * domain->zprd);
+   std::vector<double> image_response;
+   try {
+-    // LAMMPS stores a restricted triclinic cell as columns
+-    // a=(xprd,0,0), b=(xy,yprd,0), c=(xz,yz,zprd).  Passing the full matrix
+-    // lets the direct QM-image Ewald operator construct 2*pi*H^-T*n.
+-    const QMMMXTBEwald::CellMatrix cell = {domain->h[0],
+-                                           domain->triclinic ? domain->h[5] : 0.0,
+-                                           domain->triclinic ? domain->h[4] : 0.0,
+-                                           0.0,
+-                                           domain->h[1],
+-                                           domain->triclinic ? domain->h[3] : 0.0,
+-                                           0.0,
+-                                           0.0,
+-                                           domain->h[2]};
+-    image_ewald->setup(cell, alpha, image_kmax, image_ksqmax);
++    if (!image_ewald_initialized) {
++      const double alpha = image_alpha > 0.0
++          ? image_alpha
++          : 10.0 / std::cbrt(domain->xprd * domain->yprd * domain->zprd);
++      // LAMMPS stores a restricted triclinic cell as columns
++      // a=(xprd,0,0), b=(xy,yprd,0), c=(xz,yz,zprd).  Passing the full matrix
++      // lets the direct QM-image Ewald operator construct 2*pi*H^-T*n.
++      const QMMMXTBEwald::CellMatrix cell = {domain->h[0],
++                                             domain->triclinic ? domain->h[5] : 0.0,
++                                             domain->triclinic ? domain->h[4] : 0.0,
++                                             0.0,
++                                             domain->h[1],
++                                             domain->triclinic ? domain->h[3] : 0.0,
++                                             0.0,
++                                             0.0,
++                                             domain->h[2]};
++      image_ewald->setup(cell, alpha, image_kmax, image_ksqmax);
++      image_ewald_initialized = true;
++    }
+     image_ewald->response(qm_x, image_response);
+   } catch (const std::exception &exception) {
+     error->all(FLERR, "Fix qmmm/xtb direct-Ewald response failed: {}", exception.what());
+   }
+   for (double &value : image_response) value *= BOHR_TO_ANGSTROM;
++  if (profile_enabled) {
++    const double now = platform::walltime();
++    profile_time[3] += now - profile_start;
++    profile_start = now;
++  }
+ 
+   run_xtb(mm_shift, image_response);
++  if (profile_enabled) {
++    const double now = platform::walltime();
++    profile_time[4] += now - profile_start;
++    profile_start = now;
++  }
+   restore_qm_charges();
+   if (!pair_coulomb_mm_only) capture_pair(pair_full_force, pair_full_energy, pair_full_virial);
+ 
+@@ -872,12 +1051,23 @@
+     if (!(atom->mask[i] & groupbit)) atom->q[i] = 0.0;
+   comm->forward_comm(this);
+   capture_kspace(qmqm_kspace_force, energy_correction, qmqm_kspace_virial);
++  prepare_fused_full_solve();
++  after_fused_full_solve_prepared();
+   for (int i = 0; i < nall; ++i) atom->q[i] = saved_charge[i];
+   comm->forward_comm(this);
+   force->kspace->qsum_qsq(0);
++  if (profile_enabled) {
++    const double now = platform::walltime();
++    profile_time[5] += now - profile_start;
++    profile_start = now;
++  }
+ 
+   build_periodic_forces();
+   restore_entry_forces();
++  if (profile_enabled) {
++    profile_time[6] += platform::walltime() - profile_start;
++    ++profile_steps;
++  }
+ }
+ 
+ void FixQMMMXTB::post_force(int vflag)
+--- a/src/QMMM-XTB/fix_qmmm_xtb.h
++++ b/src/QMMM-XTB/fix_qmmm_xtb.h
+@@ -84,6 +84,10 @@
+   std::vector<double> qm_x, qm_x_wrapped, qm_charge_scf;
+   std::vector<double> qm_gradient, qm_force_correction;
+   std::vector<MMPoint> mm_points;
++  // The cutoff+skin superset is refreshed only at LAMMPS neighbor epochs;
++  // shell sites remain in the xTB plan with exact zero charge.
++  bool mm_topology_valid;
++  bigint mm_topology_refreshes, mm_topology_changes;
+   std::vector<double> mm_gradient, mm_force_correction;
+ 
+   std::vector<double> entry_force;
+@@ -95,12 +99,24 @@
+   PPPMXTB *pppm_xtb;
+   PPPMTIP4PXTB *pppm_tip4p_xtb;
+   std::unique_ptr<QMMMXTBEwald> image_ewald;
++  // init() invalidates the cache before every run or minimization, including
++  // after a command-driven cell change between successive runs.
++  bool image_ewald_initialized;
+   bool adapter_active;
+ 
++  // Opt-in phase timers used to guide the performance branch.  They remain
++  // dormant unless LAMMPS_QMMM_XTB_PROFILE is present in the environment.
++  bool profile_enabled;
++  bigint profile_steps;
++  std::array<double, 7> profile_time;
++
+   void gather_qm_atoms(bool);
+   void gather_mm_points();
+   int get_charge_site(int, double *, int *, double *);
+   void compute_group_potential(double *, int, int, bool);
++  void project_last_solve_potential(double *, int);
++  void cache_last_solve_as_mm();
++  void prepare_fused_full_solve();
+   void validate_tip4p_qm_group();
+   PairCoulombMapping classify_pair_coulomb_mapping(char *);
+   void set_qm_charges(double);
+@@ -110,9 +126,16 @@
+   void clear_forces();
+   void capture_pair(std::vector<double> &, double &, std::array<double, 6> &);
+   void capture_kspace(std::vector<double> &, double &, std::array<double, 6> &);
+-  void compute_mm_shift(std::vector<double> &);
++  void compute_mm_shift(std::vector<double> &, bool);
+   void run_xtb(const std::vector<double> &, const std::vector<double> &);
+   void build_periodic_forces();
++
++ protected:
++  // The DPRC wrapper uses this hook only in test builds to inject a failure
++  // after the fused field becomes pending but before the fix publishes it.
++  virtual void after_fused_full_solve_prepared() {}
++  void commit_fused_full_solve(int);
++  void discard_fused_full_solve() noexcept;
+ };
+ 
+ }    // namespace LAMMPS_NS
+--- a/src/QMMM-XTB/pppm_tip4p_xtb.h
++++ b/src/QMMM-XTB/pppm_tip4p_xtb.h
+@@ -17,6 +17,9 @@
+ 
+ #include "pppm_tip4p.h"
+ 
++#include <array>
++#include <vector>
++
+ namespace LAMMPS_NS {
+ 
+ template <class> class QMMMXTBPPPMHelper;
+@@ -26,8 +29,29 @@
+ 
+  public:
+   explicit PPPMTIP4PXTB(class LAMMPS *);
+-  void compute_group_potential(double *, int, int, bool);
+-  int get_charge_site(int, double *, int *, double *);
++  void compute(int, int) override;
++  virtual void compute_group_potential(double *, int, int, bool);
++  virtual void project_last_solve_potential(double *, int);
++  virtual void cache_last_solve_as_mm();
++  virtual void prepare_fused_full_solve();
++  virtual void commit_fused_full_solve(bigint, int, int, int);
++  virtual void discard_fused_full_solve() noexcept;
++  virtual int get_charge_site(int, double *, int *, double *);
++
++ private:
++  std::vector<FFT_SCALAR> fused_mm_work1_;
++  std::vector<FFT_SCALAR> fused_mm_field_;
++  double fused_mm_energy_ = 0.0;
++  double fused_mm_qsum_ = 0.0;
++  std::array<double, 6> fused_mm_virial_{};
++  double fused_full_energy_ = 0.0;
++  std::array<double, 6> fused_full_virial_{};
++  bigint fused_full_timestep_ = -1;
++  int fused_full_vflag_ = 0;
++  int fused_full_whichflag_ = 0;
++  int fused_full_setupflag_ = 0;
++  bool fused_full_prepared_ = false;
++  bool fused_full_pending_ = false;
+ };
+ 
+ }    // namespace LAMMPS_NS
+--- a/src/QMMM-XTB/pppm_xtb.h
++++ b/src/QMMM-XTB/pppm_xtb.h
+@@ -17,6 +17,9 @@
+ 
+ #include "pppm.h"
+ 
++#include <array>
++#include <vector>
++
+ namespace LAMMPS_NS {
+ 
+ template <class> class QMMMXTBPPPMHelper;
+@@ -26,8 +29,29 @@
+ 
+  public:
+   explicit PPPMXTB(class LAMMPS *);
+-  void compute_group_potential(double *, int, int, bool);
+-  int get_charge_site(int, double *, int *, double *);
++  void compute(int, int) override;
++  virtual void compute_group_potential(double *, int, int, bool);
++  virtual void project_last_solve_potential(double *, int);
++  virtual void cache_last_solve_as_mm();
++  virtual void prepare_fused_full_solve();
++  virtual void commit_fused_full_solve(bigint, int, int, int);
++  virtual void discard_fused_full_solve() noexcept;
++  virtual int get_charge_site(int, double *, int *, double *);
++
++ private:
++  std::vector<FFT_SCALAR> fused_mm_work1_;
++  std::vector<FFT_SCALAR> fused_mm_field_;
++  double fused_mm_energy_ = 0.0;
++  double fused_mm_qsum_ = 0.0;
++  std::array<double, 6> fused_mm_virial_{};
++  double fused_full_energy_ = 0.0;
++  std::array<double, 6> fused_full_virial_{};
++  bigint fused_full_timestep_ = -1;
++  int fused_full_vflag_ = 0;
++  int fused_full_whichflag_ = 0;
++  int fused_full_setupflag_ = 0;
++  bool fused_full_prepared_ = false;
++  bool fused_full_pending_ = false;
+ };
+ 
+ }    // namespace LAMMPS_NS
+--- a/src/QMMM-XTB/qmmm_xtb_pppm.cpp
++++ b/src/QMMM-XTB/qmmm_xtb_pppm.cpp
+@@ -16,7 +16,9 @@
+ #include "error.h"
+ #include "fft3d_wrap.h"
+ #include "grid3d.h"
++#include "math_const.h"
+ #include "memory.h"
++#include "update.h"
+ 
+ #include <array>
+ #include <cmath>
+@@ -24,6 +26,7 @@
+ #include <vector>
+ 
+ using namespace LAMMPS_NS;
++using namespace MathConst;
+ 
+ static constexpr FFT_SCALAR ZEROF = 0.0;
+ static constexpr int GRID_OFFSET = 16384;
+@@ -36,6 +39,12 @@
+ template <class Solver> class QMMMXTBPPPMHelper {
+  public:
+   static void compute_group_potential(Solver &, double *, int, int, bool);
++  static void project_last_solve_potential(Solver &, double *, int);
++  static void cache_last_solve_as_mm(Solver &);
++  static void prepare_fused_full_solve(Solver &);
++  static void commit_fused_full_solve(Solver &, bigint, int, int, int);
++  static void discard_fused_full_solve(Solver &) noexcept;
++  static bool compute_fused_full_if_pending(Solver &, int, int);
+ 
+  private:
+   using MeshSites = std::vector<std::array<double, 3>>;
+@@ -44,6 +53,7 @@
+   static void map_mesh_sites(Solver &, const MeshSites &);
+   static void make_rho_group(Solver &, const MeshSites &, int, bool);
+   static void project_group_potential(Solver &, const MeshSites &, double *, int);
++  static void project_group_potential(Solver &, const MeshSites &, double *, int, double);
+ };
+ 
+ }    // namespace LAMMPS_NS
+@@ -111,7 +121,60 @@
+ 
+   solver.gc->forward_comm(Grid3d::KSPACE, &solver, KSpace::FORWARD_AD, 1, sizeof(FFT_SCALAR),
+                           solver.gc_buf1, solver.gc_buf2, MPI_FFT_SCALAR);
+-  project_group_potential(solver, mesh_sites, potential, sensor_groupbit);
++  const bigint ngridtotal = static_cast<bigint>(solver.nx_pppm) * solver.ny_pppm * solver.nz_pppm;
++  project_group_potential(solver, mesh_sites, potential, sensor_groupbit, 1.0 / ngridtotal);
++
++  if (temporary_u_brick)
++    solver.memory->destroy3d_offset(solver.u_brick, solver.nzlo_out, solver.nylo_out,
++                                    solver.nxlo_out);
++}
++
++/* ----------------------------------------------------------------------
++   project the scalar potential retained by the immediately preceding solve
++
++   The ik PPPM path leaves Green(rho(k))/N in work1 after computing the three
++   force-grid inverse FFTs.  Reusing it avoids another density assignment,
++   grid communication, remap, and forward FFT for the MM potential needed by
++   xTB SCC.  Callers must not invoke another KSpace operation in between.
++------------------------------------------------------------------------- */
++
++template <class Solver>
++void QMMMXTBPPPMHelper<Solver>::project_last_solve_potential(Solver &solver, double *potential,
++                                                             int sensor_groupbit)
++{
++  if (solver.differentiation_flag != 0)
++    solver.error->all(FLERR, "Fused fix qmmm/xtb potential projection requires ik PPPM");
++
++  solver.boxlo = solver.triclinic ? solver.domain->boxlo_lamda : solver.domain->boxlo;
++  if (solver.atom->nmax > solver.nmax) {
++    solver.memory->destroy(solver.part2grid);
++    solver.nmax = solver.atom->nmax;
++    solver.memory->create(solver.part2grid, solver.nmax, 3, "pppm/xtb:part2grid");
++  }
++
++  const bool temporary_u_brick = (solver.u_brick == nullptr);
++  if (temporary_u_brick)
++    solver.memory->create3d_offset(solver.u_brick, solver.nzlo_out, solver.nzhi_out,
++                                   solver.nylo_out, solver.nyhi_out, solver.nxlo_out,
++                                   solver.nxhi_out, "pppm/xtb:u_brick");
++
++  MeshSites mesh_sites;
++  build_mesh_sites(solver, mesh_sites);
++  map_mesh_sites(solver, mesh_sites);
++
++  std::copy(solver.work1, solver.work1 + 2 * solver.nfft, solver.work2);
++  solver.fft2->compute(solver.work2, solver.work2, FFT3d::BACKWARD);
++  for (int k = solver.nzlo_in, n = 0; k <= solver.nzhi_in; ++k)
++    for (int j = solver.nylo_in; j <= solver.nyhi_in; ++j)
++      for (int i = solver.nxlo_in; i <= solver.nxhi_in; ++i) {
++        solver.u_brick[k][j][i] = solver.work2[n];
++        n += 2;
++      }
++
++  solver.gc->forward_comm(Grid3d::KSPACE, &solver, KSpace::FORWARD_AD, 1, sizeof(FFT_SCALAR),
++                          solver.gc_buf1, solver.gc_buf2, MPI_FFT_SCALAR);
++  // work1 already includes PPPM's 1/N reciprocal-grid normalization.
++  project_group_potential(solver, mesh_sites, potential, sensor_groupbit, 1.0);
+ 
+   if (temporary_u_brick)
+     solver.memory->destroy3d_offset(solver.u_brick, solver.nzlo_out, solver.nylo_out,
+@@ -119,6 +182,167 @@
+ }
+ 
+ /* ----------------------------------------------------------------------
++   retain the MM-only reciprocal potential and fully communicated field
++------------------------------------------------------------------------- */
++
++template <class Solver> void QMMMXTBPPPMHelper<Solver>::cache_last_solve_as_mm(Solver &solver)
++{
++  if (solver.differentiation_flag != 0)
++    solver.error->all(FLERR, "Fused fix qmmm/xtb KSpace reuse requires ik PPPM");
++
++  solver.fused_mm_work1_.assign(solver.work1, solver.work1 + 2 * solver.nfft);
++  solver.fused_mm_field_.resize(static_cast<std::size_t>(3) * solver.ngrid);
++  const FFT_SCALAR *field[3] = {
++      &(solver.vdx_brick[solver.nzlo_out][solver.nylo_out][solver.nxlo_out]),
++      &(solver.vdy_brick[solver.nzlo_out][solver.nylo_out][solver.nxlo_out]),
++      &(solver.vdz_brick[solver.nzlo_out][solver.nylo_out][solver.nxlo_out])};
++  for (int dim = 0; dim < 3; ++dim)
++    std::copy(field[dim], field[dim] + solver.ngrid,
++              solver.fused_mm_field_.begin() + static_cast<std::size_t>(dim) * solver.ngrid);
++
++  solver.fused_mm_energy_ = solver.energy;
++  solver.fused_mm_qsum_ = solver.qsum;
++  for (int i = 0; i < 6; ++i) solver.fused_mm_virial_[i] = solver.virial[i];
++}
++
++/* ----------------------------------------------------------------------
++   combine the cached MM field with the just-computed QM-only field
++
++   PPPM is linear in charge density.  The field grids can therefore be added
++   directly.  The reciprocal energy and virial need the bilinear MM/QM term,
++   which is obtained from the two retained Green(rho(k))/N arrays without an
++   additional FFT.  The charge-background cross term is included explicitly.
++------------------------------------------------------------------------- */
++
++template <class Solver> void QMMMXTBPPPMHelper<Solver>::prepare_fused_full_solve(Solver &solver)
++{
++  if (solver.fused_full_prepared_ || solver.fused_full_pending_)
++    solver.error->all(FLERR, "Previous fused fix qmmm/xtb KSpace solve was not consumed");
++  if (solver.fused_mm_work1_.size() != static_cast<std::size_t>(2) * solver.nfft ||
++      solver.fused_mm_field_.size() != static_cast<std::size_t>(3) * solver.ngrid)
++    solver.error->all(FLERR, "Missing MM reference for fused fix qmmm/xtb KSpace solve");
++
++  double cross_energy_local = 0.0;
++  std::array<double, 6> cross_virial_local{};
++  for (int i = 0, n = 0; i < solver.nfft; ++i, n += 2) {
++    if (solver.greensfn[i] == 0.0) continue;
++    const double product = (solver.fused_mm_work1_[n] * solver.work1[n] +
++                            solver.fused_mm_work1_[n + 1] * solver.work1[n + 1]) /
++        solver.greensfn[i];
++    cross_energy_local += product;
++    for (int j = 0; j < 6; ++j) cross_virial_local[j] += product * solver.vg[i][j];
++  }
++
++  double cross_energy = 0.0;
++  std::array<double, 6> cross_virial{};
++  MPI_Allreduce(&cross_energy_local, &cross_energy, 1, MPI_DOUBLE, MPI_SUM, solver.world);
++  MPI_Allreduce(cross_virial_local.data(), cross_virial.data(), 6, MPI_DOUBLE, MPI_SUM,
++                solver.world);
++
++  const double qscale = solver.qqrd2e * solver.scale;
++  cross_energy *= solver.volume * qscale;
++  cross_energy -= 2.0 * MY_PI2 * solver.fused_mm_qsum_ * solver.qsum /
++      (solver.g_ewald * solver.g_ewald * solver.volume) * qscale;
++  solver.fused_full_energy_ = solver.fused_mm_energy_ + solver.energy + cross_energy;
++  for (int i = 0; i < 6; ++i)
++    solver.fused_full_virial_[i] =
++        solver.fused_mm_virial_[i] + solver.virial[i] + solver.volume * qscale * cross_virial[i];
++
++  FFT_SCALAR *field[3] = {&(solver.vdx_brick[solver.nzlo_out][solver.nylo_out][solver.nxlo_out]),
++                          &(solver.vdy_brick[solver.nzlo_out][solver.nylo_out][solver.nxlo_out]),
++                          &(solver.vdz_brick[solver.nzlo_out][solver.nylo_out][solver.nxlo_out])};
++  for (int dim = 0; dim < 3; ++dim)
++    for (int i = 0; i < solver.ngrid; ++i)
++      field[dim][i] += solver.fused_mm_field_[static_cast<std::size_t>(dim) * solver.ngrid + i];
++
++  solver.fused_full_prepared_ = true;
++}
++
++/* ----------------------------------------------------------------------
++   publish a successfully prepared field for one exact production phase
++------------------------------------------------------------------------- */
++
++template <class Solver>
++void QMMMXTBPPPMHelper<Solver>::commit_fused_full_solve(Solver &solver, bigint timestep,
++                                                        int vflag, int whichflag, int setupflag)
++{
++  if (!solver.fused_full_prepared_ || solver.fused_full_pending_)
++    solver.error->all(FLERR, "Cannot commit an unprepared fused fix qmmm/xtb KSpace solve");
++  if (whichflag != 1 && whichflag != 2)
++    solver.error->all(FLERR, "Fused fix qmmm/xtb KSpace commit requires run or minimize phase");
++
++  solver.fused_full_timestep_ = timestep;
++  solver.fused_full_vflag_ = vflag;
++  solver.fused_full_whichflag_ = whichflag;
++  solver.fused_full_setupflag_ = setupflag;
++  solver.fused_full_prepared_ = false;
++  solver.fused_full_pending_ = true;
++}
++
++/* ----------------------------------------------------------------------
++   abandon a prepared field after the surrounding fix transaction fails
++
++   prepare_fused_full_solve() has already added the cached MM field in place.
++   Clearing only the pending bit is sufficient: the next production compute
++   takes the complete base PPPM path, whose poisson_ik() overwrites every owned
++   field element before forward grid communication reconstructs ghost values.
++   This rollback must remain allocation-free, collective-free, and noexcept.
++------------------------------------------------------------------------- */
++
++template <class Solver>
++void QMMMXTBPPPMHelper<Solver>::discard_fused_full_solve(Solver &solver) noexcept
++{
++  solver.fused_full_prepared_ = false;
++  solver.fused_full_pending_ = false;
++}
++
++/* ----------------------------------------------------------------------
++   satisfy the next production KSpace call from the preassembled full field
++------------------------------------------------------------------------- */
++
++template <class Solver>
++bool QMMMXTBPPPMHelper<Solver>::compute_fused_full_if_pending(Solver &solver, int eflag, int vflag)
++{
++  if (!solver.fused_full_pending_) {
++    if (solver.fused_full_prepared_)
++      solver.error->all(FLERR, "Uncommitted fused fix qmmm/xtb KSpace field reached compute");
++    return false;
++  }
++
++  if (solver.update->ntimestep != solver.fused_full_timestep_ ||
++      vflag != solver.fused_full_vflag_ ||
++      solver.update->whichflag != solver.fused_full_whichflag_ ||
++      solver.update->setupflag != solver.fused_full_setupflag_) {
++    discard_fused_full_solve(solver);
++    solver.error->all(FLERR, "Fused fix qmmm/xtb KSpace solve reached an unexpected phase");
++  }
++
++  // Consume the token before any operation that can throw. If publication
++  // fails, the next compute performs a complete base PPPM overwrite.
++  solver.fused_full_pending_ = false;
++
++  solver.ev_init(eflag, vflag);
++  if (solver.evflag_atom)
++    solver.error->all(FLERR, "Fused fix qmmm/xtb KSpace does not support per-atom KSpace output");
++
++  // fix qmmm/xtb reads the global energy every step, including steps on which
++  // the outer integrator did not request an energy or virial tally.
++  solver.energy = solver.fused_full_energy_;
++  for (int i = 0; i < 6; ++i) solver.virial[i] = solver.fused_full_virial_[i];
++
++  if (solver.triclinic == 0)
++    solver.boxlo = solver.domain->boxlo;
++  else {
++    solver.boxlo = solver.domain->boxlo_lamda;
++    solver.domain->x2lamda(solver.atom->nlocal);
++  }
++  solver.fieldforce();
++  if (solver.triclinic) solver.domain->lamda2x(solver.atom->nlocal);
++
++  return true;
++}
++
++/* ----------------------------------------------------------------------
+    construct mesh coordinates for real atoms and implicit TIP4P charge sites
+ ------------------------------------------------------------------------- */
+ 
+@@ -219,7 +443,14 @@
+                                                         double *potential, int sensor_groupbit)
+ {
+   const bigint ngridtotal = static_cast<bigint>(solver.nx_pppm) * solver.ny_pppm * solver.nz_pppm;
+-  const double scaleinv = 1.0 / ngridtotal;
++  project_group_potential(solver, mesh_sites, potential, sensor_groupbit, 1.0 / ngridtotal);
++}
++
++template <class Solver>
++void QMMMXTBPPPMHelper<Solver>::project_group_potential(Solver &solver, const MeshSites &mesh_sites,
++                                                        double *potential, int sensor_groupbit,
++                                                        double scale)
++{
+ 
+   for (int i = 0; i < solver.atom->nlocal; ++i) {
+     if (!(solver.atom->mask[i] & sensor_groupbit)) continue;
+@@ -246,13 +477,19 @@
+         }
+       }
+     }
+-    potential[i] = value * scaleinv;
++    potential[i] = value * scale;
+   }
+ }
+ 
+ PPPMXTB::PPPMXTB(LAMMPS *lmp) : PPPM(lmp)
+ { xtbflag = 1; }
+ 
++void PPPMXTB::compute(int eflag, int vflag)
++{
++  if (!QMMMXTBPPPMHelper<PPPMXTB>::compute_fused_full_if_pending(*this, eflag, vflag))
++    PPPM::compute(eflag, vflag);
++}
++
+ void PPPMXTB::compute_group_potential(double *potential, int sensor_groupbit, int source_groupbit,
+                                       bool invert_source)
+ {
+@@ -260,6 +497,9 @@
+                                                       source_groupbit, invert_source);
+ }
+ 
++void PPPMXTB::project_last_solve_potential(double *potential, int sensor_groupbit)
++{ QMMMXTBPPPMHelper<PPPMXTB>::project_last_solve_potential(*this, potential, sensor_groupbit); }
++
+ int PPPMXTB::get_charge_site(int i, double *site, int *indices, double *weights)
+ {
+   for (int dim = 0; dim < 3; ++dim) site[dim] = atom->x[i][dim];
+@@ -268,9 +508,27 @@
+   return 1;
+ }
+ 
++void PPPMXTB::cache_last_solve_as_mm()
++{ QMMMXTBPPPMHelper<PPPMXTB>::cache_last_solve_as_mm(*this); }
++
++void PPPMXTB::prepare_fused_full_solve()
++{ QMMMXTBPPPMHelper<PPPMXTB>::prepare_fused_full_solve(*this); }
++
++void PPPMXTB::commit_fused_full_solve(bigint timestep, int vflag, int whichflag, int setupflag)
++{ QMMMXTBPPPMHelper<PPPMXTB>::commit_fused_full_solve(*this, timestep, vflag, whichflag, setupflag); }
++
++void PPPMXTB::discard_fused_full_solve() noexcept
++{ QMMMXTBPPPMHelper<PPPMXTB>::discard_fused_full_solve(*this); }
++
+ PPPMTIP4PXTB::PPPMTIP4PXTB(LAMMPS *lmp) : PPPMTIP4P(lmp)
+ { xtbflag = 1; }
+ 
++void PPPMTIP4PXTB::compute(int eflag, int vflag)
++{
++  if (!QMMMXTBPPPMHelper<PPPMTIP4PXTB>::compute_fused_full_if_pending(*this, eflag, vflag))
++    PPPMTIP4P::compute(eflag, vflag);
++}
++
+ void PPPMTIP4PXTB::compute_group_potential(double *potential, int sensor_groupbit,
+                                            int source_groupbit, bool invert_source)
+ {
+@@ -278,6 +536,26 @@
+                                                            source_groupbit, invert_source);
+ }
+ 
++void PPPMTIP4PXTB::project_last_solve_potential(double *potential, int sensor_groupbit)
++{
++  QMMMXTBPPPMHelper<PPPMTIP4PXTB>::project_last_solve_potential(*this, potential, sensor_groupbit);
++}
++
++void PPPMTIP4PXTB::cache_last_solve_as_mm()
++{ QMMMXTBPPPMHelper<PPPMTIP4PXTB>::cache_last_solve_as_mm(*this); }
++
++void PPPMTIP4PXTB::prepare_fused_full_solve()
++{ QMMMXTBPPPMHelper<PPPMTIP4PXTB>::prepare_fused_full_solve(*this); }
++
++void PPPMTIP4PXTB::commit_fused_full_solve(bigint timestep, int vflag, int whichflag, int setupflag)
++{
++  QMMMXTBPPPMHelper<PPPMTIP4PXTB>::commit_fused_full_solve(*this, timestep, vflag, whichflag,
++                                                           setupflag);
++}
++
++void PPPMTIP4PXTB::discard_fused_full_solve() noexcept
++{ QMMMXTBPPPMHelper<PPPMTIP4PXTB>::discard_fused_full_solve(*this); }
++
+ /* ----------------------------------------------------------------------
+    TIP4P M-site position and linear O/H/H force redistribution
+ ------------------------------------------------------------------------- */

@@ -1,0 +1,7 @@
+# Preserve the reviewed upstream GPL text and hash-pinned patch byte-for-byte.
+# Both canonical inputs contain upstream trailing spaces that must not be
+# normalized merely to satisfy repository whitespace diagnostics.
+LICENSES/GPL-2.0-only.txt whitespace=-trailing-space
+patches/lammps-qmmm-xtb-fused.patch whitespace=-trailing-space
+patches/ambertools26-cuda-12.9.patch whitespace=-trailing-space,-space-before-tab
+patches/ambertools26-dprc-binary64-label.patch whitespace=-trailing-space

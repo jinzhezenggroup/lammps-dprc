@@ -1,0 +1,202 @@
+{
+  "schema_version": 2,
+  "id": "etpeth-dprc-label-contract",
+  "legacy_dataset": {
+    "source": {
+      "name": "dprc-tutorial",
+      "upstream": "https://github.com/njzjz/dprc-tutorial",
+      "revision": "f8716f28b03ef09734b74ae7f2ca67ab45c3d40f",
+      "license": "NOASSERTION",
+      "archive_path": "init_data/init_data.hdf5.tar.bz2",
+      "archive_sha256": "ae3bd54434e72a4158a551d585eb8323b9c724f03ddb3ae5d57aa35c92553b5b",
+      "dataset_sha256": "a64bd5b20030720d496ddecab31a0e2b0c5b0ff300012ceb46bcd90587c72a04",
+      "documented_command": "dpamber corr --cutoff 6. --qm_region :1-2 --parm7_file ETP_ETH.parm7 --nc mndod.nc --hl pbe0 --ll mndod --out init_data.hdf5",
+      "producer_version": null,
+      "producer_version_note": "The tutorial does not pin the dpamber, dpdata, AmberTools, or electronic-structure revisions that produced the archive."
+    },
+    "label": {
+      "meaning": "high-level QM/MM minus low-level QM/MM",
+      "high_level": "PBE0",
+      "low_level": "MNDOD",
+      "coordinate_unit": "angstrom",
+      "energy_unit": "eV",
+      "force_unit": "eV/angstrom",
+      "cutoff_angstrom": 6.0,
+      "qm_region": ":1-2",
+      "selection": "per-atom Amber distance mask",
+      "periodicity_in_training_payload": "discarded after wrapping"
+    },
+    "expected": {
+      "type_map": [
+        "C",
+        "H",
+        "HW",
+        "O",
+        "OW",
+        "P"
+      ],
+      "qm_composition": {
+        "C": 3,
+        "H": 7,
+        "O": 5,
+        "P": 1
+      },
+      "group_count": 389,
+      "frame_count": 3600,
+      "minimum_atoms": 226,
+      "maximum_atoms": 285
+    }
+  },
+  "production_target": {
+    "contract_state": "high-level-periodic-labeler-qualified-low-level-pending",
+    "label_meaning": "high-level QM/MM minus xTBloom GFN2-xTB QM/MM",
+    "high_level": {
+      "method": "PBE0",
+      "engine": "QUICK 25.03 through AmberTools 26 update.1 Sander EXTERN",
+      "basis": "6-31G* (QUICK 6-31GD.BAS)",
+      "engine_manifest": {
+        "path": "config/quick_pbe0_engine.json",
+        "sha256": "83abd43eb02bf5be75055a2df842265e6c55598ee74625b206b82c010e89aa92"
+      },
+      "qualification_evidence": {
+        "path": "workloads/etpeth/evidence/quick-pbe0-qualification.json",
+        "sha256": "87f129cb44221af3e6d706810999c25d6b68fe025393e7914582dd3342841ac3"
+      },
+      "qualification_scope": "engine-qualified-periodic-labeler-pending",
+      "qualification_scope_note": "engine-only nonperiodic fixture state; periodic qualification is recorded separately",
+      "periodic_label_qualification": {
+        "path": "workloads/etpeth/evidence/quick-pbe0-binary64-label-qualification.json",
+        "sha256": "d62c5f23487da776b1dde24bda31a4dd005e148425e607d0e3a22c94a1d84e34"
+      },
+      "periodic_embedding_status": "target-topology binary64 periodic label publication qualified; independent PBE0 oracle unavailable",
+      "required_provenance": [
+        "engine_name",
+        "engine_revision",
+        "executable_sha256",
+        "basis_definition",
+        "basis_sha256",
+        "functional_definition",
+        "scf_convergence",
+        "qmmm_embedding_definition",
+        "failed_frame_ledger"
+      ]
+    },
+    "low_level": {
+      "engine": "xTBloom",
+      "model": "GFN2-xTB",
+      "energy_quantity": "electronic Helmholtz free energy",
+      "electronic_temperature_kelvin": 300.0,
+      "public_abi_precision": "IEEE binary64",
+      "required_provenance": [
+        "xtbloom_revision",
+        "xtbloom_library_sha256",
+        "parameter_manifest_sha256",
+        "backend",
+        "compute_options",
+        "per_frame_scc_status",
+        "per_frame_scc_iterations",
+        "result_flags"
+      ]
+    },
+    "training_units": {
+      "coordinates": "angstrom",
+      "cell": "angstrom",
+      "energy": "eV",
+      "forces": "eV/angstrom"
+    },
+    "xtbloom_native_units": {
+      "positions": "bohr",
+      "energy": "hartree",
+      "forces": "hartree/bohr",
+      "periodic_atomic_potential_shifts": "hartree",
+      "periodic_charge_response_matrix": "hartree",
+      "point_charge_gamma": "hartree (atomic-unit hardness)"
+    },
+    "model_type_map": [
+      "P",
+      "O",
+      "C",
+      "H",
+      "OW",
+      "HW"
+    ],
+    "lammps_type_to_model_species": {
+      "index_base": 1,
+      "species": [
+        "P",
+        "O",
+        "O",
+        "C",
+        "H",
+        "OW",
+        "HW"
+      ]
+    },
+    "qm_region": {
+      "id_space": "LAMMPS atom ID",
+      "selection": "inclusive_range",
+      "first": 1,
+      "last": 16,
+      "count": 16,
+      "composition": {
+        "P": 1,
+        "O": 5,
+        "C": 3,
+        "H": 7
+      },
+      "charge": -2,
+      "uhf": 0
+    },
+    "embedding": {
+      "environment_cutoff_angstrom": 6.0,
+      "include_molecule": true,
+      "point_charge_forces_required": true,
+      "periodic_response": {
+        "potential": "b + A*q",
+        "energy": "q^T*b + 0.5*q^T*A*q",
+        "xtbloom_force_semantics": "b and A held fixed",
+        "required_result_flag": "XTBLOOM_RESULT_FORCES_EXCLUDE_EXTERNAL_OPERATOR_DERIVATIVES",
+        "operator_derivative_force_required": true
+      },
+      "tip4p": {
+        "model": "TIP4P-Ew",
+        "oxygen_lammps_type": 6,
+        "hydrogen_lammps_type": 7,
+        "oh_bond_lammps_type": 1,
+        "hh_bond_lammps_type": 2,
+        "angle_lammps_type": 1,
+        "qdist_angstrom": 0.125,
+        "virtual_site_definition_required": true,
+        "m_site_force_redistribution_required": true
+      }
+    },
+    "required_source_fields": [
+      "full_system_coordinates",
+      "triclinic_cell",
+      "stable_atom_ids",
+      "molecule_ids",
+      "element_or_lammps_type",
+      "mm_point_charges",
+      "mm_point_charge_gammas",
+      "mm_gamma_policy_manifest_sha256",
+      "periodic_atomic_potential_shifts",
+      "periodic_charge_response_matrix",
+      "periodic_operator_derivative_forces",
+      "tip4p_virtual_site_definition",
+      "tip4p_m_site_force_redistribution",
+      "high_level_energy",
+      "high_level_full_qmmm_forces",
+      "xtb_helmholtz_free_energy",
+      "xtb_raw_qm_forces",
+      "xtb_raw_point_charge_forces",
+      "xtb_qm_charges",
+      "xtb_result_flags",
+      "xtb_final_full_qmmm_forces",
+      "correction_energy",
+      "correction_full_system_forces",
+      "selection_membership",
+      "compact_to_full_atom_map"
+    ],
+    "precision": "binary64 labels; FP32 model inference requires independent qualification"
+  }
+}

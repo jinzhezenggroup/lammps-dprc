@@ -1,0 +1,19 @@
+diff --git a/cmake/CudaConfig.cmake b/cmake/CudaConfig.cmake
+index 0953f2c..f3191f2 100644
+--- a/cmake/CudaConfig.cmake
++++ b/cmake/CudaConfig.cmake
+@@ -77,12 +77,12 @@ if(CUDA)
+ 			message(STATUS "Configuring for SM5.0, SM5.2, SM5.3, SM6.0, SM6.1, SM7.0, SM7.5, SM8.0, SM8.6, SM8.9 and SM9.0")
+ 			list(APPEND CUDA_NVCC_FLAGS ${SM50FLAGS} ${SM52FLAGS} ${SM53FLAGS} ${SM60FLAGS} ${SM61FLAGS} ${SM70FLAGS} ${SM75FLAGS} ${SM80FLAGS} ${SM86FLAGS} ${SM89FLAGS} ${SM90FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations)
+ 
+-       elseif((${CUDA_VERSION} VERSION_GREATER_EQUAL 12.7) AND (${CUDA_VERSION} VERSION_LESS 12.9))
++       elseif((${CUDA_VERSION} VERSION_GREATER_EQUAL 12.7) AND (${CUDA_VERSION} VERSION_LESS 13.0))
+            message(STATUS "Configuring for SM7.0, SM7.5, SM8.0, SM8.6, SM8.9, SM9.0, SM10.0 and SM12.0")
+            list(APPEND CUDA_NVCC_FLAGS ${SM70FLAGS} ${SM75FLAGS} ${SM80FLAGS} ${SM86FLAGS} ${SM89FLAGS} ${SM90FLAGS} ${SM100FLAGS} ${SM120FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations -std=c++14)
+ 
+ 		else()
+-			message(FATAL_ERROR "Error: Untested CUDA version. AMBER currently requires CUDA version >= 7.5 and < 12.9.")
++			message(FATAL_ERROR "Error: Untested CUDA version. AMBER currently requires CUDA version >= 7.5 and < 13.0.")
+ 		endif()
+ 
+ 		# If building a Debug configuration, include lineinfo for nsight/system profiling

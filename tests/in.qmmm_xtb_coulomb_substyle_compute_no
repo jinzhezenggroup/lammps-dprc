@@ -1,0 +1,28 @@
+# Keep the hybrid pair active while disabling only its Coulomb sub-style.
+
+plugin load ${dprc_plugin}
+units real
+atom_style charge
+atom_modify map array
+boundary p p p
+region cell block 0 20 0 20 0 20 units box
+create_box 3 cell
+create_atoms 1 single 9.60 10.0 10.0 units box
+create_atoms 1 single 10.40 10.0 10.0 units box
+create_atoms 2 single 5.00 10.0 10.0 units box
+create_atoms 3 single 15.00 10.0 10.0 units box
+mass 1 1.008
+mass 2 22.990
+mass 3 35.450
+set atom 1*2 charge 0.0
+set atom 3 charge 1.0
+set atom 4 charge -1.0
+group qm id 1 2
+pair_style hybrid/overlay coul/long 8.0 zero 8.0
+pair_coeff * * coul/long
+pair_coeff * * zero
+pair_modify pair coul/long compute no
+kspace_style ${kspace_style} 1.0e-5
+fix qmmm qm ${qmmm_style} elements H Na Cl cutoff 8.0 method gfn2 &
+    charge 0 uhf 0 accuracy 1.0e-3 maxiter 250 etemp 300.0 mmhardness 0.0
+run 0
