@@ -9,7 +9,7 @@ The integration runner is `tools/etpeth_workload.py`. It accepts:
 - a clean tutorial checkout;
 - the manifest-defined umbrella grid and deterministic seed policy;
 - the LAMMPS executable and this plugin;
-- xTBloom and optional DeePMD runtime paths;
+- xTBloom and optional DeePMD C API/model runtime paths;
 - the execution mode, ranks per window, and smoke-test batch size;
 - a separate output directory outside the source tree.
 
@@ -55,9 +55,9 @@ as final performance evidence:
 <same options> --stage batch-smoke --smoke-window-count 2 --smoke-steps 25
 ```
 
-To exercise QM/MM+DPA4c, use a separately loaded DeePMD LAMMPS plugin and one
-qualified DPA4c model. The model must represent the periodic PBE0-minus-xTBloom
-correction; this repository does not ship one:
+To exercise QM/MM+DPA4c, use a `dprcplugin.so` built with DeePMD C API v31+
+and one qualified DPA4c model. The model must represent the periodic
+PBE0-minus-xTBloom correction; this repository does not ship one:
 
 ```bash
 python3 tools/etpeth_workload.py run \
@@ -66,10 +66,10 @@ python3 tools/etpeth_workload.py run \
   --lammps /path/to/kokkos/lmp \
   --plugin /path/to/dprcplugin.so \
   --xtbloom-library /path/to/libxtbloom.so \
-  --deepmd-plugin /path/to/libdeepmd_lmp.so \
   --deepmd-model /path/to/qualified-dpa4c.pt2 \
   --mode qmmm-dpa4c \
   --dpa4c-models-qualified \
+  --library-dir /path/to/deepmd/lib \
   --library-dir /path/to/cuda/lib64 \
   --stage batch-smoke \
   --smoke-window-count 2 \
@@ -83,11 +83,10 @@ If the model itself is an unqualified software fixture, replace
 records this choice and refuses to start without one explicit model-status
 boundary.
 
-The single-model path emits compact `center_group qm` input and
-`partition_batch yes`, so one GPU-local DeePMD owner evaluates the synchronized
-windows as one block-diagonal batch. A positive model-deviation frequency
-requires four repeated `--deepmd-model` arguments and is a separate execution
-coordinate.
+The single-model path emits `dprc/deepmd/batch/kk`, compact `center_group qm`
+input, and `partition_batch yes`, so one GPU-local DeePMD owner evaluates the
+synchronized windows as one block-diagonal batch. Model deviation is currently
+rejected by the in-plugin path.
 
 The scientific stages are resumable and deliberately separate:
 

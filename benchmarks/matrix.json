@@ -18,15 +18,14 @@
     "precision": ["fp64-reference", "dprc-fp32", "xtb-mixed-safe"],
     "dprc": [
       "disabled",
-      "single-primary",
-      "single-primary-plus-periodic-four-model-deviation"
+      "single-primary"
     ],
     "classical_backend": ["cpu-reference", "lammps-gpu-pair", "fused-qmmm-pppm"]
   },
   "mode_semantics": {
     "classical": "complete Amber/TIP4P force field through the shared batched DPRc CUDA LJ/TIP4P/PPPM backend; no xTB or DPRc. The upstream GPU-pair plus CPU-PPPM path remains an explicit reference backend",
     "qmmm": "batched xTBloom GFN2-xTB QM/MM plus fused batched LJ/TIP4P/PPPM",
-    "qmmm-dpa4c": "qmmm plus one compact DPA4c DPRc primary evaluated every step; an optional positive model-deviation frequency evaluates three additional qualified models only on deviation timesteps"
+    "qmmm-dpa4c": "qmmm plus one compact DPA4c DPRc primary evaluated every step through the partition-batched DeePMD C API path inside dprcplugin"
   },
   "measurement": {
     "warmup_steps": 25,

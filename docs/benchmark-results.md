@@ -1,10 +1,15 @@
 # Diagnostic benchmark results
 
-This report records the current development measurements for the ETP/ETH
+This report records the retained pre-C-API development measurements for the ETP/ETH
 umbrella workload. It is a reviewed derived summary, not publication-qualified
 evidence. The tutorial checkout and LAMMPS-DPRc worktree were dirty, tutorial
 licensing was unresolved, and the DPA4c graph was an unqualified diagnostic
 artifact rather than a real PBE0-minus-xTB DPRc model.
+
+The QM/MM+DPA4c rows used the earlier separately loaded DeePMD adapter. They
+are historical diagnostics and must not be presented as measurements of the
+current `dprc/deepmd/batch/kk` C API implementation. A fresh three-mode matrix
+is required after the C API dependency and production model are published.
 
 ## Measurement contract
 
@@ -86,7 +91,7 @@ it must not be omitted from a paper table.
 
 ## Artifact boundary
 
-The diagnostic DeePMD plugin SHA-256 was
+The historical diagnostic DeePMD adapter SHA-256 was
 `0cf9e3b8a1c30b03c0778fcd24507ba26bf83f2720af84bdaa9a96b47bd931d0`.
 The diagnostic model SHA-256 was
 `b44d9eef44009739fee9ef98d22328b7fb29e298e82ae77b8824e361d335dfde`.
@@ -106,7 +111,7 @@ diagnostics:
 1. Use clean, immutable revisions for LAMMPS-DPRc and every dependency.
 2. Resolve and record tutorial, model, dataset, and binary distribution
    licenses.
-3. Replace the random graph with a scientifically qualified DPA4c ensemble.
+3. Replace the random graph with a scientifically qualified DPA4c primary.
 4. Record binary hashes, compilers, toolkit, driver, CPU/GPU, affinity, MPI
    layout, batch size, descriptors, SCC state, warmup, synchronization, and raw
    samples.

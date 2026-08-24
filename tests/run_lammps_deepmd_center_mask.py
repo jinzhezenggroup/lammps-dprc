@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Prove DPRc center-only energy semantics on host and Kokkos paths.
+"""Prove in-plugin DeePMD C API center-only energy semantics.
 
 The compact subsystem deliberately retains nearby MM atoms as graph nodes.
 Those atoms must receive the reaction force obtained by differentiating the
 QM-centered correction, but their independent atomic-energy heads must remain
-zero.  This regression compares the ordinary ``deepmd`` adapter with
-``deepmd/kk`` and checks both properties through LAMMPS's public per-atom
+zero. This regression compares the host and ``/kk`` names provided by the same
+LAMMPS-DPRc plugin and checks both properties through LAMMPS's public per-atom
 energy and force outputs.
 """
 
@@ -52,21 +52,22 @@ def require_lammps_token(path: Path) -> str:
 
 def render_input(
     kokkos: bool,
-    deepmd_plugin: Path,
+    dprc_plugin: Path,
     model: Path,
     data_file: Path,
     energy_result: Path,
     atom_result: Path,
 ) -> str:
     """Render one host or Kokkos calculation over the same compact graph."""
-    plugin = require_lammps_token(deepmd_plugin)
+    plugin = require_lammps_token(dprc_plugin)
     model_path = require_lammps_token(model)
     data_path = require_lammps_token(data_file)
     energy_path = require_lammps_token(energy_result)
     atom_path = require_lammps_token(atom_result)
     atom_style = "atomic/kk" if kokkos else "atomic"
-    pair_style = "deepmd/kk" if kokkos else "deepmd"
-    partition_batch = " partition_batch yes" if kokkos else ""
+    pair_style = (
+        "dprc/deepmd/batch/kk" if kokkos else "dprc/deepmd/batch"
+    )
 
     commands = [
         f"plugin load {plugin}",
@@ -89,8 +90,7 @@ def render_input(
             "neighbor 2.0 bin",
             "neigh_modify every 1 delay 0 check yes",
             (
-                f"pair_style {pair_style} {model_path} out_freq 0 "
-                f"{partition_batch.lstrip()} "
+                f"pair_style {pair_style} {model_path} partition_batch yes "
                 "center_group qm environment_cutoff 6.0 include_molecule no"
             ),
             "pair_coeff * * C H HW O OW P",
@@ -197,7 +197,7 @@ def parse_atoms(path: Path) -> dict[int, dict[str, float | int]]:
 def run_mode(
     executable: Path,
     kokkos: bool,
-    deepmd_plugin: Path,
+    dprc_plugin: Path,
     model: Path,
     directory: Path,
 ) -> tuple[float, dict[int, dict[str, float | int]], str]:
@@ -211,7 +211,7 @@ def run_mode(
     input_file.write_text(
         render_input(
             kokkos,
-            deepmd_plugin,
+            dprc_plugin,
             model,
             data_file,
             energy_file,
@@ -259,14 +259,14 @@ def force_norm(atom: dict[str, float | int]) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lammps", type=Path, required=True)
-    parser.add_argument("--deepmd-plugin", type=Path, required=True)
+    parser.add_argument("--dprc-plugin", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--deepmd-revision", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     arguments = parser.parse_args()
 
     try:
-        for path in (arguments.lammps, arguments.deepmd_plugin, arguments.model):
+        for path in (arguments.lammps, arguments.dprc_plugin, arguments.model):
             if not path.is_file():
                 raise ValueError(f"required runtime input is not a file: {path}")
 
@@ -275,14 +275,14 @@ def main() -> int:
             host_energy, host_atoms, _ = run_mode(
                 arguments.lammps,
                 False,
-                arguments.deepmd_plugin,
+                arguments.dprc_plugin,
                 arguments.model,
                 directory,
             )
             kokkos_energy, kokkos_atoms, _ = run_mode(
                 arguments.lammps,
                 True,
-                arguments.deepmd_plugin,
+                arguments.dprc_plugin,
                 arguments.model,
                 directory,
             )
@@ -371,8 +371,8 @@ def main() -> int:
         evidence = {
             "schema_version": 1,
             "claim": (
-                "deepmd and deepmd/kk publish energy only for DPRc center atoms "
-                "while retaining MM environment reaction forces"
+                "the host and /kk names in dprcplugin publish energy only for "
+                "DPRc center atoms while retaining MM environment reaction forces"
             ),
             "deepmd_revision": arguments.deepmd_revision,
             "inputs": {
@@ -380,9 +380,9 @@ def main() -> int:
                     "path": str(arguments.lammps.resolve()),
                     "sha256": sha256(arguments.lammps),
                 },
-                "deepmd_plugin": {
-                    "path": str(arguments.deepmd_plugin.resolve()),
-                    "sha256": sha256(arguments.deepmd_plugin),
+                "dprc_plugin": {
+                    "path": str(arguments.dprc_plugin.resolve()),
+                    "sha256": sha256(arguments.dprc_plugin),
                 },
                 "model": {
                     "path": str(arguments.model.resolve()),

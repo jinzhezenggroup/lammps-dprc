@@ -36,6 +36,32 @@ class ETPETHWorkloadTest(unittest.TestCase):
         self.assertEqual((windows[16].tag, windows[16].center), ("m1p5", -1.5))
         self.assertEqual((windows[-1].tag, windows[-1].center), ("p1p6", 1.6))
 
+    def test_deepmd_c_loader_identity_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-deepmd-loader-") as temporary:
+            root = Path(temporary)
+            plugin = root / "dprcplugin.so"
+            library = root / "libdeepmd_c.so.3"
+            plugin.write_bytes(b"plugin")
+            library.write_bytes(b"public C API")
+            output = f"libdeepmd_c.so.3 => {library} (0x1234)"
+            with mock.patch.object(WORKLOAD, "command_output", return_value=output):
+                identity = WORKLOAD.verify_loaded_deepmd_c(plugin, {})
+            self.assertEqual(
+                identity,
+                {
+                    "soname": "libdeepmd_c.so.3",
+                    "resolved_path": str(library.resolve()),
+                    "sha256": WORKLOAD.sha256(library),
+                },
+            )
+
+            with mock.patch.object(WORKLOAD, "command_output", return_value=""):
+                self.assertIsNone(
+                    WORKLOAD.verify_loaded_deepmd_c(plugin, {}, required=False)
+                )
+                with self.assertRaisesRegex(ValueError, "no libdeepmd_c"):
+                    WORKLOAD.verify_loaded_deepmd_c(plugin, {})
+
     def test_source_verification_requires_explicit_dirty_opt_in(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-etpeth-source-") as temporary:
             repository = Path(temporary)
@@ -165,9 +191,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
             self.assertIn("pppm/tip4p/dprc/batch", classical)
             self.assertNotIn("fix qmmm", classical)
 
-            deepmd_plugin = root / "deepmdplugin.so"
             dpa4c_model = root / "dpa4c.pt2"
-            deepmd_plugin.write_bytes(b"deepmd-plugin")
             dpa4c_model.write_bytes(b"dpa4c-model")
             dpa4c = WORKLOAD.render_lammps_input(
                 self.manifest,
@@ -177,13 +201,13 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 steps=3,
                 trajectory_frequency=0,
                 mode="qmmm-dpa4c",
-                deepmd_plugin=deepmd_plugin,
                 deepmd_models=[dpa4c_model],
             )
             self.assertIn(
-                f"deepmd/kk {dpa4c_model.resolve()} partition_batch yes",
+                f"dprc/deepmd/batch/kk {dpa4c_model.resolve()} partition_batch yes",
                 dpa4c,
             )
+            self.assertEqual(dpa4c.count("plugin load"), 1)
             self.assertNotIn("partition_batch yes", classical)
 
     def test_seed_colvars_profile_is_stronger_but_sampling_contract_is_unchanged(
@@ -317,8 +341,6 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 "/fixture/libxtbloom.so",
                 "--mode",
                 "qmmm-dpa4c",
-                "--deepmd-plugin",
-                "/fixture/libdeepmd_lmp.so",
                 "--deepmd-model",
                 "/fixture/model-0.pt2",
                 "--model-deviation-frequency",
@@ -337,25 +359,23 @@ class ETPETHWorkloadTest(unittest.TestCase):
     def test_dpa4c_execution_policy_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-etpeth-policy-") as temporary:
             root = Path(temporary)
-            plugin = root / "libdeepmd_lmp.so"
-            plugin.write_bytes(b"plugin")
-            models = [root / f"model-{index}.pt2" for index in range(4)]
+            models = [root / f"model-{index}.pt2" for index in range(2)]
             for model in models:
                 model.write_bytes(model.name.encode("utf-8"))
 
             with self.assertRaisesRegex(ValueError, "requires either"):
                 WORKLOAD.validate_execution_policy(
                     mode="qmmm-dpa4c",
-                    deepmd_plugin=plugin,
+                    deepmd_plugin=None,
                     deepmd_models=models[:1],
                     model_deviation_frequency=0,
                     dpa4c_models_qualified=False,
                     allow_unqualified_dpa4c_models=False,
                 )
-            with self.assertRaisesRegex(ValueError, "exactly 4"):
+            with self.assertRaisesRegex(ValueError, "exactly one primary model"):
                 WORKLOAD.validate_execution_policy(
                     mode="qmmm-dpa4c",
-                    deepmd_plugin=plugin,
+                    deepmd_plugin=None,
                     deepmd_models=models[:1],
                     model_deviation_frequency=100,
                     dpa4c_models_qualified=False,
@@ -364,7 +384,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
 
             WORKLOAD.validate_execution_policy(
                 mode="qmmm-dpa4c",
-                deepmd_plugin=plugin,
+                deepmd_plugin=None,
                 deepmd_models=models[:1],
                 model_deviation_frequency=0,
                 dpa4c_models_qualified=False,
@@ -375,9 +395,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
         windows = WORKLOAD.windows_from_manifest(self.manifest)
         with tempfile.TemporaryDirectory(prefix="dprc-etpeth-forward-") as temporary:
             root = Path(temporary)
-            deepmd_plugin = root / "libdeepmd_lmp.so"
             model = root / "dpa4c.pt2"
-            deepmd_plugin.write_bytes(b"plugin")
             model.write_bytes(b"model")
             arguments = Namespace(
                 output=root / "run",
@@ -392,7 +410,6 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 library_dir=[],
                 cuda_visible_devices="0",
                 mode="qmmm-dpa4c",
-                deepmd_plugin=deepmd_plugin,
                 deepmd_model=[model],
                 model_deviation_frequency=0,
                 dpa4c_models_qualified=False,
@@ -407,7 +424,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 WORKLOAD.run_stage(arguments, self.manifest, windows)
             forwarded = invocation.call_args.kwargs
             self.assertEqual(forwarded["mode"], "qmmm-dpa4c")
-            self.assertEqual(forwarded["deepmd_plugin"], deepmd_plugin)
+            self.assertIsNone(forwarded["deepmd_plugin"])
             self.assertEqual(forwarded["deepmd_models"], (model,))
             self.assertEqual(forwarded["model_deviation_frequency"], 0)
             self.assertFalse(forwarded["dpa4c_models_qualified"])

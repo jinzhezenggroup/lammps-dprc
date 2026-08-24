@@ -45,13 +45,12 @@ DeePMD models may explicitly use FP32 inference. The selected model artifact,
 backend, compact environment, and output precision must be recorded. FP32 is
 not inferred from the GPU name alone, and FP16/TF32 is a separate experiment.
 
-The inspected local DeePMD device API (API version 28) already exposes a useful
-mixed-precision boundary:
+The in-plugin DeePMD path requires public C API version 31 or newer and exposes
+a deliberate mixed-representation boundary:
 
-- `DP_DeepPotComputeEdgesGPUFloat32` accepts FP32 edge vectors while retaining
-  FP64 coordinates, frame/atom parameters, atom energies, forces, and virials;
-- `DP_DeepPotComputeCanonicalGraphGPU` consumes a device-resident compact graph
-  with FP32 edge vectors and publishes FP64 outputs;
+- `DP_DeepPotComputeCanonicalGraphBatchGPU` consumes a block-diagonal,
+  device-resident compact graph with FP32 edge vectors and publishes FP64
+  atomic energies, forces, and virials;
 - `DP_DeepPotUsesFP32EdgeVectors` and the related device/canonical-graph
   capability queries allow runtime selection instead of assuming a model
   representation from its filename.
@@ -61,10 +60,11 @@ geometry traffic without weakening the LAMMPS force interface. It still needs
 model-specific correctness and end-to-end umbrella qualification; the API
 shape alone is not evidence that FP32 inference is accurate enough.
 
-PR #5943 supplies compact center/environment selection but explicitly leaves
-`deepmd/kk` accelerator parity unsupported. It does not provide cross-window
-batching. LAMMPS-DPRc must therefore measure the ordinary compact GPU path and
-later decide whether a broker-level multi-frame DeepMD call is justified.
+LAMMPS-DPRc supplies compact selection and cross-window batching through its
+own `dprc/deepmd/batch[/kk]` styles. One GPU-local owner executes the C API
+batch after collective graph validation. The current API does not expose the
+backend CUDA stream, so a device synchronization remains part of the
+correctness boundary before host publication.
 
 ## Acceptance sequence
 

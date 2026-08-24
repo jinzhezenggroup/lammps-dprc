@@ -31,7 +31,7 @@ get_filename_component(
 set(LAMMPS_SOURCE_DIR "${_dprc_default_lammps}" CACHE PATH "Path to the pinned LAMMPS src directory")
 set(XTBLOOM_SOURCE_DIR "${_dprc_default_xtbloom}" CACHE PATH "Path to the pinned xTBloom source tree")
 set(DEEPMD_SOURCE_DIR "${_dprc_default_deepmd}" CACHE PATH
-  "Path to the DeePMD-kit checkout that produced the optional runtime plugin")
+  "Path to the pinned DeePMD-kit checkout that produced the C API library")
 set(XTBLOOM_GENERATED_INCLUDE_DIR "${_dprc_default_xtbloom_generated}" CACHE PATH
   "Path containing the generated xtbloom/version.h for the pinned source tree")
 set(DPRC_XTBLOOM_LIBRARY "" CACHE FILEPATH
@@ -41,14 +41,16 @@ set(DPRC_EXPECTED_XTBLOOM_LIBRARY_SHA256 "" CACHE STRING
 set(DPRC_LAMMPS_EXECUTABLE "" CACHE FILEPATH "LAMMPS executable used for plugin load tests")
 set(DPRC_REFERENCE_LAMMPS_EXECUTABLE "" CACHE FILEPATH
   "Optional QMMM-XTB-enabled LAMMPS executable used only for libxTB oracle calls")
-set(DPRC_DEEPMD_PLUGIN "" CACHE FILEPATH
-  "Optional DeePMD LAMMPS plugin used for compact DPRc composition tests")
+set(DPRC_DEEPMD_INCLUDE_DIR "" CACHE PATH
+  "Directory containing deepmd/c_api.h with canonical batch API version 31+")
+set(DPRC_DEEPMD_C_LIBRARY "" CACHE FILEPATH
+  "Runtime-provided DeePMD C API shared library linked by dprcplugin")
 set(DPRC_DEEPMD_MODEL "" CACHE FILEPATH
-  "Optional frozen DeePMD model used for compact DPRc composition tests")
-set(DPRC_EXPECTED_DEEPMD_PLUGIN_SHA256 "" CACHE STRING
-  "Required SHA-256 of DPRC_DEEPMD_PLUGIN when the optional runtime is enabled")
+  "Optional frozen canonical DeePMD model used for DPRc runtime tests")
+set(DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256 "" CACHE STRING
+  "Required SHA-256 of DPRC_DEEPMD_C_LIBRARY when the C API integration is enabled")
 set(DPRC_EXPECTED_DEEPMD_MODEL_SHA256 "" CACHE STRING
-  "Required SHA-256 of DPRC_DEEPMD_MODEL when the optional runtime is enabled")
+  "Required SHA-256 of DPRC_DEEPMD_MODEL when runtime tests are enabled")
 set(DPRC_LAMMPS_SIZES "smallbig" CACHE STRING "LAMMPS integer-size mode")
 set_property(CACHE DPRC_LAMMPS_SIZES PROPERTY STRINGS smallbig bigbig)
 set(DPRC_XTBLOOM_BACKEND "AUTO" CACHE STRING
@@ -75,8 +77,8 @@ option(DPRC_ENABLE_KOKKOS_RUNTIME_TESTS
   "Run GPU tests that require a Kokkos-enabled LAMMPS executable" OFF)
 option(DPRC_REQUIRE_XTBLOOM_LIBRARY
   "Fail configuration unless the xTBloom integration library is available" OFF)
-option(DPRC_REQUIRE_DEEPMD_RUNTIME
-  "Fail configuration unless the optional DeePMD plugin and model are available" OFF)
+option(DPRC_REQUIRE_DEEPMD_C_API
+  "Fail configuration unless the DeePMD C API library is available" OFF)
 set(DPRC_CUFFT_INCLUDE_DIR "" CACHE PATH
   "Directory containing cufft.h for the classical CUDA backend")
 set(DPRC_CUFFT_LIBRARY "" CACHE FILEPATH
@@ -229,60 +231,87 @@ if(DPRC_REQUIRE_XTBLOOM_LIBRARY AND NOT DPRC_XTBLOOM_LIBRARY)
     "DPRC_REQUIRE_XTBLOOM_LIBRARY=ON requires an explicit runtime-provided shared library")
 endif()
 
-# DeePMD stays a separately loaded LAMMPS plugin.  Requiring exact source and
-# artifact identities here gives composition tests reproducible provenance
-# without adding a DeePMD DT_NEEDED edge or its private C++ ABI to dprcplugin.
-set(_dprc_deepmd_runtime_enabled OFF)
-if(DPRC_DEEPMD_PLUGIN OR DPRC_DEEPMD_MODEL)
-  if(NOT DPRC_DEEPMD_PLUGIN OR NOT DPRC_DEEPMD_MODEL)
+# dprcplugin owns the LAMMPS pair style and links only DeePMD's public C API.
+# The DeePMD LAMMPS plugin and its private C++ ABI are deliberately absent.
+set(_dprc_deepmd_enabled OFF)
+set(_dprc_deepmd_runtime_test_enabled OFF)
+if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
+  if(NOT DPRC_DEEPMD_C_LIBRARY OR NOT DPRC_DEEPMD_INCLUDE_DIR)
     message(FATAL_ERROR
-      "DPRC_DEEPMD_PLUGIN and DPRC_DEEPMD_MODEL must be supplied together")
+      "DPRC_DEEPMD_C_LIBRARY and DPRC_DEEPMD_INCLUDE_DIR must be supplied together")
   endif()
-  if(NOT DPRC_LAMMPS_EXECUTABLE)
+  if(NOT EXISTS "${DPRC_DEEPMD_INCLUDE_DIR}/deepmd/c_api.h")
     message(FATAL_ERROR
-      "DPRC_LAMMPS_EXECUTABLE is required for the DeePMD composition test")
+      "DPRC_DEEPMD_INCLUDE_DIR must contain deepmd/c_api.h")
   endif()
-  if(NOT DPRC_XTBLOOM_LIBRARY)
+  if(NOT EXISTS "${DPRC_DEEPMD_C_LIBRARY}")
     message(FATAL_ERROR
-      "DPRC_XTBLOOM_LIBRARY is required for the DeePMD/xTB composition test")
+      "DPRC_DEEPMD_C_LIBRARY does not exist: ${DPRC_DEEPMD_C_LIBRARY}")
   endif()
-  if(NOT DPRC_BUILD_TESTING)
+  if(NOT WIN32 AND DPRC_DEEPMD_C_LIBRARY MATCHES "\\.a$")
     message(FATAL_ERROR
-      "DPRC_BUILD_TESTING must be enabled when the optional DeePMD runtime is selected")
+      "DPRC_DEEPMD_C_LIBRARY must be a runtime-provided shared library")
   endif()
-  if(NOT EXISTS "${DPRC_DEEPMD_PLUGIN}" OR NOT EXISTS "${DPRC_DEEPMD_MODEL}")
-    message(FATAL_ERROR "The selected DeePMD plugin or model does not exist")
-  endif()
-  if(NOT EXISTS "${DEEPMD_SOURCE_DIR}/source/lmp/pair_deepmd.cpp")
+  if(NOT DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256)
     message(FATAL_ERROR
-      "DEEPMD_SOURCE_DIR must point to the checkout that produced DPRC_DEEPMD_PLUGIN")
+      "The DeePMD C API integration requires DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256")
   endif()
-  if(NOT DPRC_EXPECTED_DEEPMD_PLUGIN_SHA256 OR
-     NOT DPRC_EXPECTED_DEEPMD_MODEL_SHA256)
+  if(NOT EXISTS "${DEEPMD_SOURCE_DIR}/source/api_c/include/c_api.h")
     message(FATAL_ERROR
-      "The optional DeePMD runtime requires explicit plugin and model SHA-256 values")
+      "DEEPMD_SOURCE_DIR must point to the checkout that produced the C API library")
+  endif()
+  file(READ "${DPRC_DEEPMD_INCLUDE_DIR}/deepmd/c_api.h"
+    _dprc_deepmd_c_header LIMIT 4096)
+  if(NOT _dprc_deepmd_c_header MATCHES "#define[ \t]+DP_C_API_VERSION[ \t]+([0-9]+)" OR
+     CMAKE_MATCH_1 LESS 31)
+    message(FATAL_ERROR
+      "dprc/deepmd/batch requires DeePMD C API version 31 or newer")
   endif()
   dprc_verify_git_dependency(
     "DeePMD-kit" "${DEEPMD_SOURCE_DIR}/source" "${DPRC_EXPECTED_DEEPMD_REVISION}")
-  file(REAL_PATH "${DPRC_DEEPMD_PLUGIN}" _dprc_deepmd_plugin_realpath)
-  file(REAL_PATH "${DPRC_DEEPMD_MODEL}" _dprc_deepmd_model_realpath)
-  file(SHA256 "${_dprc_deepmd_plugin_realpath}" _dprc_deepmd_plugin_sha256)
-  file(SHA256 "${_dprc_deepmd_model_realpath}" _dprc_deepmd_model_sha256)
-  if(NOT _dprc_deepmd_plugin_sha256 STREQUAL DPRC_EXPECTED_DEEPMD_PLUGIN_SHA256)
+  file(REAL_PATH "${DPRC_DEEPMD_C_LIBRARY}" _dprc_deepmd_c_library_realpath)
+  file(SHA256 "${_dprc_deepmd_c_library_realpath}"
+    _dprc_deepmd_c_library_sha256)
+  if(NOT _dprc_deepmd_c_library_sha256 STREQUAL
+     DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256)
     message(FATAL_ERROR
-      "DeePMD plugin SHA-256 ${_dprc_deepmd_plugin_sha256} differs from the expected value")
+      "DeePMD C API library SHA-256 ${_dprc_deepmd_c_library_sha256} differs from the expected value")
   endif()
-  if(NOT _dprc_deepmd_model_sha256 STREQUAL DPRC_EXPECTED_DEEPMD_MODEL_SHA256)
-    message(FATAL_ERROR
-      "DeePMD model SHA-256 ${_dprc_deepmd_model_sha256} differs from the expected value")
-  endif()
-  set(_dprc_deepmd_runtime_enabled ON)
+  find_package(CUDAToolkit REQUIRED)
+  add_library(dprc_deepmd_c SHARED IMPORTED GLOBAL)
+  set_target_properties(dprc_deepmd_c PROPERTIES
+    IMPORTED_LOCATION "${_dprc_deepmd_c_library_realpath}"
+    INTERFACE_INCLUDE_DIRECTORIES "${DPRC_DEEPMD_INCLUDE_DIR}")
+  set(_dprc_deepmd_enabled ON)
   message(STATUS
-    "DeePMD compact runtime: ${_dprc_deepmd_plugin_realpath} with model "
-    "${_dprc_deepmd_model_realpath}")
-elseif(DPRC_REQUIRE_DEEPMD_RUNTIME)
+    "DeePMD C API runtime: ${_dprc_deepmd_c_library_realpath} "
+    "(SHA-256 ${_dprc_deepmd_c_library_sha256})")
+
+  if(DPRC_DEEPMD_MODEL)
+    if(NOT DPRC_LAMMPS_EXECUTABLE OR NOT DPRC_BUILD_TESTING)
+      message(FATAL_ERROR
+        "DPRC_DEEPMD_MODEL requires DPRC_LAMMPS_EXECUTABLE and DPRC_BUILD_TESTING=ON")
+    endif()
+    if(NOT EXISTS "${DPRC_DEEPMD_MODEL}" OR
+       NOT DPRC_EXPECTED_DEEPMD_MODEL_SHA256)
+      message(FATAL_ERROR
+        "The DeePMD runtime test requires an existing model and its expected SHA-256")
+    endif()
+    file(REAL_PATH "${DPRC_DEEPMD_MODEL}" _dprc_deepmd_model_realpath)
+    file(SHA256 "${_dprc_deepmd_model_realpath}" _dprc_deepmd_model_sha256)
+    if(NOT _dprc_deepmd_model_sha256 STREQUAL
+       DPRC_EXPECTED_DEEPMD_MODEL_SHA256)
+      message(FATAL_ERROR
+        "DeePMD model SHA-256 ${_dprc_deepmd_model_sha256} differs from the expected value")
+    endif()
+    set(_dprc_deepmd_runtime_test_enabled ON)
+  endif()
+elseif(DPRC_DEEPMD_MODEL)
   message(FATAL_ERROR
-    "DPRC_REQUIRE_DEEPMD_RUNTIME=ON requires DPRC_DEEPMD_PLUGIN and DPRC_DEEPMD_MODEL")
+    "DPRC_DEEPMD_MODEL requires DPRC_DEEPMD_C_LIBRARY and DPRC_DEEPMD_INCLUDE_DIR")
+elseif(DPRC_REQUIRE_DEEPMD_C_API)
+  message(FATAL_ERROR
+    "DPRC_REQUIRE_DEEPMD_C_API=ON requires the DeePMD C API include directory and library")
 endif()
 
 add_library(dprc_lammps_headers INTERFACE)
@@ -351,6 +380,48 @@ set_target_properties(dprc_partition_roots PROPERTIES
   POSITION_INDEPENDENT_CODE ON
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN YES)
+
+if(_dprc_deepmd_enabled)
+  add_library(dprc_deepmd_executor STATIC src/deepmd_batch_executor.cpp)
+  target_include_directories(dprc_deepmd_executor PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(dprc_deepmd_executor PUBLIC
+    dprc_deepmd_c CUDA::cudart)
+  target_compile_options(dprc_deepmd_executor PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+  set_target_properties(dprc_deepmd_executor PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+
+  add_library(dprc_deepmd_partition_broker STATIC
+    src/deepmd_partition_broker.cpp)
+  target_include_directories(dprc_deepmd_partition_broker PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(dprc_deepmd_partition_broker PUBLIC
+    dprc_deepmd_executor MPI::MPI_CXX)
+  target_compile_options(dprc_deepmd_partition_broker PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+  set_target_properties(dprc_deepmd_partition_broker PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+
+  add_library(dprc_lammps_deepmd_pair STATIC
+    src/pair_dprc_deepmd_batch.cpp)
+  target_include_directories(dprc_lammps_deepmd_pair PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(dprc_lammps_deepmd_pair PUBLIC
+    dprc_lammps_headers
+    dprc_partition_roots
+    dprc_deepmd_partition_broker)
+  target_compile_options(dprc_lammps_deepmd_pair PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+  set_target_properties(dprc_lammps_deepmd_pair PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+endif()
 
 add_library(dprc_xtb_legacy STATIC src/xtb_legacy_hardness.cpp)
 target_include_directories(dprc_xtb_legacy PUBLIC
@@ -551,6 +622,10 @@ target_include_directories(dprcplugin PRIVATE
   "${LAMMPS_SOURCE_DIR}/MOLECULE")
 target_link_libraries(dprcplugin PRIVATE dprc_lammps_headers dprc_partition_roots)
 target_compile_definitions(dprcplugin PRIVATE DPRC_PROJECT_VERSION="${PROJECT_VERSION}")
+if(_dprc_deepmd_enabled)
+  target_link_libraries(dprcplugin PRIVATE dprc_lammps_deepmd_pair)
+  target_compile_definitions(dprcplugin PRIVATE DPRC_HAVE_DEEPMD_BATCH=1)
+endif()
 if(DPRC_XTBLOOM_LIBRARY)
   target_link_libraries(dprcplugin PRIVATE dprc_lammps_xtb_fix)
   target_compile_definitions(dprcplugin PRIVATE DPRC_HAVE_XTBLOOM_FIX=1)
@@ -717,8 +792,17 @@ if(DPRC_BUILD_TESTING)
     add_test(NAME lammps.plugin.symbols
       COMMAND "${CMAKE_COMMAND}"
         -DNM_EXECUTABLE=${CMAKE_NM}
+        -DREADELF_EXECUTABLE=${CMAKE_READELF}
+        -DDEEPMD_C_API_ENABLED=${_dprc_deepmd_enabled}
         -DPLUGIN_FILE=$<TARGET_FILE:dprcplugin>
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_plugin_symbols.cmake")
+  endif()
+
+  if(_dprc_deepmd_enabled)
+    add_executable(deepmd_c_api_header_smoke
+      tests/deepmd_c_api_header_smoke.c)
+    target_link_libraries(deepmd_c_api_header_smoke PRIVATE dprc_deepmd_c)
+    add_test(NAME deepmd.c_api_header COMMAND deepmd_c_api_header_smoke)
   endif()
 
   if(DPRC_XTBLOOM_LIBRARY)
@@ -767,6 +851,48 @@ if(DPRC_BUILD_TESTING)
         -DOUTPUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/dprc-info.txt
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_info_output.cmake")
     set_tests_properties(lammps.plugin.output PROPERTIES DEPENDS lammps.plugin.load)
+
+    if(_dprc_deepmd_runtime_test_enabled AND
+       DPRC_ENABLE_KOKKOS_RUNTIME_TESTS)
+      add_test(NAME lammps.deepmd_c_api.center_mask
+        COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_center_mask.py"
+          --lammps "${DPRC_LAMMPS_EXECUTABLE}"
+          --dprc-plugin $<TARGET_FILE:dprcplugin>
+          --model "${_dprc_deepmd_model_realpath}"
+          --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
+          --evidence
+            "${CMAKE_CURRENT_BINARY_DIR}/deepmd-center-mask-evidence.json")
+      set_tests_properties(lammps.deepmd_c_api.center_mask PROPERTIES
+        TIMEOUT 180 LABELS "cuda;gpu;kokkos;deepmd")
+      if(DPRC_XTBLOOM_LIBRARY)
+        add_test(NAME lammps.deepmd_c_api.qmmm_overlay
+          COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_overlay.py"
+            --lammps "${DPRC_LAMMPS_EXECUTABLE}"
+            --dprc-plugin $<TARGET_FILE:dprcplugin>
+            --model "${_dprc_deepmd_model_realpath}"
+            --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
+            --evidence
+              "${CMAKE_CURRENT_BINARY_DIR}/deepmd-overlay-evidence.json")
+        set_tests_properties(lammps.deepmd_c_api.qmmm_overlay PROPERTIES
+          TIMEOUT 240 LABELS "cuda;gpu;qmmm;deepmd")
+      endif()
+      if(MPIEXEC_EXECUTABLE)
+        add_test(NAME lammps.deepmd_c_api.partition_batch
+          COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_partition_batch.py"
+            --lammps "${DPRC_LAMMPS_EXECUTABLE}"
+            --mpiexec "${MPIEXEC_EXECUTABLE}"
+            --dprc-plugin $<TARGET_FILE:dprcplugin>
+            --model "${_dprc_deepmd_model_realpath}"
+            --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
+            --evidence
+              "${CMAKE_CURRENT_BINARY_DIR}/deepmd-partition-batch-evidence.json")
+        set_tests_properties(lammps.deepmd_c_api.partition_batch PROPERTIES
+          TIMEOUT 240 LABELS "cuda;gpu;mpi;kokkos;deepmd")
+      endif()
+    endif()
 
     if(DPRC_XTBLOOM_LIBRARY)
       set(_dprc_reference_lammps_arguments)
@@ -1087,53 +1213,6 @@ if(DPRC_BUILD_TESTING)
           --evidence "${CMAKE_CURRENT_BINARY_DIR}/qmmm-reject-native-private.json")
       set_tests_properties(lammps.qmmm_xtb.reject_native_fix_private_kspace PROPERTIES TIMEOUT 120)
 
-      if(_dprc_deepmd_runtime_enabled)
-        if(UNIX AND NOT APPLE)
-          add_test(NAME lammps.plugin.deepmd_symbol_overlap
-            COMMAND "${CMAKE_COMMAND}"
-              -DNM_EXECUTABLE=${CMAKE_NM}
-              -DDPRC_PLUGIN=$<TARGET_FILE:dprcplugin>
-              -DDEEPMD_PLUGIN=${_dprc_deepmd_plugin_realpath}
-              -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_plugin_overlap.cmake")
-        endif()
-        add_test(NAME lammps.qmmm_xtb.deepmd_overlay
-          COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_overlay.py"
-            --lammps "${DPRC_LAMMPS_EXECUTABLE}"
-            --dprc-plugin $<TARGET_FILE:dprcplugin>
-            --deepmd-plugin "${_dprc_deepmd_plugin_realpath}"
-            --model "${_dprc_deepmd_model_realpath}"
-            --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
-            --evidence "${CMAKE_CURRENT_BINARY_DIR}/deepmd-overlay-evidence.json")
-        set_tests_properties(lammps.qmmm_xtb.deepmd_overlay PROPERTIES TIMEOUT 180)
-        if(DPRC_ENABLE_KOKKOS_RUNTIME_TESTS)
-          add_test(NAME lammps.deepmd.center_mask_kokkos
-            COMMAND "${Python3_EXECUTABLE}"
-              "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_center_mask.py"
-              --lammps "${DPRC_LAMMPS_EXECUTABLE}"
-              --deepmd-plugin "${_dprc_deepmd_plugin_realpath}"
-              --model "${_dprc_deepmd_model_realpath}"
-              --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
-              --evidence
-                "${CMAKE_CURRENT_BINARY_DIR}/deepmd-center-mask-evidence.json")
-          set_tests_properties(lammps.deepmd.center_mask_kokkos
-            PROPERTIES TIMEOUT 180 LABELS "cuda;gpu;kokkos;deepmd")
-          if(MPIEXEC_EXECUTABLE)
-            add_test(NAME lammps.deepmd.partition_batch_kokkos
-              COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_partition_batch.py"
-                --lammps "${DPRC_LAMMPS_EXECUTABLE}"
-                --mpiexec "${MPIEXEC_EXECUTABLE}"
-                --deepmd-plugin "${_dprc_deepmd_plugin_realpath}"
-                --model "${_dprc_deepmd_model_realpath}"
-                --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
-                --evidence
-                  "${CMAKE_CURRENT_BINARY_DIR}/deepmd-partition-batch-evidence.json")
-            set_tests_properties(lammps.deepmd.partition_batch_kokkos
-              PROPERTIES TIMEOUT 240 LABELS "cuda;gpu;mpi;kokkos;deepmd")
-          endif()
-        endif()
-      endif()
     endif()
 
     if(MPIEXEC_EXECUTABLE)

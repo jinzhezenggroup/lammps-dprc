@@ -220,6 +220,6 @@ contract.
 DPA4C is a throughput-oriented student rather than a checkpoint conversion.
 Distill or train it on the same xTB correction labels only after compressed
 inference supports the exact MM--MM exclusion (or an independently equivalent
-mask) and compact `deepmd/kk` evaluation. FP32 is eligible only after the
+mask) and compact `dprc/deepmd/batch/kk` evaluation. FP32 is eligible only after the
 energy, force, trajectory, and full-PMF qualification sequence in
 [`precision.md`](precision.md).

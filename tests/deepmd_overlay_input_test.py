@@ -23,7 +23,6 @@ class DeepMDOverlayInputTest(unittest.TestCase):
     def test_xtb_modes_use_the_matching_private_kspace_style(self) -> None:
         paths = (
             Path("/runtime/dprcplugin.so"),
-            Path("/runtime/deepmdplugin.so"),
             Path("/runtime/model.pt2"),
             Path("/runtime/result.txt"),
         )
@@ -33,6 +32,8 @@ class DeepMDOverlayInputTest(unittest.TestCase):
                 self.assertIn("fix qmmm qm qmmm/xtb/dprc", text)
                 self.assertIn("kspace_style pppm/dprc", text)
                 self.assertNotIn("kspace_style pppm/xtb", text)
+                self.assertEqual(text.count("plugin load"), 1)
+                self.assertNotIn("deepmdplugin.so", text)
 
 
 if __name__ == "__main__":

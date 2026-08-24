@@ -1,4 +1,7 @@
 #include "command_dprc_info.h"
+#ifdef DPRC_HAVE_DEEPMD_BATCH
+#include "pair_dprc_deepmd_batch.h"
+#endif
 #ifdef DPRC_HAVE_XTBLOOM_FIX
 #include "fix_dprc_xtb.h"
 #include "kspace_dprc.h"
@@ -21,6 +24,12 @@ using namespace LAMMPS_NS;
 namespace {
 
 Command *create_dprc_info(LAMMPS *lmp) { return new CommandDPRCInfo(lmp); }
+
+#ifdef DPRC_HAVE_DEEPMD_BATCH
+Pair *create_dprc_deepmd_batch(LAMMPS *lmp) {
+  return new PairDPRCDeepMDBatch(lmp);
+}
+#endif
 
 #ifdef DPRC_HAVE_XTBLOOM_FIX
 Fix *create_dprc_xtb(LAMMPS *lmp, int narg, char **arg) {
@@ -84,6 +93,21 @@ DPRC_PLUGIN_EXPORT void lammpsplugin_init(void *lmp, void *handle,
       reinterpret_cast<lammpsplugin_factory1 *>(&create_dprc_info);
   plugin.handle = handle;
   register_plugin(&plugin, lmp);
+
+#ifdef DPRC_HAVE_DEEPMD_BATCH
+  plugin.style = "pair";
+  plugin.name = "dprc/deepmd/batch";
+  plugin.info = "GPU-local partition-batched DPRc through the DeePMD C API";
+  plugin.creator.v1 =
+      reinterpret_cast<lammpsplugin_factory1 *>(&create_dprc_deepmd_batch);
+  register_plugin(&plugin, lmp);
+
+  // The implementation is a host LAMMPS adapter around one CUDA model owner,
+  // but the explicit alias lets it compose naturally inside hybrid/overlay/kk
+  // and under the standard -sf kk command-line suffix.
+  plugin.name = "dprc/deepmd/batch/kk";
+  register_plugin(&plugin, lmp);
+#endif
 
 #ifdef DPRC_HAVE_XTBLOOM_FIX
   plugin.style = "fix";

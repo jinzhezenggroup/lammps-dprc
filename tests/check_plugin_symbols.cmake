@@ -49,3 +49,35 @@ if(all_nm_output MATCHES
   message(FATAL_ERROR
     "dprcplugin contains an original LAMMPS QMMM-XTB implementation symbol")
 endif()
+
+# DeePMD integration is allowed only through its public C API. Reject both
+# private C++ symbols and the historical standalone LAMMPS plugin dependency.
+if(all_nm_output MATCHES "_ZN[0-9]+deepmd")
+  message(FATAL_ERROR
+    "dprcplugin contains or references a DeePMD C++ ABI symbol")
+endif()
+
+if(DEFINED READELF_EXECUTABLE AND EXISTS "${READELF_EXECUTABLE}")
+  execute_process(
+    COMMAND "${READELF_EXECUTABLE}" -d "${PLUGIN_FILE}"
+    RESULT_VARIABLE readelf_status
+    OUTPUT_VARIABLE dynamic_output
+    ERROR_VARIABLE readelf_error)
+  if(NOT readelf_status EQUAL 0)
+    message(FATAL_ERROR
+      "Could not inspect plugin dynamic dependencies: ${readelf_error}")
+  endif()
+  if(dynamic_output MATCHES "libdeepmd_lmp")
+    message(FATAL_ERROR
+      "dprcplugin must not depend on the standalone DeePMD LAMMPS plugin")
+  endif()
+  if(DEEPMD_C_API_ENABLED)
+    if(NOT dynamic_output MATCHES "Shared library: \\[libdeepmd_c")
+      message(FATAL_ERROR
+        "DeePMD-enabled dprcplugin does not name libdeepmd_c as a dependency")
+    endif()
+  elseif(dynamic_output MATCHES "Shared library: \\[libdeepmd_c")
+    message(FATAL_ERROR
+      "DeePMD-disabled dprcplugin unexpectedly depends on libdeepmd_c")
+  endif()
+endif()

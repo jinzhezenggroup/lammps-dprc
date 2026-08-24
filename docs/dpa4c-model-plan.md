@@ -91,8 +91,8 @@ real labels; do not convert DPA4 weights into a DPA4c model and assume the
 architectural contract survived.
 
 Train four independent DPA4c seeds with fixed, published configurations. The
-primary model runs every MD step, and the ensemble supplies uncertainty and
-model-deviation evidence. Record data selection, random seeds, optimizer
+primary model is the only model admitted to the current MD runtime; the full
+ensemble supplies offline uncertainty and model-selection evidence. Record data selection, random seeds, optimizer
 state, precision, code revision, dependencies, and all intermediate model
 hashes.
 

@@ -3,7 +3,8 @@
 
 The test uses the same compact DPA4c center-mask system as the host/Kokkos
 regression, but perturbs the second frame.  Each independent calculation and
-the two-partition calculation use ``deepmd/kk partition_batch yes``; therefore
+the two-partition calculation use ``dprc/deepmd/batch partition_batch yes``;
+therefore
 the comparison isolates block-diagonal assembly, frame ordering, and output
 scatter in the universe broker.
 """
@@ -106,7 +107,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lammps", type=Path, required=True)
     parser.add_argument("--mpiexec", type=Path, required=True)
-    parser.add_argument("--deepmd-plugin", type=Path, required=True)
+    parser.add_argument("--dprc-plugin", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--deepmd-revision", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
@@ -116,7 +117,7 @@ def main() -> int:
         for path in (
             arguments.lammps,
             arguments.mpiexec,
-            arguments.deepmd_plugin,
+            arguments.dprc_plugin,
             arguments.model,
         ):
             if not path.is_file():
@@ -138,7 +139,7 @@ def main() -> int:
                 input_file.write_text(
                     CENTER.render_input(
                         True,
-                        arguments.deepmd_plugin,
+                        arguments.dprc_plugin,
                         arguments.model,
                         data_files[frame],
                         energy_file,
@@ -178,7 +179,7 @@ def main() -> int:
             batch_atoms = [batch_dir / f"atoms-{frame}.dump" for frame in range(2)]
             template = CENTER.render_input(
                 True,
-                arguments.deepmd_plugin,
+                arguments.dprc_plugin,
                 arguments.model,
                 data_files[0],
                 batch_energy[0],
@@ -268,7 +269,7 @@ def main() -> int:
             "deepmd_revision": arguments.deepmd_revision,
             "inputs": {
                 "lammps_sha256": sha256(arguments.lammps),
-                "deepmd_plugin_sha256": sha256(arguments.deepmd_plugin),
+                "dprc_plugin_sha256": sha256(arguments.dprc_plugin),
                 "model_sha256": sha256(arguments.model),
             },
             "per_frame_differences": differences,

@@ -44,9 +44,8 @@ Unless unavailable with a documented reason, measure:
 - classical path: CPU reference, LAMMPS GPU pair path, and each fused/device
   implementation;
 - DPRc: disabled, then one compact primary model evaluated every step;
-- model deviation: disabled for the production throughput curve, then enabled
-  at explicit low-frequency strides with four qualified models to measure its
-  amortized monitoring cost;
+- model deviation: disabled; the current in-plugin C API path accepts exactly
+  one primary model and rejects ensemble scheduling;
 - descriptor memory: host and CUDA-device wherever the implementation supports
   both without changing semantics.
 
@@ -75,24 +74,12 @@ itself a timing claim.
 
 Do not compare resource-unequal baselines without naming the difference.
 
-The number of loaded model artifacts is not the per-step inference multiplier.
-With DeePMD's model-deviation schedule, ordinary timesteps evaluate only the
-first model.  Every `f` steps, the deviation timestep evaluates all four and
-uses model zero for dynamics.  The idealized forward count is therefore
-`1 + 3/f` per timestep (`1.03` at `f=100`, `1.003` at `f=1000`).  Report the
-single-primary production curve and each monitored stride separately; do not
-describe the complete trajectory as a four-model or four-times calculation.
-
-The single-primary curve must use the explicit device-resident
-`deepmd/kk`/`full/kk`/`verlet/kk` path together with the available Kokkos
-bonded, SHAKE, integration, thermostat, momentum, and Colvars styles.  Until
-DeePMD's Kokkos pair supports ensembles, positive model-deviation strides use
-its generic GPU adapter.  The device path also pins Kokkos to `newton on neigh
-half`, which preserves the single-owner accumulation contract required by the
-batched classical broker.
-The forward schedule remains `1 + 3/f`, but deviation timesteps include host
-staging and must be named `deepmd-generic-sparse-deviation` rather than
-device-resident Kokkos evidence.
+The single-primary curve must use `dprc/deepmd/batch/kk` together with
+`full/kk`, `verlet/kk`, and the available Kokkos bonded, SHAKE, integration,
+thermostat, momentum, and Colvars styles. The launcher pins Kokkos to `newton
+on neigh half`, preserving the single-owner accumulation contract required by
+the batched classical broker. Evidence must name the backend
+`dprcplugin-deepmd-c-api-batch` and record the exact C API library and model.
 
 ## Correctness qualification
 
@@ -115,8 +102,8 @@ with uncertainty, not visual similarity alone.
 Retain:
 
 - clean Git revisions and dirty bits for this repository and every dependency;
-- absolute paths and SHA-256 for executable, plugin, xTBloom, and DeepMD
-  libraries/models;
+- absolute paths and SHA-256 for the executable, plugin, xTBloom library,
+  DeePMD C API library, and model;
 - compiler, flags, CMake caches, CUDA toolkit/driver, GPU/CPU, clocks/power
   policy, process affinity, MPI, BLAS/eigensolver, and thread environment;
 - exact input hashes, batch topology, point-charge capacity, requested outputs,

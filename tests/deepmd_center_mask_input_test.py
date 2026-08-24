@@ -23,7 +23,7 @@ SPEC.loader.exec_module(CENTER_MASK)
 class DeepMDCenterMaskInputTest(unittest.TestCase):
     def test_host_and_kokkos_inputs_share_the_center_mask_contract(self) -> None:
         paths = (
-            Path("/runtime/deepmdplugin.so"),
+            Path("/runtime/dprcplugin.so"),
             Path("/runtime/model.pt2"),
             Path("/runtime/system.data"),
             Path("/runtime/energy.txt"),
@@ -33,18 +33,19 @@ class DeepMDCenterMaskInputTest(unittest.TestCase):
         kokkos = CENTER_MASK.render_input(True, *paths)
 
         for text in (host, kokkos):
+            self.assertEqual(text.count("plugin load"), 1)
+            self.assertIn("plugin load /runtime/dprcplugin.so", text)
             self.assertIn("group qm id 1:4", text)
             self.assertIn("read_data /runtime/system.data", text)
             self.assertIn("center_group qm", text)
             self.assertIn("environment_cutoff 6.0", text)
             self.assertIn("C H HW O OW P", text)
             self.assertIn("compute dprc_atom all pe/atom pair", text)
-        self.assertIn("pair_style deepmd ", host)
-        self.assertNotIn("deepmd/kk", host)
-        self.assertNotIn("partition_batch yes", host)
+            self.assertIn("partition_batch yes", text)
+            self.assertNotIn("deepmdplugin.so", text)
+        self.assertIn("pair_style dprc/deepmd/batch ", host)
         self.assertIn("atom_style atomic/kk", kokkos)
-        self.assertIn("pair_style deepmd/kk ", kokkos)
-        self.assertIn("partition_batch yes", kokkos)
+        self.assertIn("pair_style dprc/deepmd/batch/kk ", kokkos)
         self.assertIn("run_style verlet/kk", kokkos)
 
     def test_data_preserves_center_environment_and_outside_atom_ids(self) -> None:

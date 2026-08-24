@@ -76,7 +76,7 @@
       "upstream": "https://github.com/deepmodeling/deepmd-kit/pull/5943",
       "revision": "835a42f001b41e1bee0646b7e1403855b7fe6340",
       "license": "LGPL-3.0-or-later",
-      "classification": "open compact-evaluation reference and optional separately loaded runtime plugin",
+      "classification": "open compact-evaluation design reference; the in-plugin runtime requires a newer published public C API v31 revision",
       "required": false,
       "vendored": false,
       "related_revisions": [

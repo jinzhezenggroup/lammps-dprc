@@ -31,9 +31,10 @@
 
 ## M4: DPRc
 
-- [implemented reference gate] Load the pinned DeePMD plugin separately,
-  compose compact `pair_style deepmd` with xTB QM/MM through
-  `hybrid/overlay`, and prove single-addition energy/force semantics.
+- [implemented C API gate] Link `dprcplugin.so` to DeePMD's public C API,
+  build compact canonical graphs for `dprc/deepmd/batch[/kk]`, batch stable
+  partition slots through one GPU-local owner, and prove host/alias parity,
+  batch-2 parity, and QM/MM overlay additivity.
 - [implemented label gate] Audit the legacy MNDOD-to-PBE0 archive and define
   the fail-closed full-periodic provenance required to regenerate PBE0-to-xTB
   correction labels.
@@ -51,11 +52,10 @@
 - [remaining] Prove the independent AmberTools+xTB periodic result matches
   xTBloom's operator and full-force convention, then generate the first
   production xTBloom-based correction corpus.
-- [remaining] Move compact selection and compatible multi-frame evaluation to
-  one GPU-local DPRc broker without changing the host reference result.
-- Enable one qualified FP32 DPRc primary as the production mode, then add
-  four-model deviation at an explicit low-frequency stride and report its
-  amortized overhead separately.
+- [remaining] Publish and pin the clean DeePMD C API v31 implementation used by
+  the broker, then replace the diagnostic graph with a qualified model.
+- Enable one qualified FP32 DPRc primary as the production mode. Keep model
+  deviation offline until a reviewed in-plugin ensemble schedule exists.
 - Add exact DPRc masking support for the selected DPA4/DPA4C architecture.
 - Explore broker-level GPU stream scheduling after context and transfer
   profiling.

@@ -250,12 +250,13 @@ def availability_reasons(
         if arguments.xtbloom_library is None or not arguments.xtbloom_library.is_file():
             reasons.append("xTBloom library is unavailable")
     if mode == "qmmm-dpa4c":
-        if arguments.deepmd_plugin is None or not arguments.deepmd_plugin.is_file():
-            reasons.append("DeePMD LAMMPS plugin is unavailable")
-        expected_models = 1 if arguments.model_deviation_frequency == 0 else 4
-        if len(arguments.deepmd_model) != expected_models:
+        if arguments.model_deviation_frequency != 0:
             reasons.append(
-                f"DPA4c schedule requires exactly {expected_models} model "
+                "the in-plugin DeePMD C API path requires model deviation to be disabled"
+            )
+        if len(arguments.deepmd_model) != 1:
+            reasons.append(
+                "DPA4c schedule requires exactly one model "
                 f"artifact(s), found {len(arguments.deepmd_model)}"
             )
         elif any(not path.is_file() for path in arguments.deepmd_model):
@@ -305,9 +306,8 @@ def runtime_environment(
             )
         }
     if mode == "qmmm-dpa4c":
-        # Every partition loads the same PyTorch/DeePMD runtime. Pin both
-        # operator pools to one thread so 48 windows do not create nested CPU
-        # oversubscription or emit 96 ambiguous tuning warnings.
+        # Rank zero owns the shared DeePMD model, but the backend can still
+        # create CPU operator pools. Pin both pools to avoid oversubscription.
         environment["DP_INTRA_OP_PARALLELISM_THREADS"] = "1"
         environment["DP_INTER_OP_PARALLELISM_THREADS"] = "1"
         selected["DP_INTRA_OP_PARALLELISM_THREADS"] = "1"
@@ -342,19 +342,13 @@ def coordinate_identity(
         inputs["plugin"] = artifact(arguments.plugin)
         inputs["xtbloom"] = artifact(arguments.xtbloom_library)
     if mode == "qmmm-dpa4c":
-        assert arguments.deepmd_plugin is not None
-        inputs["deepmd_plugin"] = artifact(arguments.deepmd_plugin)
         inputs["models"] = [artifact(path) for path in arguments.deepmd_model]
         inputs["dprc_schedule"] = {
             "primary_model_index": 0,
             "model_count": len(arguments.deepmd_model),
             "model_deviation_frequency_steps": arguments.model_deviation_frequency,
-            "model_deviation_enabled": arguments.model_deviation_frequency > 0,
-            "execution_backend": (
-                "deepmd-kk-device"
-                if arguments.model_deviation_frequency == 0
-                else "deepmd-generic-sparse-deviation"
-            ),
+            "model_deviation_enabled": False,
+            "execution_backend": "dprcplugin-deepmd-c-api-batch",
             "models_qualified_as_xtb_dprc": arguments.dpa4c_models_qualified,
         }
     inputs["batch_size"] = batch_size
@@ -411,12 +405,9 @@ def run_coordinate(
             trajectory_frequency=0,
             mode=mode,
             classical_backend=arguments.classical_backend,
-            # DeePMD inputs belong only to the DPRc coordinate.  Passing them
-            # through to the other two modes would change their generated
-            # inputs and violates the renderer's fail-closed boundary.
-            deepmd_plugin=(
-                arguments.deepmd_plugin if mode == "qmmm-dpa4c" else None
-            ),
+            # DeePMD model inputs belong only to the DPRc coordinate. Passing
+            # them to other modes would violate the renderer's fail-closed
+            # boundary.
             deepmd_models=(
                 arguments.deepmd_model if mode == "qmmm-dpa4c" else ()
             ),
@@ -435,9 +426,7 @@ def run_coordinate(
     uses_batched_classical = (
         mode != "classical" or arguments.classical_backend == "batched-dprc"
     )
-    kokkos_device = uses_batched_classical and not (
-        mode == "qmmm-dpa4c" and arguments.model_deviation_frequency > 0
-    )
+    kokkos_device = uses_batched_classical
     command = WORKLOAD.build_lammps_command(
         lammps=arguments.lammps,
         mpi_launcher=mpi_launcher,
@@ -451,8 +440,7 @@ def run_coordinate(
         # creates the atom container.  GPU Kokkos defaults to a full neighbor
         # list with Newton off, whereas the shared classical broker requires
         # one-owner half-list accumulation, so the launcher pins the compatible
-        # pair.  Positive-stride model deviation remains on DeePMD's generic
-        # host adapter because deepmd/kk rejects ensembles.
+        # pair. The in-plugin DeePMD C API adapter shares this launch shape.
         lammps_args=(
             (
                 "-k",
@@ -471,11 +459,17 @@ def run_coordinate(
     )
     environment, selected_environment = runtime_environment(mode, arguments)
     loaded_xtbloom = None
+    loaded_deepmd_c = None
     uses_dprc_plugin = mode != "classical" or arguments.classical_backend == "batched-dprc"
     if uses_dprc_plugin:
         assert arguments.plugin is not None and arguments.xtbloom_library is not None
         loaded_xtbloom = WORKLOAD.verify_loaded_xtbloom(
             arguments.plugin, arguments.xtbloom_library, environment
+        )
+        loaded_deepmd_c = WORKLOAD.verify_loaded_deepmd_c(
+            arguments.plugin,
+            environment,
+            required=mode == "qmmm-dpa4c",
         )
 
     print(f"run: {mode} batch={batch_size}: {shlex.join(command)}", flush=True)
@@ -509,6 +503,7 @@ def run_coordinate(
         "generated_input": artifact(input_path),
         "launcher_log": artifact(launcher_log),
         "loaded_xtbloom": loaded_xtbloom,
+        "loaded_deepmd_c": loaded_deepmd_c,
         "project": project,
         "source_qualification": source["qualification"],
         "window_order": [item.window.tag for item in run_windows],
@@ -671,7 +666,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lammps", type=Path, required=True)
     parser.add_argument("--plugin", type=Path)
     parser.add_argument("--xtbloom-library", type=Path)
-    parser.add_argument("--deepmd-plugin", type=Path)
     parser.add_argument("--deepmd-model", type=Path, action="append", default=[])
     parser.add_argument(
         "--model-deviation-frequency",
@@ -679,9 +673,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         metavar="STEPS",
         help=(
-            "evaluate only one primary DPA4c model when zero (default); a "
-            "positive stride requires four models and evaluates the three "
-            "additional models only on deviation timesteps"
+            "must remain zero; the in-plugin DeePMD C API path currently "
+            "supports one primary DPA4c model without model deviation"
         ),
     )
     parser.add_argument(
@@ -742,6 +735,11 @@ def validate_dpa4c_policy(arguments: argparse.Namespace) -> None:
     """Reject contradictory model scheduling and scientific qualification claims."""
     if arguments.model_deviation_frequency < 0:
         raise ValueError("--model-deviation-frequency must be nonnegative")
+    if arguments.model_deviation_frequency != 0:
+        raise ValueError(
+            "--model-deviation-frequency must be zero for the in-plugin "
+            "DeePMD C API path"
+        )
     if (
         arguments.dpa4c_models_qualified
         and arguments.allow_unqualified_dpa4c_models

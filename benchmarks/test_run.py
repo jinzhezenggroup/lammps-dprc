@@ -127,17 +127,7 @@ class BenchmarkRunnerTest(unittest.TestCase):
             dpa4c = RUNNER.WORKLOAD.render_lammps_input(
                 plugin=root / "dprcplugin.so",
                 mode="qmmm-dpa4c",
-                deepmd_plugin=root / "deepmd.so",
                 deepmd_models=[primary_model],
-                **common,
-            )
-            deviation_models = [root / f"model-{index}.pt2" for index in range(4)]
-            dpa4c_deviation = RUNNER.WORKLOAD.render_lammps_input(
-                plugin=root / "dprcplugin.so",
-                mode="qmmm-dpa4c",
-                deepmd_plugin=root / "deepmd.so",
-                deepmd_models=deviation_models,
-                model_deviation_frequency=100,
                 **common,
             )
             self.assertIn("lj/cut/dprc/batch", classical)
@@ -174,29 +164,12 @@ class BenchmarkRunnerTest(unittest.TestCase):
             self.assertIn("center_group qm", dpa4c)
             self.assertIn("P O O C H OW HW", dpa4c)
             self.assertIn(
-                f"deepmd/kk {primary_model} partition_batch yes out_freq 0",
+                f"dprc/deepmd/batch/kk {primary_model} partition_batch yes",
                 dpa4c,
             )
-            self.assertIn("pair_coeff * * deepmd/kk", dpa4c)
+            self.assertIn("pair_coeff * * dprc/deepmd/batch/kk", dpa4c)
             self.assertNotIn("model_deviation", dpa4c)
-            self.assertIn("atom_style full", dpa4c_deviation)
-            self.assertNotIn("atom_style full/kk", dpa4c_deviation)
-            self.assertNotIn("newton on", dpa4c_deviation)
-            self.assertIn("pair_style hybrid/overlay ", dpa4c_deviation)
-            self.assertNotIn("hybrid/overlay/kk", dpa4c_deviation)
-            self.assertNotIn("harmonic/kk", dpa4c_deviation)
-            self.assertNotIn("shake/kk", dpa4c_deviation)
-            self.assertNotIn("nve/kk", dpa4c_deviation)
-            self.assertNotIn("langevin/kk", dpa4c_deviation)
-            self.assertNotIn("momentum/kk", dpa4c_deviation)
-            self.assertNotIn("colvars/kk", dpa4c_deviation)
-            self.assertIn(" deepmd ", dpa4c_deviation)
-            self.assertNotIn("deepmd/kk", dpa4c_deviation)
-            self.assertIn("out_freq 100", dpa4c_deviation)
-            self.assertIn("out_file ${model_deviation}", dpa4c_deviation)
-            self.assertIn("variable model_deviation world", dpa4c_deviation)
-            for model in deviation_models:
-                self.assertIn(str(model), dpa4c_deviation)
+            self.assertEqual(dpa4c.count("plugin load"), 1)
             self.assertEqual(dpa4c.count("run 1"), 2)
 
             relative = RUNNER.WORKLOAD.render_lammps_input(
@@ -231,16 +204,15 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 "steps": 1,
                 "trajectory_frequency": 0,
                 "mode": "qmmm-dpa4c",
-                "deepmd_plugin": root / "deepmd.so",
             }
-            models = [root / f"model-{index}.pt2" for index in range(4)]
-            with self.assertRaisesRegex(ValueError, "requires exactly 1 model"):
+            models = [root / f"model-{index}.pt2" for index in range(2)]
+            with self.assertRaisesRegex(ValueError, "requires exactly one model"):
                 RUNNER.WORKLOAD.render_lammps_input(
                     deepmd_models=models,
                     model_deviation_frequency=0,
                     **common,
                 )
-            with self.assertRaisesRegex(ValueError, "requires exactly 4 model"):
+            with self.assertRaisesRegex(ValueError, "model deviation to be disabled"):
                 RUNNER.WORKLOAD.render_lammps_input(
                     deepmd_models=models[:1],
                     model_deviation_frequency=100,
@@ -253,23 +225,22 @@ class BenchmarkRunnerTest(unittest.TestCase):
                     **common,
                 )
 
-    def test_dpa4c_evidence_identity_records_sparse_deviation_schedule(self) -> None:
+    def test_dpa4c_evidence_identity_records_in_plugin_batch_schedule(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-schedule-identity-") as temporary:
             root = Path(temporary)
             paths = {
                 name: root / name
-                for name in ("lmp", "dprcplugin.so", "libxtbloom.so", "deepmd.so")
+                for name in ("lmp", "dprcplugin.so", "libxtbloom.so")
             }
-            models = [root / f"model-{index}.pt2" for index in range(4)]
+            models = [root / "model.pt2"]
             for path in (*paths.values(), *models):
                 path.write_bytes(path.name.encode("utf-8"))
             arguments = SimpleNamespace(
                 lammps=paths["lmp"],
                 plugin=paths["dprcplugin.so"],
                 xtbloom_library=paths["libxtbloom.so"],
-                deepmd_plugin=paths["deepmd.so"],
                 deepmd_model=models,
-                model_deviation_frequency=250,
+                model_deviation_frequency=0,
                 dpa4c_models_qualified=True,
                 classical_backend="batched-dprc",
             )
@@ -278,10 +249,10 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 identity["dprc_schedule"],
                 {
                     "primary_model_index": 0,
-                    "model_count": 4,
-                    "model_deviation_frequency_steps": 250,
-                    "model_deviation_enabled": True,
-                    "execution_backend": "deepmd-generic-sparse-deviation",
+                    "model_count": 1,
+                    "model_deviation_frequency_steps": 0,
+                    "model_deviation_enabled": False,
+                    "execution_backend": "dprcplugin-deepmd-c-api-batch",
                     "models_qualified_as_xtb_dprc": True,
                 },
             )
@@ -296,10 +267,9 @@ class BenchmarkRunnerTest(unittest.TestCase):
                     "mpiexec",
                     "dprcplugin.so",
                     "libxtbloom.so",
-                    "deepmd.so",
                 )
             ]
-            models = [root / f"model-{index}.pt2" for index in range(4)]
+            models = [root / f"model-{index}.pt2" for index in range(2)]
             for path in (*required, *models):
                 path.write_bytes(path.name.encode("utf-8"))
             arguments = SimpleNamespace(
@@ -307,7 +277,6 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 mpiexec=required[1],
                 plugin=required[2],
                 xtbloom_library=required[3],
-                deepmd_plugin=required[4],
                 deepmd_model=models[:1],
                 model_deviation_frequency=0,
                 dpa4c_models_qualified=True,
@@ -320,16 +289,23 @@ class BenchmarkRunnerTest(unittest.TestCase):
             arguments.deepmd_model = models
             self.assertTrue(
                 any(
-                    "requires exactly 1 model" in reason
+                    "requires exactly one model" in reason
                     for reason in RUNNER.availability_reasons(
                         "qmmm-dpa4c", 8, arguments
                     )
                 )
             )
+            arguments.deepmd_model = models[:1]
             arguments.model_deviation_frequency = 100
-            self.assertEqual(
-                RUNNER.availability_reasons("qmmm-dpa4c", 8, arguments), []
+            self.assertTrue(
+                any(
+                    "model deviation" in reason
+                    for reason in RUNNER.availability_reasons(
+                        "qmmm-dpa4c", 8, arguments
+                    )
+                )
             )
+            arguments.model_deviation_frequency = 0
 
             arguments.dpa4c_models_qualified = False
             self.assertTrue(

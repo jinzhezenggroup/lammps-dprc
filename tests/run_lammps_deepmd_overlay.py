@@ -76,29 +76,24 @@ def system_commands() -> list[str]:
 def render_input(
     mode: str,
     dprc_plugin: Path,
-    deepmd_plugin: Path,
     model: Path,
     result: Path,
 ) -> str:
     """Render one of the three independent additivity calculations."""
     dprc = require_lammps_token(dprc_plugin)
-    deepmd = require_lammps_token(deepmd_plugin)
     model_path = require_lammps_token(model)
     result_path = require_lammps_token(result)
 
-    commands: list[str] = []
-    if mode in {"deepmd", "overlay"}:
-        commands.append(f"plugin load {deepmd}")
-    if mode in {"xtb", "overlay"}:
-        commands.append(f"plugin load {dprc}")
+    commands: list[str] = [f"plugin load {dprc}"]
     commands.extend(system_commands())
 
     compact = (
-        f"deepmd {model_path} center_group qm environment_cutoff 1.5 "
+        f"dprc/deepmd/batch {model_path} partition_batch yes "
+        "center_group qm environment_cutoff 1.5 "
         "include_molecule no"
     )
     if mode == "deepmd":
-        commands.extend([f"pair_style {compact}", "pair_coeff * *"])
+        commands.extend([f"pair_style {compact}", "pair_coeff * * O H"])
     elif mode == "xtb":
         commands.extend(["pair_style coul/long 8.0", "pair_coeff * *"])
     elif mode == "overlay":
@@ -106,7 +101,7 @@ def render_input(
             [
                 f"pair_style hybrid/overlay coul/long 8.0 {compact}",
                 "pair_coeff * * coul/long",
-                "pair_coeff * * deepmd",
+                "pair_coeff * * dprc/deepmd/batch O H",
             ]
         )
     else:
@@ -169,7 +164,6 @@ def run_mode(
     executable: Path,
     mode: str,
     dprc_plugin: Path,
-    deepmd_plugin: Path,
     model: Path,
     directory: Path,
 ) -> tuple[dict[str, float], str]:
@@ -177,7 +171,7 @@ def run_mode(
     input_file = directory / f"in.{mode}"
     result_file = directory / f"{mode}.txt"
     input_file.write_text(
-        render_input(mode, dprc_plugin, deepmd_plugin, model, result_file),
+        render_input(mode, dprc_plugin, model, result_file),
         encoding="utf-8",
     )
     process = subprocess.run(
@@ -205,7 +199,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lammps", type=Path, required=True)
     parser.add_argument("--dprc-plugin", type=Path, required=True)
-    parser.add_argument("--deepmd-plugin", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--deepmd-revision", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
@@ -215,7 +208,6 @@ def main() -> int:
         for path in (
             arguments.lammps,
             arguments.dprc_plugin,
-            arguments.deepmd_plugin,
             arguments.model,
         ):
             if not path.is_file():
@@ -227,7 +219,6 @@ def main() -> int:
                 arguments.lammps,
                 "xtb",
                 arguments.dprc_plugin,
-                arguments.deepmd_plugin,
                 arguments.model,
                 directory,
             )
@@ -235,7 +226,6 @@ def main() -> int:
                 arguments.lammps,
                 "deepmd",
                 arguments.dprc_plugin,
-                arguments.deepmd_plugin,
                 arguments.model,
                 directory,
             )
@@ -243,7 +233,6 @@ def main() -> int:
                 arguments.lammps,
                 "overlay",
                 arguments.dprc_plugin,
-                arguments.deepmd_plugin,
                 arguments.model,
                 directory,
             )
@@ -275,10 +264,6 @@ def main() -> int:
                 "dprc_plugin": {
                     "path": str(arguments.dprc_plugin.resolve()),
                     "sha256": sha256(arguments.dprc_plugin),
-                },
-                "deepmd_plugin": {
-                    "path": str(arguments.deepmd_plugin.resolve()),
-                    "sha256": sha256(arguments.deepmd_plugin),
                 },
                 "model": {
                     "path": str(arguments.model.resolve()),

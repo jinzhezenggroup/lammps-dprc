@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a small, explicitly unqualified DPA4c CUDA diagnostic model.
 
-This artifact exists only to exercise the compact ``deepmd/kk`` execution
+This artifact exists only to exercise the compact ``dprc/deepmd/batch/kk`` execution
 path before an xTB-trained DPRc ensemble is available.  Randomized parameters
 make energies and forces non-vacuous, but they have no scientific meaning and
 must never qualify a DPRc correctness or performance row.

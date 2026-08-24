@@ -1,19 +1,13 @@
 # Build and run LAMMPS
 
-This guide builds the exact LAMMPS host required by LAMMPS-DPRc and shows the
-direct `lmp` commands for one-window and multi-partition execution. Every path
-beginning with `/path/to` is a user-supplied placeholder.
+This guide builds a Kokkos/CUDA LAMMPS host, xTBloom, the DeePMD public C API,
+and `dprcplugin.so`. It also shows direct one-window and multi-partition LAMMPS
+commands. Every `/path/to` value is a user-supplied placeholder.
 
-The public source stack is sufficient for batched xTB QM/MM. QM/MM+DPA4c also
-requires a separately loaded DeePMD plugin that implements compact
-`center_group` input and `partition_batch yes`, plus a scientifically qualified
-DPA4c DPRc model. Those two artifacts are not distributed by this repository;
-the current multi-partition DeePMD implementation is not yet available as a
-clean, immutable public release.
+The supported QM/MM plus DPRc workflow loads only `dprcplugin.so`. DeePMD is a
+linked C API dependency of that plugin, not a separately loaded LAMMPS plugin.
 
-## Create the source workspace
-
-Choose an empty parent directory and clone the three repositories as siblings:
+## 1. Create the source workspace
 
 ```bash
 export DPRC_WORKSPACE=/path/to/dprc-workspace
@@ -29,28 +23,30 @@ git -C xtbloom checkout 3c474e1c1b639098f72ae7523472bd5f65ad3ab5
 git clone https://github.com/jinzhezenggroup/lammps-dprc.git
 ```
 
-The revisions are also recorded in
-`lammps-dprc/config/dependencies.json`. Keep the LAMMPS and xTBloom worktrees
-clean for any correctness or performance claim:
+For QM/MM plus DPA4c, also obtain a clean DeePMD-kit revision that provides
+public C API version 31 or newer and the canonical batch symbols used here:
+
+```bash
+git clone https://github.com/<publisher>/deepmd-kit.git deepmd-kit
+git -C deepmd-kit checkout <reviewed-api-v31-revision>
+```
+
+The currently recorded DeePMD design-reference pin predates C API version 31.
+Replace the placeholder only with a clean, immutable revision after that API
+has been published and reviewed. A dirty local API implementation is suitable
+for development tests, not a public reproducibility or performance claim.
+
+Verify the required public pins:
 
 ```bash
 python3 lammps-dprc/tools/check_dependency_pins.py --required-only
 ```
 
-## Select one toolchain
+## 2. Select one toolchain
 
-Provide:
-
-- CMake 3.24 or newer and Ninja;
-- a C++20-capable host compiler accepted by the selected CUDA toolkit;
-- one MPI implementation with C and C++ wrappers;
-- an NVIDIA CUDA toolkit compatible with the target GPU;
-- cuFFT from the same reviewed CUDA runtime cohort used by LAMMPS-DPRc;
-- Python 3.11 or newer for the repository tools.
-
-Set machine-specific paths outside the repositories. The following example
-uses an RTX 5090, whose CUDA compute capability is 12.0 and whose Kokkos
-architecture name is `BLACKWELL120`:
+The build requires CMake 3.24 or newer, Ninja, Python 3.11 or newer, one MPI
+implementation, a CUDA toolkit accepted by the host compiler, and a matching
+cuFFT runtime. Example variables for an RTX 5090 are:
 
 ```bash
 export DPRC_CUDA_ROOT=/path/to/cuda
@@ -65,17 +61,15 @@ export DPRC_CUFFT_LIBRARY="$DPRC_CUDA_ROOT/lib64/libcufft.so"
 export PATH="$DPRC_CUDA_ROOT/bin:$PATH"
 ```
 
-Replace both architecture values for another GPU. The LAMMPS executable,
-Kokkos, DeePMD plugin, and LAMMPS-DPRc plugin must use the same host C++ ABI,
-MPI implementation, LAMMPS integer-size mode, and CUDA architecture. Do not
-mix an Open MPI plugin with an MPICH executable or reuse a plugin built for a
-different LAMMPS revision.
+Change both architecture values for another GPU. LAMMPS and the plugin must
+use the same MPI implementation, compiler ABI, and `LAMMPS_SIZES` mode. Do not
+mix Open MPI and MPICH artifacts or reuse a plugin built for another LAMMPS
+revision.
 
-## Build the shared Kokkos runtime
+## 3. Build a shared Kokkos runtime
 
-QM/MM+DPA4c loads DeePMD separately. LAMMPS and the DeePMD plugin must
-therefore share one Kokkos runtime. Build that runtime from the Kokkos snapshot
-contained in the pinned LAMMPS checkout:
+Build Kokkos from the pinned LAMMPS checkout so LAMMPS can use a shared CUDA
+runtime:
 
 ```bash
 cd "$DPRC_WORKSPACE"
@@ -95,17 +89,11 @@ cmake --build kokkos-build --parallel
 cmake --install kokkos-build
 ```
 
-Build the separately loaded DeePMD LAMMPS plugin against this same
-`kokkos-install` prefix. For xTB QM/MM without DPA4c, a shared Kokkos runtime
-is not intrinsically required, but this route keeps one LAMMPS build compatible
-with both execution modes.
+## 4. Build the LAMMPS executable
 
-## Build the production LAMMPS executable
-
-The plugin supplies private QM/MM styles, so leave both upstream `QMMM` and
-`QMMM-XTB` packages disabled. `EXTERNAL_KOKKOS=ON` is required; setting only
-`Kokkos_DIR` would otherwise leave LAMMPS on its bundled static Kokkos build.
-`PKG_PLUGIN=ON` provides the `plugin load` command.
+The plugin supplies its own private QM/MM styles, so disable the upstream
+`QMMM` and `QMMM-XTB` packages. `PKG_PLUGIN=ON` provides `plugin load`.
+`EXTERNAL_KOKKOS=ON` is required when using the shared Kokkos installation.
 
 ```bash
 cd "$DPRC_WORKSPACE"
@@ -140,58 +128,21 @@ cmake -S lammps/cmake -B lammps-build -G Ninja \
 cmake --build lammps-build --target lmp --parallel
 ```
 
-`KOKKOS_PREC=double` is the production default. It is independent of the
-xTBloom C ABI, which exchanges IEEE binary64 values in atomic units. Any
-Kokkos, xTBloom, or DPA4c FP32 or mixed-precision variant is a separate opt-in
-experiment requiring independent scientific qualification.
-
-Do not change `LAMMPS_SIZES` when building the plugin. If `bigbig` is required,
-configure both LAMMPS and LAMMPS-DPRc explicitly with `bigbig` and rerun all
-correctness tests.
-
-### Optional upstream GPU-package benchmark executable
-
-The production batched path does not use the LAMMPS GPU package. To reproduce
-the retained upstream-GPU classical MM reference, configure a separate LAMMPS
-build with the same options above except:
-
-```text
--DPKG_GPU=ON
--DGPU_API=cuda
--DGPU_ARCH=sm_120
--DGPU_PREC=mixed
-```
-
-The `GPU_PREC=mixed` result applies only to that upstream MM benchmark
-coordinate. It does not change xTBloom or LAMMPS-DPRc precision.
-
-## Verify the LAMMPS executable
-
-Record the executable identity and verify the required packages:
+Verify the executable and enabled packages:
 
 ```bash
-cd "$DPRC_WORKSPACE"
 sha256sum lammps-build/lmp
 lammps-build/lmp -h > lammps-build/lmp-help.txt
-rg 'KOKKOS|KSPACE|MOLECULE|RIGID|COLVARS|PLUGIN' lammps-build/lmp-help.txt
-```
-
-Check that execution resolves the intended MPI, C++ runtime, CUDA cohort, and
-shared Kokkos libraries:
-
-```bash
+rg 'KOKKOS|KSPACE|MOLECULE|RIGID|COLVARS|PLUGIN' \
+  lammps-build/lmp-help.txt
 ldd lammps-build/lmp
-ldd /path/to/libdeepmd_lmp.so
 ```
 
-The DeePMD command is required only for QM/MM+DPA4c. Do not continue if the
-two components resolve different MPI or Kokkos libraries.
+`KOKKOS_PREC=double` is the default. FP32 or mixed-precision variants are
+separate experiments and require the qualification sequence in
+`docs/precision.md`.
 
-## Build xTBloom for CUDA
-
-Build the public shared library from the pinned xTBloom checkout. The Torch
-extension and xTBloom's own test suite are not required for this runtime
-artifact:
+## 5. Build xTBloom
 
 ```bash
 cd "$DPRC_WORKSPACE"
@@ -209,31 +160,68 @@ cmake -S xtbloom -B xtbloom/build/lammps-dprc-cuda -G Ninja \
   -DXTBLOOM_BUILD_TESTS=OFF \
   -DBUILD_SHARED_LIBS=ON
 
-cmake --build xtbloom/build/lammps-dprc-cuda --target xtbloom --parallel
+cmake --build xtbloom/build/lammps-dprc-cuda \
+  --target xtbloom --parallel
 
 export DPRC_XTBLOOM_LIBRARY="$DPRC_WORKSPACE/xtbloom/build/lammps-dprc-cuda/libxtbloom.so"
 export DPRC_XTBLOOM_SHA256="$(sha256sum "$DPRC_XTBLOOM_LIBRARY" | awk '{print $1}')"
-printf '%s  %s\n' "$DPRC_XTBLOOM_SHA256" "$DPRC_XTBLOOM_LIBRARY"
 ```
 
-If xTBloom requires an explicit CPU eigensolver provider in the selected
-environment, add
-`-DXTBLOOM_CPU_LINALG_LIBRARY=/path/to/lp64/lapacke-cblas.so`. Do not allow
-CMake to select an unintended LP64/ILP64 or threaded provider silently.
+If the selected environment requires an explicit CPU eigensolver provider,
+add `-DXTBLOOM_CPU_LINALG_LIBRARY=/path/to/lp64/lapacke-cblas.so`.
 
-## Build LAMMPS-DPRc
+## 6. Build the DeePMD C API
 
-Hash the exact cuFFT header and shared library before configuring:
+This step is required only for QM/MM plus DPA4c. Build the public C API and a
+CUDA-capable PyTorch backend from the reviewed API-v31 revision. The exact
+PyTorch prefix is installation-specific.
+
+```bash
+cd "$DPRC_WORKSPACE"
+export DPRC_DEEPMD_PREFIX="$DPRC_WORKSPACE/deepmd-install"
+
+cmake -S deepmd-kit/source -B deepmd-build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$DPRC_HOST_CC" \
+  -DCMAKE_CXX_COMPILER="$DPRC_HOST_CXX" \
+  -DCMAKE_CUDA_ARCHITECTURES="$DPRC_CUDA_ARCH" \
+  -DCUDAToolkit_ROOT="$DPRC_CUDA_ROOT" \
+  -DCMAKE_PREFIX_PATH=/path/to/pytorch/prefix \
+  -DCMAKE_INSTALL_PREFIX="$DPRC_DEEPMD_PREFIX" \
+  -DBUILD_CPP_IF=ON \
+  -DBUILD_PY_IF=OFF \
+  -DBUILD_TESTING=OFF \
+  -DDP_USING_C_API=ON \
+  -DUSE_CUDA_TOOLKIT=TRUE \
+  -DUSE_PT_PYTHON_LIBS=ON
+
+cmake --build deepmd-build --parallel
+cmake --install deepmd-build
+
+export DPRC_DEEPMD_INCLUDE_DIR="$DPRC_DEEPMD_PREFIX/include"
+export DPRC_DEEPMD_C_LIBRARY="$DPRC_DEEPMD_PREFIX/lib/libdeepmd_c.so"
+export DPRC_DEEPMD_C_SHA256="$(sha256sum "$DPRC_DEEPMD_C_LIBRARY" | awk '{print $1}')"
+
+rg -n '^#define[[:space:]]+DP_C_API_VERSION' \
+  "$DPRC_DEEPMD_INCLUDE_DIR/deepmd/c_api.h"
+nm -D "$DPRC_DEEPMD_C_LIBRARY" | \
+  rg 'DP_DeepPotComputeCanonicalGraphBatchGPU'
+```
+
+Stop if the C API version is below 31 or the batch symbol is absent.
+
+## 7. Build LAMMPS-DPRc
+
+Hash cuFFT and, when enabled, the diagnostic or production model:
 
 ```bash
 export DPRC_CUFFT_HEADER_SHA256="$(sha256sum "$DPRC_CUFFT_INCLUDE_DIR/cufft.h" | awk '{print $1}')"
 export DPRC_CUFFT_LIBRARY_SHA256="$(sha256sum "$DPRC_CUFFT_LIBRARY" | awk '{print $1}')"
-printf '%s  %s\n' "$DPRC_CUFFT_HEADER_SHA256" "$DPRC_CUFFT_INCLUDE_DIR/cufft.h"
-printf '%s  %s\n' "$DPRC_CUFFT_LIBRARY_SHA256" "$DPRC_CUFFT_LIBRARY"
+export DPRC_DEEPMD_MODEL=/path/to/dpa4c-model.pt2
+export DPRC_DEEPMD_MODEL_SHA256="$(sha256sum "$DPRC_DEEPMD_MODEL" | awk '{print $1}')"
 ```
 
-Use the same compiler, MPI, integer-size mode, CUDA architecture, and cuFFT
-cohort as the LAMMPS host:
+Configure the complete plugin:
 
 ```bash
 cd "$DPRC_WORKSPACE"
@@ -254,6 +242,14 @@ cmake -S lammps-dprc -B lammps-dprc/build/cuda -G Ninja \
   -DDPRC_REQUIRE_XTBLOOM_LIBRARY=ON \
   -DDPRC_XTBLOOM_BACKEND=CUDA \
   -DDPRC_XTBLOOM_DEVICE_ID=0 \
+  -DDEEPMD_SOURCE_DIR="$DPRC_WORKSPACE/deepmd-kit" \
+  -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v31-revision> \
+  -DDPRC_DEEPMD_INCLUDE_DIR="$DPRC_DEEPMD_INCLUDE_DIR" \
+  -DDPRC_DEEPMD_C_LIBRARY="$DPRC_DEEPMD_C_LIBRARY" \
+  -DDPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256="$DPRC_DEEPMD_C_SHA256" \
+  -DDPRC_REQUIRE_DEEPMD_C_API=ON \
+  -DDPRC_DEEPMD_MODEL="$DPRC_DEEPMD_MODEL" \
+  -DDPRC_EXPECTED_DEEPMD_MODEL_SHA256="$DPRC_DEEPMD_MODEL_SHA256" \
   -DDPRC_LAMMPS_EXECUTABLE="$DPRC_WORKSPACE/lammps-build/lmp" \
   -DDPRC_LAMMPS_SIZES=smallbig \
   -DDPRC_BUILD_TESTING=ON \
@@ -265,15 +261,32 @@ cmake -S lammps-dprc -B lammps-dprc/build/cuda -G Ninja \
   -DDPRC_EXPECTED_CUFFT_LIBRARY_SHA256="$DPRC_CUFFT_LIBRARY_SHA256"
 
 cmake --build lammps-dprc/build/cuda --parallel
+ctest --test-dir lammps-dprc/build/cuda --output-on-failure
+python3 lammps-dprc/tools/check_dependency_pins.py --required-only
 ```
 
-The resulting plugin is
-`$DPRC_WORKSPACE/lammps-dprc/build/cuda/dprcplugin.so`.
+The plugin is `lammps-dprc/build/cuda/dprcplugin.so`. To build xTB QM/MM
+without DPRc, omit all `DEEPMD` options. To compile the DeePMD styles without
+runtime model tests, omit only `DPRC_DEEPMD_MODEL` and its hash.
 
-## Set the runtime environment
+## 8. Install and inspect the plugin
 
-Expose one physical GPU and the exact runtime libraries. Add DeePMD library
-directories only for QM/MM+DPA4c:
+```bash
+cmake --install lammps-dprc/build/cuda \
+  --prefix "$DPRC_WORKSPACE/lammps-dprc-install"
+
+export DPRC_PLUGIN="$DPRC_WORKSPACE/lammps-dprc-install/lib/lammps/plugins/dprcplugin.so"
+sha256sum "$DPRC_PLUGIN"
+ldd "$DPRC_PLUGIN"
+readelf -d "$DPRC_PLUGIN"
+nm -D --defined-only "$DPRC_PLUGIN"
+```
+
+The installed plugin must export only `lammpsplugin_init`. A DeePMD-enabled
+build must name `libdeepmd_c` as a dependency and must not name a standalone
+DeePMD LAMMPS plugin. The install step removes build-machine RPATH entries.
+
+## 9. Set the runtime environment
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
@@ -283,22 +296,13 @@ export MKL_NUM_THREADS=1
 export DP_INTRA_OP_PARALLELISM_THREADS=1
 export DP_INTER_OP_PARALLELISM_THREADS=1
 export HYDRA_LAUNCHER=fork
-export LD_LIBRARY_PATH="$DPRC_WORKSPACE/xtbloom/build/lammps-dprc-cuda:$DPRC_WORKSPACE/kokkos-install/lib:/path/to/deepmd/lib:$DPRC_CUDA_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$DPRC_WORKSPACE/xtbloom/build/lammps-dprc-cuda:$DPRC_DEEPMD_PREFIX/lib:$DPRC_WORKSPACE/kokkos-install/lib:$DPRC_CUDA_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-Do not inherit an unreviewed loader path from a login shell for a qualified
-run. Record the effective environment and `ldd` output with every performance
-or scientific result.
+Record the effective environment and `ldd` output for every correctness or
+performance result. Do not combine libraries from incompatible CUDA cohorts.
 
-Run the plugin tests after establishing this environment:
-
-```bash
-ctest --test-dir "$DPRC_WORKSPACE/lammps-dprc/build/cuda" --output-on-failure
-```
-
-## Verify plugin loading
-
-Run the topology and ABI diagnostic before a scientific input:
+## 10. Verify plugin loading
 
 ```bash
 cd "$DPRC_WORKSPACE"
@@ -307,70 +311,51 @@ mkdir -p plugin-check
 lammps-build/lmp \
   -log plugin-check/log.lammps \
   -screen plugin-check/screen.txt \
-  -var dprc_plugin "$DPRC_WORKSPACE/lammps-dprc/build/cuda/dprcplugin.so" \
+  -var dprc_plugin "$DPRC_PLUGIN" \
   -var dprc_marker "$DPRC_WORKSPACE/plugin-check/partition.txt" \
   -in "$DPRC_WORKSPACE/lammps-dprc/tests/in.dprc_info"
 ```
 
-The command must load the plugin and write the expected partition identity.
-Never continue after an ABI, integer-size, MPI, or style-registration error.
+Stop after any ABI, MPI, integer-size, or style-registration error.
 
-## Direct single-window LAMMPS command
+## 11. Direct LAMMPS launch commands
 
-For a generated input containing one value for each `variable ... world`
-command:
+For one window:
 
 ```bash
-mkdir -p /path/to/run-directory/logs
-
-"$DPRC_WORKSPACE/lammps-build/lmp" \
+/path/to/lmp \
   -k on g 1 \
   -pk kokkos newton on neigh half \
-  -log /path/to/run-directory/logs/log.lammps \
+  -log /path/to/run/log.lammps \
   -screen none \
-  -in /path/to/run-directory/input.lammps
+  -in /path/to/run/input.lammps
 ```
 
-Kokkos must be initialized before `read_data`. The generated input uses
-`atom_style full/kk`, places `newton on` before `read_data`, and selects
-`run_style verlet/kk` after the simulation box exists.
-
-## Direct multi-partition LAMMPS command
-
-Use one MPI rank per independent window. For 32 synchronized windows on one
-GPU:
+For 32 independent windows sharing one GPU:
 
 ```bash
-mkdir -p /path/to/run-directory/logs
-
-mpiexec -n 32 "$DPRC_WORKSPACE/lammps-build/lmp" \
+mpiexec -n 32 /path/to/lmp \
   -k on g 1 \
   -pk kokkos newton on neigh half \
   -partition 32x1 \
-  -plog /path/to/run-directory/logs/log.lammps \
+  -plog /path/to/run/log.lammps \
   -pscreen none \
-  -in /path/to/run-directory/input.lammps
+  -in /path/to/run/input.lammps
 ```
 
-The input must contain exactly 32 values for every world variable. LAMMPS
-creates partition logs such as `log.lammps.0` through `log.lammps.31`. The
-synchronized timing denominator is the slowest partition loop, not the average
-of those logs.
+Every `variable ... world` command in the input must provide one value per
+partition. Each partition must be an independent trajectory or umbrella
+window; future dependent timesteps from one trajectory cannot be batched.
 
-Do not batch future dependent timesteps from one trajectory. Each partition
-must represent an independent window or trajectory and retain its stable slot
-identity for the entire run.
+## Essential QM/MM plus DPA4c LAMMPS commands
 
-## Essential QM/MM+DPA4c LAMMPS commands
-
-The workflow runner generates the complete input and should be preferred over
-manual authoring. The essential force-path commands have this shape:
+The workflow runner should be preferred, but the essential force path is:
 
 ```lammps
-plugin load /path/to/libdeepmd_lmp.so
 plugin load /path/to/dprcplugin.so
 
 units real
+dimension 3
 boundary p p p
 atom_style full/kk
 atom_modify map array
@@ -388,13 +373,15 @@ angle_style harmonic/kk
 pair_style hybrid/overlay/kk &
   lj/cut/dprc/batch 9.0 &
   tip4p/long/dprc/batch 6 7 1 1 0.125 9.0 &
-  deepmd/kk /path/to/qualified-dpa4c.pt2 &
-  partition_batch yes out_freq 0 atomic center_group qm &
-  environment_cutoff 6.0 include_molecule yes
+  dprc/deepmd/batch/kk /path/to/qualified-dpa4c.pt2 &
+    partition_batch yes &
+    center_group qm &
+    environment_cutoff 6.0 &
+    include_molecule yes
 
 include /path/to/generated/forcefield_dprc_batch.inc
 pair_coeff 6*7 6*7 tip4p/long/dprc/batch
-pair_coeff * * deepmd/kk P O O C H OW HW
+pair_coeff * * dprc/deepmd/batch/kk P O O C H OW HW
 pair_modify pair lj/cut/dprc/batch tail yes
 special_bonds amber
 
@@ -402,40 +389,46 @@ kspace_style pppm/tip4p/dprc/batch 1.0e-6
 kspace_modify mesh 50 50 50 order 4 gewald 0.348831617901729
 
 fix qmmm qm qmmm/xtb/dprc &
-  elements P O O C H O H cutoff 9.0 charge -2 uhf 0 &
+  elements P O O C H O H &
+  cutoff 9.0 charge -2 uhf 0 &
   method gfn2 accuracy 0.001 maxiter 250 etemp 300.0 &
   mmhardness 0.0 kmax 8 8 8 ksqmax 100
 fix_modify qmmm energy yes
+
+fix water_shake water shake/kk 1.0e-6 200 0 b 1 a 1
+fix integrate all nve/kk
+fix thermostat all langevin/kk 300.0 300.0 100.0 12345
+
+timestep 0.001
+neighbor 2.0 bin
+neigh_modify every 1 delay 0 check yes
+thermo 100
+run 1000
 ```
 
-The complete input must also define all force-field coefficients, TIP4P SHAKE,
-the integrator, thermostat, Colvars restraints, neighbor policy, thermo output,
-run length, and final data/restart writes. These are generated from
-`workloads/etpeth/manifest.json` by `tools/etpeth_workload.py`.
+`center_group` must be static. `environment_cutoff` is expressed in LAMMPS
+distance units. `include_molecule yes` requires positive molecule IDs for
+selected environment atoms. The style requires atom IDs, an atom map, one MPI
+rank per partition, synchronized timesteps, and no `neigh_modify exclude`.
 
-For xTB QM/MM without DPA4c, omit the DeePMD plugin, the `deepmd/kk` sub-style,
-and its `pair_coeff`; keep the LAMMPS-DPRc plugin, batched classical styles,
-KSpace style, and `fix qmmm`.
+For xTB QM/MM without DPA4c, remove the `dprc/deepmd/batch/kk` sub-style and
+its `pair_coeff`; keep `dprcplugin.so`, the batched classical styles, KSpace,
+and `fix qmmm`.
 
-## Recommended production command
-
-The direct commands are useful for debugging. For production, use the runner
-so input rendering, model qualification, artifact hashes, stable world
-ordering, resume validation, and output publication remain fail-closed:
+## 12. Recommended production runner
 
 ```bash
 python3 "$DPRC_WORKSPACE/lammps-dprc/tools/etpeth_workload.py" run \
   --tutorial /path/to/dprc-tutorial \
   --output /path/to/run-directory \
   --lammps "$DPRC_WORKSPACE/lammps-build/lmp" \
-  --plugin "$DPRC_WORKSPACE/lammps-dprc/build/cuda/dprcplugin.so" \
+  --plugin "$DPRC_PLUGIN" \
   --xtbloom-library "$DPRC_XTBLOOM_LIBRARY" \
-  --deepmd-plugin /path/to/libdeepmd_lmp.so \
   --deepmd-model /path/to/qualified-dpa4c.pt2 \
   --mode qmmm-dpa4c \
   --dpa4c-models-qualified \
+  --library-dir "$DPRC_DEEPMD_PREFIX/lib" \
   --library-dir "$DPRC_WORKSPACE/kokkos-install/lib" \
-  --library-dir /path/to/deepmd/lib \
   --library-dir "$DPRC_CUDA_ROOT/lib64" \
   --stage batch-smoke \
   --smoke-window-count 2 \
@@ -443,4 +436,5 @@ python3 "$DPRC_WORKSPACE/lammps-dprc/tools/etpeth_workload.py" run \
 ```
 
 Proceed to `anchor`, `seeds`, `equilibrate`, and `production` only after the
-one-window and batch smoke checks pass with the exact production artifacts.
+one-window and batched correctness checks pass with the exact production
+artifacts.

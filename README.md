@@ -10,9 +10,7 @@ The reference workload is the ETP/ETH system from `../dprc-tutorial`:
 - multiple independent umbrella windows;
 - 8,938 atoms with a 16-atom QM region;
 - triclinic TIP4P-Ew solvent and a 50 x 50 x 50 PPPM mesh;
-- xTBloom GFN2-xTB QM/MM followed by one DPA4c DPRc primary every step;
-  optional model deviation evaluates three additional models only at an
-  explicit low-frequency stride.
+- xTBloom GFN2-xTB QM/MM followed by one DPA4c DPRc primary every step.
 
 ## Start here
 
@@ -56,7 +54,8 @@ LAMMPS partition/window 0 --\
 LAMMPS partition/window 1 ---+--> one node/GPU-local broker
 LAMMPS partition/window 2 ---+       |
 ...                         --/       +--> one xTBloom ragged CUDA plan
-                                          stable slot and WARM state per window
+                                    +--> one optional DeePMD canonical batch
+                                         stable slot identity per window
 ```
 
 Only independent windows or trajectories can be batched. Consecutive future
@@ -119,8 +118,9 @@ provides:
   cutoff-crossing test proving zero-charge shell equivalence plus FRESH-to-WARM
   reuse without a plan rebuild; and a two-partition ragged-topology rebuild
   test;
-- an optional, artifact-pinned composition test that loads DeePMD as a separate
-  plugin and proves compact DPRc is added exactly once beside xTB QM/MM;
+- an optional DeePMD C API v31+ integration inside `dprcplugin.so`, with
+  center-mask, batch-2-versus-batch-1, symbol-boundary, and QM/MM overlay
+  additivity tests;
 - a hash-verifying, resumable external ETP/ETH runner that generates the full
   48-window restraint grid and the missing seed states without vendoring the
   dirty, license-unresolved tutorial inputs;
@@ -198,21 +198,21 @@ still contains only `lammpsplugin_init`, which prevents the private renamed
 implementation from interposing on LAMMPS or another plugin under
 `RTLD_GLOBAL` loading.
 
-The DPRc runtime path likewise does not add DeePMD symbols to this plugin. A
-matching DeePMD LAMMPS plugin is loaded separately and composed with the
-classical pair style through `hybrid/overlay`. The production single-model
-path uses compact group-only input, `deepmd/kk`, and `partition_batch yes`:
-one GPU-local owner evaluates a block-diagonal graph across synchronized
-windows. The current implementation still stages rank GPU data through shared
-host memory before and after the owner GPU evaluation. A positive-frequency
-four-model deviation schedule uses DeePMD's generic adapter as a separate
-performance coordinate.
+The DPRc runtime path is implemented inside `dprcplugin.so` through DeePMD's
+public C API v31+. It registers `dprc/deepmd/batch` and the `/kk` alias, uses
+compact group-only input, and requires `partition_batch yes`. One GPU-local
+owner loads the model and evaluates a block-diagonal graph across synchronized
+windows. The plugin has a direct `libdeepmd_c` dependency but no DeePMD C++ or
+standalone LAMMPS-plugin dependency. The current path supports one primary
+model; model deviation is rejected until it is implemented through the same
+reviewed C API boundary.
 
-The unqualified single-model diagnostic measured median aggregate rates of
+The earlier standalone-adapter diagnostic measured median aggregate rates of
 `23.56, 43.70, 74.66, 116.41, 156.30, 194.23` accepted steps/s/GPU at batches
 `1, 2, 4, 8, 16, 32`. Batch 48 failed in xTBloom CUDA SCC plan creation before
-a valid DPA4c timing sample. See the [benchmark report](docs/benchmark-results.md)
-for the full evidence boundary and batch-32 timing decomposition.
+a valid DPA4c timing sample. Those rows do not measure the current in-plugin C
+API path. See the [benchmark report](docs/benchmark-results.md) for the full
+evidence boundary and batch-32 timing decomposition.
 
 ## Configure and test
 
@@ -293,38 +293,38 @@ tallies.  It rejects slab, staggered/ad PPPM, r-RESPA, per-atom tallies, and
 continuously changing cells rather than falling back to duplicate per-window
 work.
 
-To enable the optional compact DeePMD composition gate, use a DeePMD plugin
-built from the reviewed compact-evaluation revision and provide exact artifact
-digests. The local DeePMD checkout must be clean and at the configured revision
-unless `DPRC_ALLOW_UNPINNED_DEPENDENCIES=ON` is explicitly used for diagnostic
-development:
+To enable compact DeePMD batching, provide a DeePMD C API v31+ header and
+shared library plus their exact source and artifact identities:
 
 ```bash
-sha256sum /path/to/libdeepmd_lmp.so /path/to/dprc-model.pt2
+sha256sum /path/to/libdeepmd_c.so /path/to/dprc-model.pt2
 cmake -S . -B build -G Ninja \
   <the xTBloom and LAMMPS options above> \
   -DDEEPMD_SOURCE_DIR="$PWD/../deepmd-kit" \
-  -DDPRC_DEEPMD_PLUGIN=/path/to/libdeepmd_lmp.so \
+  -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v31-revision> \
+  -DDPRC_DEEPMD_INCLUDE_DIR=/path/to/deepmd/include \
+  -DDPRC_DEEPMD_C_LIBRARY=/path/to/libdeepmd_c.so \
   -DDPRC_DEEPMD_MODEL=/path/to/dprc-model.pt2 \
-  -DDPRC_EXPECTED_DEEPMD_PLUGIN_SHA256=<plugin-sha256> \
+  -DDPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256=<c-api-library-sha256> \
   -DDPRC_EXPECTED_DEEPMD_MODEL_SHA256=<model-sha256> \
-  -DDPRC_REQUIRE_DEEPMD_RUNTIME=ON
+  -DDPRC_REQUIRE_DEEPMD_C_API=ON \
+  -DDPRC_ENABLE_KOKKOS_RUNTIME_TESTS=ON
 cmake --build build --parallel
-ctest --test-dir build -R lammps.qmmm_xtb.deepmd_overlay --output-on-failure
+ctest --test-dir build -R deepmd --output-on-failure
 ```
 
-The test records executable, plugin, model, revision, units, component results,
-and additivity residuals in `build/deepmd-overlay-evidence.json`. It requires a
-real DPRc correction model before its result can support a scientific claim;
-using a DeePMD test fixture only validates runtime composition.
+The tests record executable, plugin, model, revision, units, parity results,
+and overlay additivity. A diagnostic model validates software integration only;
+it cannot support a scientific DPRc claim. See the complete build and launch
+instructions in [the LAMMPS guide](docs/lammps-build-and-run.md).
 
 The exact compiler and MPI settings used to build LAMMPS may need to be passed
 to CMake explicitly. `DPRC_XTBLOOM_BACKEND` selects `AUTO`, `CPU`, or `CUDA`;
 `DPRC_XTBLOOM_DEVICE_ID` selects a CUDA ordinal (`-1` leaves selection to the
 runtime), and `DPRC_XTBLOOM_CPU_THREADS` controls the one broker-owned CPU
-context. Omitting `DPRC_XTBLOOM_LIBRARY` builds a diagnostic plugin that
-registers only `dprc/info`; it neither registers `qmmm/xtb/dprc` nor carries an
-xTBloom `DT_NEEDED` entry. The dependency checker rejects dirty revisions,
+context. Omitting `DPRC_XTBLOOM_LIBRARY` omits the xTB QM/MM styles and the
+xTBloom `DT_NEEDED` entry; `dprc/info` and any explicitly enabled DeePMD C API
+styles remain available. The dependency checker rejects dirty revisions,
 mismatched pins, and mismatched reviewed artifact hashes by default because
 such builds cannot support final correctness or performance claims.
 
