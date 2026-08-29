@@ -26,7 +26,7 @@ jobs:
           python-version: '3.12.7'
 
       - name: Install the pinned repository-test dependency
-        run: python -m pip install numpy==2.1.3
+        run: python -m pip install numpy==2.1.3 h5py==3.12.1
 
       - name: Compile Python sources
         run: python -m compileall -q benchmarks tests tools
