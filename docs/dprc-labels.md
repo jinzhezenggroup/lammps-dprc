@@ -75,8 +75,8 @@ Audit it without copying the archive into this repository:
 
 ```bash
 python3 tools/audit_dprc_labels.py \
-  --dataset ../lammps-dprc-runs/dprc-labels/source/init_data.hdf5 \
-  --output ../lammps-dprc-runs/dprc-labels/audit.json \
+  --dataset /path/to/dprc-labels/source/init_data.hdf5 \
+  --output /path/to/dprc-labels/audit.json \
   --allow-unqualified-source
 ```
 
@@ -220,6 +220,7 @@ contract.
 DPA4C is a throughput-oriented student rather than a checkpoint conversion.
 Distill or train it on the same xTB correction labels only after compressed
 inference supports the exact MM--MM exclusion (or an independently equivalent
-mask) and compact `dprc/deepmd/batch/kk` evaluation. FP32 is eligible only after the
-energy, force, trajectory, and full-PMF qualification sequence in
+mask) and compact `dprc/deepmd/batch` evaluation. The `/kk` alias remains an
+independent opt-in experiment. FP32 is eligible only after the energy, force,
+trajectory, and full-PMF qualification sequence in
 [`precision.md`](precision.md).

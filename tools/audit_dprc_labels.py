@@ -209,7 +209,7 @@ def require_contract(payload: dict[str, Any]) -> None:
     expected_references = {
         "engine_manifest": {
             "path": "config/quick_pbe0_engine.json",
-            "sha256": "83abd43eb02bf5be75055a2df842265e6c55598ee74625b206b82c010e89aa92",
+            "sha256": "1459f84d99f683af632cad70a412d9d34e2047ab518f1a1855ebf347f902e0d0",
         },
         "qualification_evidence": {
             "path": "workloads/etpeth/evidence/quick-pbe0-qualification.json",
@@ -257,7 +257,7 @@ def require_contract(payload: dict[str, Any]) -> None:
     )
     expected_periodic_reference = {
         "path": "workloads/etpeth/evidence/quick-pbe0-binary64-label-qualification.json",
-        "sha256": "d62c5f23487da776b1dde24bda31a4dd005e148425e607d0e3a22c94a1d84e34",
+        "sha256": "68971a0d2a1386cc871bce6ed6410dd0513f5b2b2a2c1cff3121fcba6f79e4ef",
     }
     if periodic_reference != expected_periodic_reference:
         raise ValueError(

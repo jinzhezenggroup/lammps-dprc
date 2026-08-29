@@ -294,16 +294,22 @@ continuously changing cells rather than falling back to duplicate per-window
 work.
 
 To enable compact DeePMD batching, provide a DeePMD C API v31+ header and
-shared library plus their exact source and artifact identities:
+shared library plus a declared, content-addressed artifact cohort:
 
 ```bash
 sha256sum /path/to/libdeepmd_c.so /path/to/dprc-model.pt2
+python3 tools/deepmd_artifact_manifest.py write \
+  --source "$PWD/../deepmd-kit" \
+  --include-dir /path/to/deepmd/include \
+  --library /path/to/libdeepmd_c.so \
+  --output /path/to/deepmd-artifact-manifest.json
 cmake -S . -B build -G Ninja \
   <the xTBloom and LAMMPS options above> \
   -DDEEPMD_SOURCE_DIR="$PWD/../deepmd-kit" \
   -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v31-revision> \
   -DDPRC_DEEPMD_INCLUDE_DIR=/path/to/deepmd/include \
   -DDPRC_DEEPMD_C_LIBRARY=/path/to/libdeepmd_c.so \
+  -DDPRC_DEEPMD_ARTIFACT_MANIFEST=/path/to/deepmd-artifact-manifest.json \
   -DDPRC_DEEPMD_MODEL=/path/to/dprc-model.pt2 \
   -DDPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256=<c-api-library-sha256> \
   -DDPRC_EXPECTED_DEEPMD_MODEL_SHA256=<model-sha256> \
@@ -312,6 +318,10 @@ cmake -S . -B build -G Ninja \
 cmake --build build --parallel
 ctest --test-dir build -R deepmd --output-on-failure
 ```
+
+The manifest proves that the declared checkout, public header, and library
+bytes match the declared content identities. It is not build-system attestation and does
+not by itself prove that the library was compiled from that checkout.
 
 The tests record executable, plugin, model, revision, units, parity results,
 and overlay additivity. A diagnostic model validates software integration only;

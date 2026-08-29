@@ -5,7 +5,7 @@
   "production_ready": false,
   "qualification_scope": "target-topology binary64 Sander/QUICK periodic label publication, Hamiltonian identity, same-process reuse, and selected force derivatives",
   "date": "2026-08-23",
-  "raw_run_directory": "../lammps-dprc-runs/quick-cuda-qmmm-pbe0-etpeth-v2/periodic-binary64",
+  "raw_run_directory": "external/quick-cuda-qmmm-pbe0-etpeth-v2/periodic-binary64",
   "hardware": {
     "gpu": "NVIDIA GeForce RTX 5090",
     "compute_capability": "12.0",

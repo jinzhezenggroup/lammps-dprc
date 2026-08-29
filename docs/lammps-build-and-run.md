@@ -64,7 +64,8 @@ export PATH="$DPRC_CUDA_ROOT/bin:$PATH"
 Change both architecture values for another GPU. LAMMPS and the plugin must
 use the same MPI implementation, compiler ABI, and `LAMMPS_SIZES` mode. Do not
 mix Open MPI and MPICH artifacts or reuse a plugin built for another LAMMPS
-revision.
+revision. The partition-batched DeePMD transport also requires MPI-3 shared
+windows with the unified memory model (`MPI_WIN_UNIFIED`).
 
 ## 3. Build a shared Kokkos runtime
 
@@ -201,6 +202,13 @@ cmake --install deepmd-build
 export DPRC_DEEPMD_INCLUDE_DIR="$DPRC_DEEPMD_PREFIX/include"
 export DPRC_DEEPMD_C_LIBRARY="$DPRC_DEEPMD_PREFIX/lib/libdeepmd_c.so"
 export DPRC_DEEPMD_C_SHA256="$(sha256sum "$DPRC_DEEPMD_C_LIBRARY" | awk '{print $1}')"
+export DPRC_DEEPMD_ARTIFACT_MANIFEST="$DPRC_DEEPMD_PREFIX/lammps-dprc-artifacts.json"
+
+python3 "$DPRC_WORKSPACE/lammps-dprc/tools/deepmd_artifact_manifest.py" write \
+  --source "$DPRC_WORKSPACE/deepmd-kit" \
+  --include-dir "$DPRC_DEEPMD_INCLUDE_DIR" \
+  --library "$DPRC_DEEPMD_C_LIBRARY" \
+  --output "$DPRC_DEEPMD_ARTIFACT_MANIFEST"
 
 rg -n '^#define[[:space:]]+DP_C_API_VERSION' \
   "$DPRC_DEEPMD_INCLUDE_DIR/deepmd/c_api.h"
@@ -246,6 +254,7 @@ cmake -S lammps-dprc -B lammps-dprc/build/cuda -G Ninja \
   -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v31-revision> \
   -DDPRC_DEEPMD_INCLUDE_DIR="$DPRC_DEEPMD_INCLUDE_DIR" \
   -DDPRC_DEEPMD_C_LIBRARY="$DPRC_DEEPMD_C_LIBRARY" \
+  -DDPRC_DEEPMD_ARTIFACT_MANIFEST="$DPRC_DEEPMD_ARTIFACT_MANIFEST" \
   -DDPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256="$DPRC_DEEPMD_C_SHA256" \
   -DDPRC_REQUIRE_DEEPMD_C_API=ON \
   -DDPRC_DEEPMD_MODEL="$DPRC_DEEPMD_MODEL" \
@@ -324,8 +333,6 @@ For one window:
 
 ```bash
 /path/to/lmp \
-  -k on g 1 \
-  -pk kokkos newton on neigh half \
   -log /path/to/run/log.lammps \
   -screen none \
   -in /path/to/run/input.lammps
@@ -335,8 +342,6 @@ For 32 independent windows sharing one GPU:
 
 ```bash
 mpiexec -n 32 /path/to/lmp \
-  -k on g 1 \
-  -pk kokkos newton on neigh half \
   -partition 32x1 \
   -plog /path/to/run/log.lammps \
   -pscreen none \
@@ -357,23 +362,23 @@ plugin load /path/to/dprcplugin.so
 units real
 dimension 3
 boundary p p p
-atom_style full/kk
+atom_style full
 atom_modify map array
 newton on
 
 variable start_data world /path/to/window.data
 read_data ${start_data}
-run_style verlet/kk
+run_style verlet
 
 group qm id 1:16
 group water type 6 7
-bond_style harmonic/kk
-angle_style harmonic/kk
+bond_style harmonic
+angle_style harmonic
 
-pair_style hybrid/overlay/kk &
+pair_style hybrid/overlay &
   lj/cut/dprc/batch 9.0 &
   tip4p/long/dprc/batch 6 7 1 1 0.125 9.0 &
-  dprc/deepmd/batch/kk /path/to/qualified-dpa4c.pt2 &
+  dprc/deepmd/batch /path/to/qualified-dpa4c.pt2 &
     partition_batch yes &
     center_group qm &
     environment_cutoff 6.0 &
@@ -381,7 +386,7 @@ pair_style hybrid/overlay/kk &
 
 include /path/to/generated/forcefield_dprc_batch.inc
 pair_coeff 6*7 6*7 tip4p/long/dprc/batch
-pair_coeff * * dprc/deepmd/batch/kk P O O C H OW HW
+pair_coeff * * dprc/deepmd/batch P O O C H OW HW
 pair_modify pair lj/cut/dprc/batch tail yes
 special_bonds amber
 
@@ -395,9 +400,9 @@ fix qmmm qm qmmm/xtb/dprc &
   mmhardness 0.0 kmax 8 8 8 ksqmax 100
 fix_modify qmmm energy yes
 
-fix water_shake water shake/kk 1.0e-6 200 0 b 1 a 1
-fix integrate all nve/kk
-fix thermostat all langevin/kk 300.0 300.0 100.0 12345
+fix water_shake water shake 1.0e-6 200 0 b 1 a 1
+fix integrate all nve
+fix thermostat all langevin 300.0 300.0 100.0 12345
 
 timestep 0.001
 neighbor 2.0 bin
@@ -411,9 +416,14 @@ distance units. `include_molecule yes` requires positive molecule IDs for
 selected environment atoms. The style requires atom IDs, an atom map, one MPI
 rank per partition, synchronized timesteps, and no `neigh_modify exclude`.
 
-For xTB QM/MM without DPA4c, remove the `dprc/deepmd/batch/kk` sub-style and
+For xTB QM/MM without DPA4c, remove the `dprc/deepmd/batch` sub-style and
 its `pair_coeff`; keep `dprcplugin.so`, the batched classical styles, KSpace,
 and `fix qmmm`.
+
+These direct commands deliberately keep ordinary LAMMPS work on the host.
+Use `-k on g 1 -pk kokkos newton on neigh half` together with the `/kk` style
+aliases only for a separately qualified Kokkos run; otherwise every partition
+would create an additional CUDA context alongside the GPU-local brokers.
 
 ## 12. Recommended production runner
 
@@ -426,6 +436,7 @@ python3 "$DPRC_WORKSPACE/lammps-dprc/tools/etpeth_workload.py" run \
   --xtbloom-library "$DPRC_XTBLOOM_LIBRARY" \
   --deepmd-model /path/to/qualified-dpa4c.pt2 \
   --mode qmmm-dpa4c \
+  --lammps-execution-backend host \
   --dpa4c-models-qualified \
   --library-dir "$DPRC_DEEPMD_PREFIX/lib" \
   --library-dir "$DPRC_WORKSPACE/kokkos-install/lib" \
@@ -437,4 +448,6 @@ python3 "$DPRC_WORKSPACE/lammps-dprc/tools/etpeth_workload.py" run \
 
 Proceed to `anchor`, `seeds`, `equilibrate`, and `production` only after the
 one-window and batched correctness checks pass with the exact production
-artifacts.
+artifacts. The host execution backend keeps ordinary LAMMPS work on the CPU
+and avoids one unused Kokkos CUDA context per umbrella partition; xTBloom and
+DeePMD remain owned by their GPU-local brokers.

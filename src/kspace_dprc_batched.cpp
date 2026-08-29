@@ -2,6 +2,7 @@
 
 #include "pair_dprc_batched_lj.h"
 #include "pair_dprc_batched_tip4p.h"
+#include "stable_local_indices.h"
 
 #include "atom.h"
 #include "comm.h"
@@ -182,7 +183,20 @@ void PPPMTIP4PDPRCBatched::build_stable_atom_order() {
           stable_tags_.end())
     error->all(FLERR,
                "KSpace style pppm/tip4p/dprc/batch requires unique positive atom IDs");
+  refresh_stable_local_indices();
+}
 
+void PPPMTIP4PDPRCBatched::refresh_stable_local_indices() const {
+  // LAMMPS's global atom map includes periodic ghosts.  Rebuild the stable
+  // slot map from the owned prefix after atom sorting instead of relying on
+  // which equal-tag image the global map currently exposes.
+  auto rebuilt = DPRC::stable_local_indices(
+      stable_tags_, atom->tag, static_cast<std::size_t>(atom->nlocal));
+  if (!rebuilt)
+    error->universe_all(
+        FLERR,
+        "KSpace style pppm/tip4p/dprc/batch could not map every stable atom ID to one owned atom");
+  stable_local_indices_ = std::move(*rebuilt);
 }
 
 void PPPMTIP4PDPRCBatched::append_special_pairs(
@@ -326,10 +340,12 @@ void PPPMTIP4PDPRCBatched::build_broker() {
 }
 
 int PPPMTIP4PDPRCBatched::atom_index_for_slot(std::size_t slot) const {
-  const int index = atom->map(stable_tags_.at(slot));
-  if (index < 0 || index >= atom->nlocal)
-    error->one(FLERR,
-               "Stable batched atom ID is not local on its one-rank window");
+  const int index = stable_local_indices_.at(slot);
+  if (index < 0 || index >= atom->nlocal ||
+      atom->tag[index] != stable_tags_.at(slot))
+    error->universe_all(
+        FLERR,
+        "Stable batched atom-to-local-index cache is stale within a neighbor epoch");
   return index;
 }
 
@@ -349,10 +365,10 @@ void PPPMTIP4PDPRCBatched::validate_fixed_state() const {
   const bool audit_topology = neighbor->ago == 0;
   bool tags_and_types_match = true;
   if (audit_topology) {
+    refresh_stable_local_indices();
     for (std::size_t slot = 0; slot < stable_tags_.size(); ++slot) {
-      const int index = atom->map(stable_tags_[slot]);
-      if (index < 0 || index >= atom->nlocal ||
-          atom->type[index] - 1 != stable_atom_types_[slot]) {
+      const int index = atom_index_for_slot(slot);
+      if (atom->type[index] - 1 != stable_atom_types_[slot]) {
         tags_and_types_match = false;
         break;
       }
@@ -681,6 +697,7 @@ void PPPMTIP4PDPRCBatched::maybe_complete_publication() noexcept {
 
 double PPPMTIP4PDPRCBatched::memory_usage() {
   return static_cast<double>(stable_tags_.capacity() * sizeof(tagint) +
+                             stable_local_indices_.capacity() * sizeof(int) +
                              (frame_positions_.capacity() +
                               frame_charges_.capacity()) *
                                  sizeof(double));

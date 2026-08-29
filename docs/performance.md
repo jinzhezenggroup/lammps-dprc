@@ -74,12 +74,13 @@ itself a timing claim.
 
 Do not compare resource-unequal baselines without naming the difference.
 
-The single-primary curve must use `dprc/deepmd/batch/kk` together with
-`full/kk`, `verlet/kk`, and the available Kokkos bonded, SHAKE, integration,
-thermostat, momentum, and Colvars styles. The launcher pins Kokkos to `newton
-on neigh half`, preserving the single-owner accumulation contract required by
-the batched classical broker. Evidence must name the backend
-`dprcplugin-deepmd-c-api-batch` and record the exact C API library and model.
+The primary production curve uses the host LAMMPS style chain and
+`dprc/deepmd/batch`; broker-owned xTBloom and DeePMD work remains on the GPU.
+This is the default because it avoids one otherwise unused Kokkos CUDA context
+per umbrella partition. A `/kk` curve is a separate opt-in experiment and must
+be independently correctness-qualified; its launcher pins Kokkos to `newton
+on neigh half`. Every curve must name both the LAMMPS execution backend and
+`dprcplugin-deepmd-c-api-batch`, and record the exact C API library and model.
 
 ## Correctness qualification
 
@@ -117,19 +118,17 @@ it is not a performance result.
 The current dirty-tree development diagnostic uses 25 warmup steps and five
 100-step samples of the 8,938-atom ETP/ETH workload.  Median aggregate
 classical rates at batches `1, 2, 4, 8, 16, 32, 48` are respectively `475.2,
-686.3, 890.9, 1032.4, 1121.1, 1193.1, 1114.1` accepted steps/s/GPU.  The exact
-runner output is outside the repository at
-`../lammps-dprc-runs/classical-optimized-long-diagnostic-20260823`; it remains
-diagnostic because the worktree is dirty, correctness evidence was not
-supplied to the runner, and the tutorial source is unqualified.
+686.3, 890.9, 1032.4, 1121.1, 1193.1, 1114.1` accepted steps/s/GPU. The retained
+derived summary is under `benchmarks/results/2026-08-24-rtx5090-diagnostic/`;
+raw run directories remain external. These measurements remain diagnostic
+because the worktree is dirty, correctness evidence was not supplied to the
+runner, and the tutorial source is unqualified.
 
 Under the same timing protocol, the fixed-capacity xTB QM/MM path measured
 median aggregate rates of `26.92, 53.72, 99.32, 177.36, 281.43, 409.52,
-427.58` accepted steps/s/GPU. The B1/B32/B48 output is at
-`../lammps-dprc-runs/qmmm-padded-point-slots-tuned-b1-b32-b48-diagnostic-20260823`
-and the B2/B4/B8/B16 output is at
-`../lammps-dprc-runs/qmmm-padded-point-slots-tuned-b2-b16-diagnostic-20260823`.
-Every coordinate used 624 plan slots for at most 612 physical points, created
+427.58` accepted steps/s/GPU. The retained derived summary is in the same
+sanitized results directory; raw run directories remain external. Every
+coordinate used 624 plan slots for at most 612 physical points, created
 one plan, performed no capacity growth, and used 525 WARM calls after the
 initial FRESH call. These rows are likewise dirty, correctness-unqualified
 runner diagnostics and are not publication evidence.
