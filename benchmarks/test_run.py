@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -459,6 +460,62 @@ class BenchmarkRunnerTest(unittest.TestCase):
             )
             self.assertTrue(any("xtbloom" in reason for reason in reasons))
             self.assertTrue(any("DeePMD" in reason for reason in reasons))
+
+    def test_partitioned_availability_resolves_mpi_launcher_from_path(self) -> None:
+        """A command-name launcher is valid when discovered through PATH."""
+        with tempfile.TemporaryDirectory(prefix="dprc-path-mpiexec-") as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            launcher = bin_dir / "mpiexec"
+            launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            lammps = root / "lmp"
+            lammps.write_bytes(b"lammps")
+            arguments = SimpleNamespace(
+                lammps=lammps,
+                mpiexec=Path("mpiexec"),
+                plugin=None,
+                xtbloom_library=None,
+                deepmd_model=[],
+                model_deviation_frequency=0,
+                dpa4c_models_qualified=False,
+                allow_unqualified_dpa4c_models=False,
+                classical_backend="upstream-gpu",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
+            ):
+                self.assertEqual(
+                    RUNNER.availability_reasons("classical", 2, arguments), []
+                )
+
+            arguments.mpiexec = Path("missing-mpiexec")
+            self.assertIn(
+                "MPI launcher is unavailable",
+                RUNNER.availability_reasons("classical", 2, arguments),
+            )
+
+    def test_serial_coordinate_does_not_require_mpi_launcher(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-serial-launcher-") as temporary:
+            root = Path(temporary)
+            lammps = root / "lmp"
+            lammps.write_bytes(b"lammps")
+            arguments = SimpleNamespace(
+                lammps=lammps,
+                mpiexec=root / "missing-mpiexec",
+                plugin=None,
+                xtbloom_library=None,
+                deepmd_model=[],
+                model_deviation_frequency=0,
+                dpa4c_models_qualified=False,
+                allow_unqualified_dpa4c_models=False,
+                classical_backend="upstream-gpu",
+            )
+            self.assertEqual(
+                RUNNER.availability_reasons("classical", 1, arguments), []
+            )
 
     def test_unqualified_dpa4c_override_is_explicit_and_mutually_exclusive(self) -> None:
         parser = RUNNER.build_parser()
