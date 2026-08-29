@@ -266,12 +266,18 @@ bool DeepmdPartitionBroker::local_graph_valid(
     diagnostic = "canonical graph CSR terminal entries are invalid";
     return false;
   }
+  const std::int64_t edge_count = static_cast<std::int64_t>(edges);
   for (std::size_t node = 0; node < nodes; ++node) {
+    const std::int64_t destination_begin = graph.destination_row_ptr[node];
+    const std::int64_t destination_end =
+        graph.destination_row_ptr[node + 1];
+    const std::int64_t source_begin = graph.source_row_ptr[node];
+    const std::int64_t source_end = graph.source_row_ptr[node + 1];
     if (graph.atom_types[node] < 0 ||
         graph.atom_types[node] >= metadata_.type_count ||
-        graph.destination_row_ptr[node] >
-            graph.destination_row_ptr[node + 1] ||
-        graph.source_row_ptr[node] > graph.source_row_ptr[node + 1]) {
+        destination_begin < 0 || destination_end < destination_begin ||
+        destination_end > edge_count || source_begin < 0 ||
+        source_end < source_begin || source_end > edge_count) {
       diagnostic = "canonical graph contains an invalid type or CSR row";
       return false;
     }
@@ -350,18 +356,86 @@ void DeepmdPartitionBroker::ensure_shared_capacity(
                                     MPI_INFO_NULL, shared_communicator_,
                                     &local_base, &shared_data_window_),
             "MPI_Win_allocate_shared DeePMD data");
+  int setup_valid = 1;
+  std::string setup_diagnostic;
+  const auto record_setup_status = [&](int status, const char *operation) {
+    if (status != MPI_SUCCESS && setup_valid) {
+      setup_valid = 0;
+      setup_diagnostic = std::string(operation) + " failed";
+    }
+  };
+  record_setup_status(
+      MPI_Win_set_errhandler(shared_data_window_, MPI_ERRORS_RETURN),
+      "MPI_Win_set_errhandler DeePMD data");
+
+  // Direct C++ loads and stores through another rank's shared mapping are
+  // portable only when MPI exposes one coherent public/private copy. Reject a
+  // separate-model implementation collectively before publishing pointers.
+  int *window_model = nullptr;
+  int model_available = 0;
+  record_setup_status(
+      MPI_Win_get_attr(shared_data_window_, MPI_WIN_MODEL, &window_model,
+                       &model_available),
+      "MPI_Win_get_attr DeePMD memory model");
+  const bool local_unified =
+      (model_available && window_model != nullptr &&
+       *window_model == MPI_WIN_UNIFIED);
+  if (!local_unified && setup_valid) {
+    setup_valid = 0;
+    setup_diagnostic =
+        "dprc/deepmd/batch requires the MPI unified shared-window memory "
+        "model";
+  }
+
   MPI_Aint queried_bytes = 0;
   int displacement_unit = 0;
   void *root_base = nullptr;
-  check_mpi(MPI_Win_shared_query(shared_data_window_, kOwner, &queried_bytes,
-                                 &displacement_unit, &root_base),
-            "MPI_Win_shared_query DeePMD data");
+  record_setup_status(
+      MPI_Win_shared_query(shared_data_window_, kOwner, &queried_bytes,
+                           &displacement_unit, &root_base),
+      "MPI_Win_shared_query DeePMD data");
   if (root_base == nullptr || queried_bytes != root_bytes ||
-      displacement_unit != 1)
-    throw std::runtime_error("shared DeePMD data mapping is inconsistent");
-  check_mpi(MPI_Win_lock_all(MPI_MODE_NOCHECK, shared_data_window_),
-            "MPI_Win_lock_all DeePMD data");
-  shared_data_locked_ = true;
+      displacement_unit != 1) {
+    if (setup_valid) {
+      setup_valid = 0;
+      setup_diagnostic = "shared DeePMD data mapping is inconsistent";
+    }
+  }
+  const int lock_status =
+      MPI_Win_lock_all(MPI_MODE_NOCHECK, shared_data_window_);
+  record_setup_status(lock_status, "MPI_Win_lock_all DeePMD data");
+  shared_data_locked_ = lock_status == MPI_SUCCESS;
+
+  int all_setup_valid = 0;
+  check_mpi(MPI_Allreduce(&setup_valid, &all_setup_valid, 1, MPI_INT, MPI_MIN,
+                          shared_communicator_),
+            "MPI_Allreduce DeePMD shared-window setup");
+  if (!all_setup_valid) {
+    const int candidate = setup_valid ? size_ : rank_;
+    int diagnostic_rank = size_;
+    check_mpi(MPI_Allreduce(&candidate, &diagnostic_rank, 1, MPI_INT, MPI_MIN,
+                            shared_communicator_),
+              "MPI_Allreduce DeePMD setup diagnostic rank");
+    if (rank_ != diagnostic_rank)
+      setup_diagnostic.clear();
+    int diagnostic_length =
+        rank_ == diagnostic_rank
+            ? checked_count(setup_diagnostic.size(), "setup diagnostic")
+            : 0;
+    check_mpi(MPI_Bcast(&diagnostic_length, 1, MPI_INT, diagnostic_rank,
+                        shared_communicator_),
+              "MPI_Bcast DeePMD setup diagnostic length");
+    if (rank_ != diagnostic_rank)
+      setup_diagnostic.resize(static_cast<std::size_t>(diagnostic_length));
+    check_mpi(MPI_Bcast(setup_diagnostic.empty()
+                            ? nullptr
+                            : setup_diagnostic.data(),
+                        diagnostic_length, MPI_CHAR, diagnostic_rank,
+                        shared_communicator_),
+              "MPI_Bcast DeePMD setup diagnostic");
+    release_shared_storage();
+    throw std::runtime_error(setup_diagnostic);
+  }
 
   auto *bytes = static_cast<unsigned char *>(root_base);
   shared_atom_types_ =

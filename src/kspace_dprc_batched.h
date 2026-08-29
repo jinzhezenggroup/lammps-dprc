@@ -73,6 +73,7 @@ class PPPMTIP4PDPRCBatched final : public PPPMTIP4PDPRC {
   [[nodiscard]] DPRC::ClassicalTopology build_topology() const;
   [[nodiscard]] std::vector<std::uint8_t> pair_mapping(class Pair *) const;
   void build_stable_atom_order();
+  void refresh_stable_local_indices() const;
   void append_special_pairs(DPRC::ClassicalTopology &) const;
   void validate_fixed_state() const;
   void pack_frame(std::vector<double> &positions,
@@ -87,6 +88,9 @@ class PPPMTIP4PDPRCBatched final : public PPPMTIP4PDPRC {
   std::unique_ptr<DPRC::PartitionRoots> roots_;
   std::unique_ptr<DPRC::ClassicalPartitionBroker> broker_;
   std::vector<tagint> stable_tags_;
+  // Atom sorting can change owned indices at neighbor rebuilds.  This cache is
+  // rebuilt from atom->tag[0:nlocal], never from the ghost-inclusive atom map.
+  mutable std::vector<int> stable_local_indices_;
   std::vector<std::int32_t> stable_atom_types_;
   std::vector<DPRC::SpecialPair> stable_special_pairs_;
   DPRC::RestrictedTriclinicCell stable_cell_{};

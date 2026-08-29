@@ -524,7 +524,7 @@ def render_lammps_input(
     deepmd_plugin: Path | None = None,
     deepmd_models: Sequence[Path] = (),
     model_deviation_frequency: int = 0,
-    lammps_execution_backend: str = "kokkos",
+    lammps_execution_backend: str = "host",
     run_commands: Sequence[str] | None = None,
     execution_directory: Path | None = None,
 ) -> str:
@@ -972,7 +972,7 @@ def validate_execution_policy(
     model_deviation_frequency: int,
     dpa4c_models_qualified: bool,
     allow_unqualified_dpa4c_models: bool,
-    lammps_execution_backend: str = "kokkos",
+    lammps_execution_backend: str = "host",
 ) -> None:
     """Fail closed on ambiguous or scientifically mislabeled DPRc inputs."""
     if mode not in {"qmmm", "qmmm-dpa4c"}:
@@ -1033,7 +1033,7 @@ def execution_record(
     model_deviation_frequency: int,
     dpa4c_models_qualified: bool,
     allow_unqualified_dpa4c_models: bool,
-    lammps_execution_backend: str = "kokkos",
+    lammps_execution_backend: str = "host",
 ) -> dict[str, Any]:
     """Describe the force composition and model-qualification boundary."""
     if lammps_execution_backend not in {"host", "kokkos"}:
@@ -1255,26 +1255,80 @@ def verify_loaded_deepmd_c(
     }
 
 
+def reviewed_dependency_record(
+    repository_root: Path, dependency: dict[str, Any]
+) -> dict[str, Any]:
+    """Record whether one checkout exactly matches its reviewed dependency pin."""
+    repository = (repository_root / dependency["path"]).resolve()
+    record: dict[str, Any] = {
+        "path": str(repository),
+        "required": bool(dependency["required"]),
+        "expected_revision": dependency["revision"],
+        "available": repository.is_dir(),
+        "revision_matches": False,
+        "clean": False,
+        "artifacts_match": False,
+        "publication_qualified": False,
+        "qualification_reasons": [],
+    }
+    if not record["available"]:
+        record["qualification_reasons"].append("checkout is unavailable")
+        return record
+
+    record["revision"] = git_output(repository, "rev-parse", "HEAD")
+    record["revision_matches"] = (
+        record["revision"] == record["expected_revision"]
+    )
+    dirty_output = git_output(
+        repository, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    record["dirty"] = bool(dirty_output)
+    record["clean"] = not record["dirty"]
+    record["dirty_entries"] = dirty_output.splitlines() if dirty_output else []
+
+    artifacts: list[dict[str, Any]] = []
+    artifacts_match = True
+    for expected in dependency.get("artifacts", []):
+        path = repository / expected["path"]
+        item: dict[str, Any] = {
+            "relative_path": expected["path"],
+            "expected_sha256": expected["sha256"],
+            "available": path.is_file(),
+            "matches": False,
+        }
+        if item["available"]:
+            item["sha256"] = sha256(path)
+            item["matches"] = item["sha256"] == item["expected_sha256"]
+        artifacts_match = artifacts_match and item["matches"]
+        artifacts.append(item)
+    record["artifacts"] = artifacts
+    record["artifacts_match"] = artifacts_match
+
+    if not record["revision_matches"]:
+        record["qualification_reasons"].append("revision differs from reviewed pin")
+    if not record["clean"]:
+        record["qualification_reasons"].append("checkout is dirty")
+    if not record["artifacts_match"]:
+        record["qualification_reasons"].append("reviewed artifact bytes differ")
+    record["publication_qualified"] = not record["qualification_reasons"]
+    return record
+
+
 def project_record(manifest_path: Path, output: Path) -> dict[str, Any]:
-    """Identify the dirty development runner that produced diagnostic data."""
+    """Identify the project and every required reviewed dependency checkout."""
     revision = git_output(PROJECT_ROOT, "rev-parse", "HEAD")
     dirty_output = git_output(PROJECT_ROOT, "status", "--porcelain=v1")
     provenance = output / "provenance.json"
-    dependencies = {}
-    for name, repository in (
-        ("lammps", PROJECT_ROOT.parent / "lammps"),
-        ("xtbloom", PROJECT_ROOT.parent / "xtbloom"),
-    ):
-        if repository.is_dir():
-            dependency_dirty = git_output(repository, "status", "--porcelain=v1")
-            dependencies[name] = {
-                "path": str(repository.resolve()),
-                "revision": git_output(repository, "rev-parse", "HEAD"),
-                "dirty": bool(dependency_dirty),
-                "dirty_entries": dependency_dirty.splitlines()
-                if dependency_dirty
-                else [],
-            }
+    dependency_manifest = PROJECT_ROOT / "config/dependencies.json"
+    dependency_payload = json.loads(dependency_manifest.read_text(encoding="utf-8"))
+    dependencies = {
+        dependency["name"]: reviewed_dependency_record(PROJECT_ROOT, dependency)
+        for dependency in dependency_payload["dependencies"]
+        if dependency["required"]
+    }
+    dependencies_qualified = all(
+        record["publication_qualified"] for record in dependencies.values()
+    )
     return {
         "path": str(PROJECT_ROOT),
         "revision": revision,
@@ -1288,12 +1342,20 @@ def project_record(manifest_path: Path, output: Path) -> dict[str, Any]:
             "path": str(manifest_path.resolve()),
             "sha256": sha256(manifest_path),
         },
+        "dependency_manifest": {
+            "path": str(dependency_manifest.resolve()),
+            "sha256": sha256(dependency_manifest),
+        },
         "provenance": {
             "path": str(provenance.resolve()),
             "sha256": sha256(provenance),
         },
         "dependencies": dependencies,
-        "qualification": "private-diagnostic" if dirty_output else "clean-source",
+        "qualification": (
+            "clean-source"
+            if not dirty_output and dependencies_qualified
+            else "private-diagnostic"
+        ),
     }
 
 
@@ -1333,7 +1395,7 @@ def record_is_resumable(
     model_deviation_frequency: int = 0,
     dpa4c_models_qualified: bool = False,
     allow_unqualified_dpa4c_models: bool = False,
-    lammps_execution_backend: str = "kokkos",
+    lammps_execution_backend: str = "host",
 ) -> bool:
     """Accept a checkpoint only when its complete dependency chain matches."""
     if not path.is_file():
@@ -1548,7 +1610,7 @@ def validate_invocation_record_current(
         common.get("allow_unqualified_dpa4c_models", False)
     )
     lammps_execution_backend = str(
-        common.get("lammps_execution_backend", "kokkos")
+        common.get("lammps_execution_backend", "host")
     )
     expected_execution = execution_record(
         mode=mode,
@@ -2100,7 +2162,7 @@ def run_invocation(
     model_deviation_frequency: int = 0,
     dpa4c_models_qualified: bool = False,
     allow_unqualified_dpa4c_models: bool = False,
-    lammps_execution_backend: str = "kokkos",
+    lammps_execution_backend: str = "host",
 ) -> Path:
     """Run one synchronized batch and atomically publish its evidence record."""
     validate_execution_policy(
@@ -2646,7 +2708,7 @@ def run_stage(
         getattr(arguments, "allow_unqualified_dpa4c_models", False)
     )
     lammps_execution_backend = str(
-        getattr(arguments, "lammps_execution_backend", "kokkos")
+        getattr(arguments, "lammps_execution_backend", "host")
     )
     validate_execution_policy(
         mode=mode,
@@ -2976,11 +3038,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--lammps-execution-backend",
         choices=("host", "kokkos"),
-        default="kokkos",
+        default="host",
         help=(
-            "run ordinary LAMMPS work on the host or through Kokkos; the host "
-            "backend avoids one unused Kokkos CUDA context per umbrella window "
-            "while broker-owned xTBloom and DeePMD work remains on the GPU"
+            "run ordinary LAMMPS work on the host (default) or explicitly "
+            "through Kokkos; the host backend avoids one unused Kokkos CUDA "
+            "context per umbrella window while broker-owned xTBloom and DeePMD "
+            "work remains on the GPU"
         ),
     )
     run.add_argument("--ranks-per-window", type=int, default=1)

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "classification": "private-diagnostic-correctness-only",
+  "claim": "The reviewed shared-memory broker transport completed 5000 MD steps in each of 48 synchronized host-LAMMPS umbrella partitions after reproducing the initial Kokkos thermo state within the declared tolerance.",
+  "completed_local": "2026-08-29T23:04:07+08:00",
+  "results": {
+    "window_count": 48,
+    "stress_steps_per_window": 5000,
+    "initial_timestep": 20000,
+    "final_timestep_min": 25000,
+    "final_timestep_max": 25000,
+    "host_kokkos_maximum_thermo_difference": 1.000000082740371e-11,
+    "host_kokkos_tolerance": 0.0001,
+    "wall_seconds_diagnostic_only": 3639,
+    "stderr_bytes": 0
+  },
+  "qualified_artifacts": {
+    "broker_cpp_sha256": "6e3eecadbb832390bbf881e61079687931f7c644a4076a9fde9e799b8b185c22",
+    "broker_header_sha256": "479d49ff05b1ee7836b21f812318e9db2a3d7ebc14b80ca697f1499fba01e4ca",
+    "dprc_plugin_sha256": "be1f3bac485c28b15b861dad9f2ac38aa1e4a903b5b4d64812539265a410be08",
+    "lammps_sha256": "868061d55e25ee089a0a96d5e4a64831361e6e6847d334f2e5bba7d2e5c42702",
+    "dpa4c_model_sha256": "343e4e6fa3220b61304fe915ca81e65be8934b7511870f7d434027cea1ab02fc",
+    "xtbloom_library_sha256": "c19e0376100b283f933da896d09fab26f578367b3460f2e79c70daf03b8efa6c"
+  },
+  "external_raw_evidence": {
+    "location": "private GPU-node diagnostic storage; absolute paths and hostnames intentionally withheld",
+    "stdout_sha256": "35e75ec69bc05aa40160da3b8e12dde1b11bba6e94bb6faae5ba4a71234640d2",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "kokkos_zero_input_sha256": "47baada1799dbd92cf4e474fd66ad7e31e259067c22552196a97a42d10334189",
+    "host_zero_input_sha256": "6c17abc85d5595fa2d60420470174b6472478b695713e96fce291e712b9c1ac3",
+    "host_stress_input_sha256": "4983860674375271b19e70d313766ca345223222bb974f096c58b32246ba5807",
+    "kokkos_zero_log_manifest_sha256": "1150d42b3ee62247945cef283e334d4ed5a7429dfb07401733b8792ee095681c",
+    "host_zero_log_manifest_sha256": "87805727ebe901e8953710645b95b385fb18e512b19ab0df9a1cf362fc2b6257",
+    "host_stress_log_manifest_sha256": "5cad99e5028c81406cc8cd2ef4bda135c543eff8694cd5efe4de4650cbb9139a",
+    "log_manifest_algorithm": "SHA-256 over the UTF-8 concatenation of 48 lines '<rank> <log_sha256>\\n' in numeric rank order"
+  },
+  "limitations": [
+    "This record supports correctness and crash-freedom only; its wall time is not publication performance evidence.",
+    "The active xTBloom checkout and CPU affinity were not publication-qualified.",
+    "The stress binary predates the final MPI_WIN_UNIFIED and collective setup-failure guards; those guards are covered by the current compile and focused growing-graph runtime regression.",
+    "No persistent process-snapshot artifact was retained, so this record does not independently claim a measured CUDA-context count."
+  ]
+}

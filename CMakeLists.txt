@@ -31,7 +31,7 @@ get_filename_component(
 set(LAMMPS_SOURCE_DIR "${_dprc_default_lammps}" CACHE PATH "Path to the pinned LAMMPS src directory")
 set(XTBLOOM_SOURCE_DIR "${_dprc_default_xtbloom}" CACHE PATH "Path to the pinned xTBloom source tree")
 set(DEEPMD_SOURCE_DIR "${_dprc_default_deepmd}" CACHE PATH
-  "Path to the pinned DeePMD-kit checkout that produced the C API library")
+  "Path to the pinned DeePMD-kit checkout declared with the C API artifacts")
 set(XTBLOOM_GENERATED_INCLUDE_DIR "${_dprc_default_xtbloom_generated}" CACHE PATH
   "Path containing the generated xtbloom/version.h for the pinned source tree")
 set(DPRC_XTBLOOM_LIBRARY "" CACHE FILEPATH
@@ -45,6 +45,8 @@ set(DPRC_DEEPMD_INCLUDE_DIR "" CACHE PATH
   "Directory containing deepmd/c_api.h with canonical batch API version 31+")
 set(DPRC_DEEPMD_C_LIBRARY "" CACHE FILEPATH
   "Runtime-provided DeePMD C API shared library linked by dprcplugin")
+set(DPRC_DEEPMD_ARTIFACT_MANIFEST "" CACHE FILEPATH
+  "JSON declaring the DeePMD source revision, C header, and C API library cohort")
 set(DPRC_DEEPMD_MODEL "" CACHE FILEPATH
   "Optional frozen canonical DeePMD model used for DPRc runtime tests")
 set(DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256 "" CACHE STRING
@@ -256,9 +258,14 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
     message(FATAL_ERROR
       "The DeePMD C API integration requires DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256")
   endif()
+  if(NOT DPRC_DEEPMD_ARTIFACT_MANIFEST OR
+     NOT EXISTS "${DPRC_DEEPMD_ARTIFACT_MANIFEST}")
+    message(FATAL_ERROR
+      "The DeePMD C API integration requires DPRC_DEEPMD_ARTIFACT_MANIFEST")
+  endif()
   if(NOT EXISTS "${DEEPMD_SOURCE_DIR}/source/api_c/include/c_api.h")
     message(FATAL_ERROR
-      "DEEPMD_SOURCE_DIR must point to the checkout that produced the C API library")
+      "DEEPMD_SOURCE_DIR must point to the checkout declared in the artifact manifest")
   endif()
   file(READ "${DPRC_DEEPMD_INCLUDE_DIR}/deepmd/c_api.h"
     _dprc_deepmd_c_header LIMIT 4096)
@@ -269,6 +276,21 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
   endif()
   dprc_verify_git_dependency(
     "DeePMD-kit" "${DEEPMD_SOURCE_DIR}/source" "${DPRC_EXPECTED_DEEPMD_REVISION}")
+  # When diagnostic development explicitly allows an unpinned checkout, bind
+  # the declared manifest and runtime-test metadata to the actual revision;
+  # publication configurations continue to use the reviewed cache pin.
+  set(_dprc_deepmd_manifest_revision "${DPRC_EXPECTED_DEEPMD_REVISION}")
+  if(DPRC_ALLOW_UNPINNED_DEPENDENCIES)
+    execute_process(
+      COMMAND git -C "${DEEPMD_SOURCE_DIR}" rev-parse HEAD
+      OUTPUT_VARIABLE _dprc_deepmd_manifest_revision
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _dprc_deepmd_revision_status)
+    if(NOT _dprc_deepmd_revision_status EQUAL 0)
+      message(FATAL_ERROR
+        "Could not determine the DeePMD revision for an unpinned diagnostic build")
+    endif()
+  endif()
   file(REAL_PATH "${DPRC_DEEPMD_C_LIBRARY}" _dprc_deepmd_c_library_realpath)
   file(SHA256 "${_dprc_deepmd_c_library_realpath}"
     _dprc_deepmd_c_library_sha256)
@@ -277,6 +299,41 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
     message(FATAL_ERROR
       "DeePMD C API library SHA-256 ${_dprc_deepmd_c_library_sha256} differs from the expected value")
   endif()
+  file(REAL_PATH "${DPRC_DEEPMD_ARTIFACT_MANIFEST}"
+    _dprc_deepmd_artifact_manifest_realpath)
+  file(SHA256 "${_dprc_deepmd_artifact_manifest_realpath}"
+    _dprc_deepmd_artifact_manifest_sha256)
+  set(_dprc_deepmd_manifest_arguments
+    verify
+    --source "${DEEPMD_SOURCE_DIR}"
+    --include-dir "${DPRC_DEEPMD_INCLUDE_DIR}"
+    --library "${_dprc_deepmd_c_library_realpath}"
+    --manifest "${_dprc_deepmd_artifact_manifest_realpath}"
+    --expected-revision "${_dprc_deepmd_manifest_revision}"
+    --expected-library-sha256 "${DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256}")
+  if(NOT DPRC_REQUIRE_CLEAN_DEPENDENCIES)
+    list(APPEND _dprc_deepmd_manifest_arguments --allow-dirty-source)
+  endif()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/deepmd_artifact_manifest.py"
+      ${_dprc_deepmd_manifest_arguments}
+    RESULT_VARIABLE _dprc_deepmd_manifest_status
+    OUTPUT_VARIABLE _dprc_deepmd_manifest_output
+    ERROR_VARIABLE _dprc_deepmd_manifest_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE)
+  if(NOT _dprc_deepmd_manifest_status EQUAL 0)
+    message(FATAL_ERROR
+      "DeePMD declared artifact-manifest verification failed: "
+      "${_dprc_deepmd_manifest_output}${_dprc_deepmd_manifest_error}")
+  endif()
+  set(DPRC_DEEPMD_ARTIFACT_MANIFEST_REALPATH
+    "${_dprc_deepmd_artifact_manifest_realpath}" CACHE INTERNAL
+    "Resolved DeePMD artifact manifest")
+  set(DPRC_DEEPMD_ARTIFACT_MANIFEST_SHA256
+    "${_dprc_deepmd_artifact_manifest_sha256}" CACHE INTERNAL
+    "SHA-256 of the DeePMD artifact manifest")
   find_package(CUDAToolkit REQUIRED)
   add_library(dprc_deepmd_c SHARED IMPORTED GLOBAL)
   set_target_properties(dprc_deepmd_c PROPERTIES
@@ -285,7 +342,8 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
   set(_dprc_deepmd_enabled ON)
   message(STATUS
     "DeePMD C API runtime: ${_dprc_deepmd_c_library_realpath} "
-    "(SHA-256 ${_dprc_deepmd_c_library_sha256})")
+    "(SHA-256 ${_dprc_deepmd_c_library_sha256}; declared artifact manifest "
+    "${_dprc_deepmd_artifact_manifest_sha256})")
 
   if(DPRC_DEEPMD_MODEL)
     if(NOT DPRC_LAMMPS_EXECUTABLE OR NOT DPRC_BUILD_TESTING)
@@ -686,6 +744,12 @@ if(DPRC_BUILD_TESTING)
   target_link_libraries(stable_batch_test PRIVATE dprc_batch_core)
   add_test(NAME dprc.stable_batch COMMAND stable_batch_test)
 
+  add_executable(stable_local_indices_test
+    tests/stable_local_indices_test.cpp)
+  target_include_directories(stable_local_indices_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_test(NAME dprc.stable_local_indices COMMAND stable_local_indices_test)
+
   add_executable(classical_batch_test tests/classical_batch_test.cpp)
   target_link_libraries(classical_batch_test PRIVATE dprc_classical_batch)
   if(DPRC_ENABLE_CLASSICAL_CUDA)
@@ -763,6 +827,9 @@ if(DPRC_BUILD_TESTING)
   add_test(NAME benchmark.etpeth_matrix
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/test_run.py")
+  add_test(NAME dependencies.deepmd_artifact_manifest
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/deepmd_artifact_manifest_test.py")
   add_test(NAME workload.etpeth_pmf
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/etpeth_pmf_test.py")
@@ -852,19 +919,7 @@ if(DPRC_BUILD_TESTING)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_info_output.cmake")
     set_tests_properties(lammps.plugin.output PROPERTIES DEPENDS lammps.plugin.load)
 
-    if(_dprc_deepmd_runtime_test_enabled AND
-       DPRC_ENABLE_KOKKOS_RUNTIME_TESTS)
-      add_test(NAME lammps.deepmd_c_api.center_mask
-        COMMAND "${Python3_EXECUTABLE}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_center_mask.py"
-          --lammps "${DPRC_LAMMPS_EXECUTABLE}"
-          --dprc-plugin $<TARGET_FILE:dprcplugin>
-          --model "${_dprc_deepmd_model_realpath}"
-          --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
-          --evidence
-            "${CMAKE_CURRENT_BINARY_DIR}/deepmd-center-mask-evidence.json")
-      set_tests_properties(lammps.deepmd_c_api.center_mask PROPERTIES
-        TIMEOUT 180 LABELS "cuda;gpu;kokkos;deepmd")
+    if(_dprc_deepmd_runtime_test_enabled)
       if(DPRC_XTBLOOM_LIBRARY)
         add_test(NAME lammps.deepmd_c_api.qmmm_overlay
           COMMAND "${Python3_EXECUTABLE}"
@@ -872,7 +927,7 @@ if(DPRC_BUILD_TESTING)
             --lammps "${DPRC_LAMMPS_EXECUTABLE}"
             --dprc-plugin $<TARGET_FILE:dprcplugin>
             --model "${_dprc_deepmd_model_realpath}"
-            --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
+            --deepmd-revision "${_dprc_deepmd_manifest_revision}"
             --evidence
               "${CMAKE_CURRENT_BINARY_DIR}/deepmd-overlay-evidence.json")
         set_tests_properties(lammps.deepmd_c_api.qmmm_overlay PROPERTIES
@@ -886,11 +941,24 @@ if(DPRC_BUILD_TESTING)
             --mpiexec "${MPIEXEC_EXECUTABLE}"
             --dprc-plugin $<TARGET_FILE:dprcplugin>
             --model "${_dprc_deepmd_model_realpath}"
-            --deepmd-revision "${DPRC_EXPECTED_DEEPMD_REVISION}"
+            --deepmd-revision "${_dprc_deepmd_manifest_revision}"
             --evidence
               "${CMAKE_CURRENT_BINARY_DIR}/deepmd-partition-batch-evidence.json")
         set_tests_properties(lammps.deepmd_c_api.partition_batch PROPERTIES
           TIMEOUT 240 LABELS "cuda;gpu;mpi;deepmd")
+      endif()
+      if(DPRC_ENABLE_KOKKOS_RUNTIME_TESTS)
+        add_test(NAME lammps.deepmd_c_api.center_mask
+          COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_lammps_deepmd_center_mask.py"
+            --lammps "${DPRC_LAMMPS_EXECUTABLE}"
+            --dprc-plugin $<TARGET_FILE:dprcplugin>
+            --model "${_dprc_deepmd_model_realpath}"
+            --deepmd-revision "${_dprc_deepmd_manifest_revision}"
+            --evidence
+              "${CMAKE_CURRENT_BINARY_DIR}/deepmd-center-mask-evidence.json")
+        set_tests_properties(lammps.deepmd_c_api.center_mask PROPERTIES
+          TIMEOUT 180 LABELS "cuda;gpu;kokkos;deepmd")
       endif()
     endif()
 

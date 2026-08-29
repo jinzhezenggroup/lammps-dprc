@@ -27,7 +27,7 @@ python3 tools/etpeth_workload.py verify \
 
 python3 tools/etpeth_workload.py prepare \
   --tutorial ../dprc-tutorial \
-  --output ../lammps-dprc-runs/etpeth \
+  --output /path/to/etpeth-run \
   --allow-unqualified-source
 ```
 
@@ -37,13 +37,14 @@ bytes, run the five-step end-to-end smoke:
 ```bash
 python3 tools/etpeth_workload.py run \
   --tutorial ../dprc-tutorial \
-  --output ../lammps-dprc-runs/etpeth \
+  --output /path/to/etpeth-run \
   --allow-unqualified-source \
   --lammps ../lammps/build-dprc-gpu-cuda/lmp \
   --plugin build/cuda-integration/dprcplugin.so \
   --xtbloom-library ../xtbloom/build/lammps-dprc-cuda/libxtbloom.so \
   --library-dir /path/to/cuda/lib64 \
   --mode qmmm \
+  --lammps-execution-backend host \
   --stage smoke
 ```
 
@@ -62,12 +63,13 @@ PBE0-minus-xTBloom correction; this repository does not ship one:
 ```bash
 python3 tools/etpeth_workload.py run \
   --tutorial ../dprc-tutorial \
-  --output ../lammps-dprc-runs/etpeth-dpa4c \
-  --lammps /path/to/kokkos/lmp \
+  --output /path/to/etpeth-dpa4c-run \
+  --lammps /path/to/lmp \
   --plugin /path/to/dprcplugin.so \
   --xtbloom-library /path/to/libxtbloom.so \
   --deepmd-model /path/to/qualified-dpa4c.pt2 \
   --mode qmmm-dpa4c \
+  --lammps-execution-backend host \
   --dpa4c-models-qualified \
   --library-dir /path/to/deepmd/lib \
   --library-dir /path/to/cuda/lib64 \
@@ -83,10 +85,12 @@ If the model itself is an unqualified software fixture, replace
 records this choice and refuses to start without one explicit model-status
 boundary.
 
-The single-model path emits `dprc/deepmd/batch/kk`, compact `center_group qm`
-input, and `partition_batch yes`, so one GPU-local DeePMD owner evaluates the
-synchronized windows as one block-diagonal batch. Model deviation is currently
-rejected by the in-plugin path.
+The default host path emits `dprc/deepmd/batch`, compact group-only input, and
+`partition_batch yes`, so one GPU-local DeePMD owner evaluates the synchronized
+windows as one block-diagonal batch without creating an unused Kokkos CUDA
+context in every partition. Use `--lammps-execution-backend kokkos` only for a
+separately qualified Kokkos run. Model deviation is currently rejected by the
+in-plugin path.
 
 The scientific stages are resumable and deliberately separate:
 
@@ -141,8 +145,8 @@ PMF with the separately hash-pinned analysis contract:
 
 ```bash
 python3 tools/analyze_etpeth_pmf.py \
-  --run ../lammps-dprc-runs/etpeth \
-  --output-prefix ../lammps-dprc-runs/etpeth/analysis/no-dprc-pmf
+  --run /path/to/etpeth-run \
+  --output-prefix /path/to/etpeth-run/analysis/no-dprc-pmf
 ```
 
 The analyzer first validates the equilibration chunk DAG, then requires every

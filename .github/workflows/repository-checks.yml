@@ -1,0 +1,50 @@
+name: Repository checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-and-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up the pinned Python runtime
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12.7'
+
+      - name: Install the pinned repository-test dependency
+        run: python -m pip install numpy==2.1.3
+
+      - name: Compile Python sources
+        run: python -m compileall -q benchmarks tests tools
+
+      - name: Run repository-only tests
+        run: |
+          python tests/check_dependency_pins_test.py
+          python tests/fused_source_generator_test.py
+          python tests/check_license_payload.py --source-root .
+          python tests/etpeth_workload_test.py
+          python benchmarks/test_run.py
+          python tests/deepmd_artifact_manifest_test.py
+          python tests/etpeth_pmf_test.py
+          python tests/dprc_labels_test.py
+          python tests/quick_pbe0_qualification_test.py
+          python tests/dprc_binary64_io_test.py
+          python tests/dprc_correction_io_test.py
+          python tests/lammps_xtb_oracle_compare_test.py
+          python tests/deepmd_overlay_input_test.py
+          python tests/deepmd_center_mask_input_test.py
+          python tests/unqualified_dpa4c_generator_test.py

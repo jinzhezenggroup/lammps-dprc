@@ -9,7 +9,7 @@ window, never the sum or a favorable individual partition.
 
 Missing runtimes and models remain explicit ``unavailable`` rows.  A timing is
 scientifically eligible only when source cleanliness and an external
-correctness ledger cover the exact mode and batch size.
+correctness ledger cover the exact mode, batch size, and runtime identity.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ CLASSICAL_BACKENDS = ("batched-dprc", "upstream-gpu")
 LOOP_TIME = re.compile(
     r"Loop time of\s+([0-9.eE+-]+)\s+on\s+\d+\s+procs?\s+for\s+(\d+)\s+steps"
 )
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def load_workload_module() -> Any:
@@ -93,6 +94,138 @@ def artifact(path: Path) -> dict[str, Any]:
         "bytes": resolved.stat().st_size,
         "sha256": WORKLOAD.sha256(resolved),
     }
+
+
+def deepmd_dependency_record(
+    arguments: argparse.Namespace, loaded_deepmd_c: dict[str, str]
+) -> dict[str, Any]:
+    """Qualify the declared DeePMD cohort against source and loaded bytes."""
+    assert arguments.deepmd_artifact_manifest is not None
+    assert arguments.deepmd_source is not None
+    assert arguments.deepmd_include_dir is not None
+    manifest_path = arguments.deepmd_artifact_manifest.resolve()
+    reasons: list[str] = []
+    verifier = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools/deepmd_artifact_manifest.py"),
+            "verify",
+            "--source",
+            str(arguments.deepmd_source.resolve()),
+            "--include-dir",
+            str(arguments.deepmd_include_dir.resolve()),
+            "--library",
+            str(Path(loaded_deepmd_c["resolved_path"]).resolve()),
+            "--manifest",
+            str(manifest_path),
+            "--expected-revision",
+            arguments.expected_deepmd_revision,
+            "--expected-library-sha256",
+            loaded_deepmd_c["sha256"],
+        ],
+        check=False,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        payload = json.loads(verifier.stdout)
+    except (OSError, json.JSONDecodeError) as error:
+        payload = {}
+        reasons.append(f"artifact-manifest verifier returned invalid output: {error}")
+    if verifier.returncode != 0:
+        diagnostic = verifier.stdout.strip().splitlines()
+        reasons.append(
+            "artifact-manifest verification failed"
+            + (f": {diagnostic[-1]}" if diagnostic else "")
+        )
+
+    required_digests = (
+        "source_state_sha256",
+        "source_c_api_header_sha256",
+        "installed_c_api_header_sha256",
+        "c_api_library_sha256",
+    )
+    if payload.get("schema_version") != 1:
+        reasons.append("artifact manifest schema_version is not 1")
+    if payload.get("source_revision") != arguments.expected_deepmd_revision:
+        reasons.append("source revision differs from the reviewed DeePMD pin")
+    if payload.get("source_clean") is not True:
+        reasons.append("declared DeePMD source checkout is not clean")
+    if not isinstance(payload.get("c_api_version"), int) or payload.get(
+        "c_api_version", 0
+    ) < 31:
+        reasons.append("declared DeePMD C API version is older than 31")
+    for name in required_digests:
+        value = payload.get(name)
+        if not isinstance(value, str) or SHA256_HEX.fullmatch(value) is None:
+            reasons.append(f"artifact manifest has invalid {name}")
+    if (
+        payload.get("source_c_api_header_sha256")
+        != payload.get("installed_c_api_header_sha256")
+    ):
+        reasons.append("installed C API header differs from declared source header")
+    if payload.get("c_api_library_sha256") != loaded_deepmd_c.get("sha256"):
+        reasons.append("loaded DeePMD C API library differs from the declared cohort")
+
+    return {
+        "manifest": artifact(manifest_path),
+        "expected_source_revision": arguments.expected_deepmd_revision,
+        "declared": payload,
+        "loaded_library": {
+            "soname": loaded_deepmd_c.get("soname"),
+            "sha256": loaded_deepmd_c.get("sha256"),
+        },
+        "publication_qualified": not reasons,
+        "qualification_reasons": reasons,
+    }
+
+
+def publication_eligibility_reasons(
+    *,
+    mode: str,
+    source: dict[str, Any],
+    project: dict[str, Any],
+    deepmd_dependency: dict[str, Any] | None,
+    dpa4c_models_qualified: bool,
+    dangerous_builds: dict[str, int],
+    correctness_reasons: Sequence[str],
+) -> list[str]:
+    """Return every reason a successful timing cannot support publication."""
+    reasons = list(correctness_reasons)
+    if source.get("qualification") != "final":
+        reasons.append(
+            f"tutorial source qualification is {source.get('qualification')}"
+        )
+    if project.get("dirty"):
+        reasons.append("LAMMPS-DPRc source tree is dirty")
+    for name, record in project.get("dependencies", {}).items():
+        if record.get("required") and not record.get("publication_qualified"):
+            detail = ", ".join(record.get("qualification_reasons", []))
+            reasons.append(
+                f"required dependency {name} is not publication-qualified"
+                + (f": {detail}" if detail else "")
+            )
+    if mode == "qmmm-dpa4c":
+        if deepmd_dependency is None:
+            reasons.append("DeePMD artifact qualification is unavailable")
+        elif not deepmd_dependency.get("publication_qualified"):
+            detail = ", ".join(
+                deepmd_dependency.get("qualification_reasons", [])
+            )
+            reasons.append(
+                "DeePMD artifact cohort is not publication-qualified"
+                + (f": {detail}" if detail else "")
+            )
+        if not dpa4c_models_qualified:
+            reasons.append(
+                "DPA4c artifacts were admitted only for an unqualified performance "
+                "diagnostic and are not xTB-based DPRc evidence"
+            )
+    if any(value != 0 for value in dangerous_builds.values()):
+        reasons.append("dangerous neighbor builds were reported")
+    return reasons
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -206,8 +339,9 @@ def correctness_record(
     batch_size: int,
     required_checks: Sequence[str],
     evidence_by_mode: dict[str, Path],
+    runtime_identity: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Require an external ledger that covers every declared correctness gate."""
+    """Require correctness evidence for this exact runtime execution path."""
     path = evidence_by_mode.get(mode)
     if path is None:
         return {"status": "unqualified"}, ["correctness evidence was not supplied"]
@@ -218,12 +352,14 @@ def correctness_record(
     payload = json.loads(path.read_text(encoding="utf-8"))
     checks = payload.get("checks", {})
     reasons: list[str] = []
-    if payload.get("schema_version") != 1:
-        reasons.append("correctness evidence schema is not 1")
+    if payload.get("schema_version") != 2:
+        reasons.append("correctness evidence schema is not 2")
     if payload.get("status") != "passed" or payload.get("mode") != mode:
         reasons.append("correctness evidence status or mode does not match")
     if batch_size not in payload.get("batch_sizes", []):
         reasons.append("correctness evidence does not cover this batch size")
+    if payload.get("runtime_identity") != runtime_identity:
+        reasons.append("correctness evidence runtime identity does not match")
     missing = [name for name in required_checks if checks.get(name) is not True]
     if missing:
         reasons.append("correctness checks are incomplete: " + ", ".join(missing))
@@ -250,6 +386,20 @@ def availability_reasons(
         if arguments.xtbloom_library is None or not arguments.xtbloom_library.is_file():
             reasons.append("xTBloom library is unavailable")
     if mode == "qmmm-dpa4c":
+        if (
+            arguments.deepmd_artifact_manifest is None
+            or not arguments.deepmd_artifact_manifest.is_file()
+        ):
+            reasons.append("DeePMD artifact manifest is unavailable")
+        if arguments.deepmd_source is None or not arguments.deepmd_source.is_dir():
+            reasons.append("DeePMD source checkout is unavailable")
+        if (
+            arguments.deepmd_include_dir is None
+            or not (arguments.deepmd_include_dir / "deepmd/c_api.h").is_file()
+        ):
+            reasons.append("DeePMD C API include directory is unavailable")
+        if not arguments.expected_deepmd_revision:
+            reasons.append("reviewed DeePMD source revision is unspecified")
         if arguments.model_deviation_frequency != 0:
             reasons.append(
                 "the in-plugin DeePMD C API path requires model deviation to be disabled"
@@ -331,17 +481,41 @@ def selected_windows(
     return list(windows[first : first + batch_size])
 
 
+def coordinate_execution_backend(
+    mode: str, arguments: argparse.Namespace
+) -> str:
+    """Return the LAMMPS backend that actually executes one coordinate."""
+    uses_batched_classical = (
+        mode != "classical" or arguments.classical_backend == "batched-dprc"
+    )
+    return (
+        arguments.lammps_execution_backend if uses_batched_classical else "host"
+    )
+
+
 def coordinate_identity(
     mode: str, batch_size: int, arguments: argparse.Namespace
 ) -> dict[str, Any]:
     """Record every binary or model whose bytes determine one row."""
-    inputs: dict[str, Any] = {"lammps": artifact(arguments.lammps)}
-    uses_dprc_plugin = mode != "classical" or arguments.classical_backend == "batched-dprc"
+    uses_batched_classical = (
+        mode != "classical" or arguments.classical_backend == "batched-dprc"
+    )
+    execution_backend = coordinate_execution_backend(mode, arguments)
+    inputs: dict[str, Any] = {
+        "lammps": artifact(arguments.lammps),
+        "lammps_execution_backend": execution_backend,
+    }
+    uses_dprc_plugin = uses_batched_classical
     if uses_dprc_plugin:
         assert arguments.plugin is not None and arguments.xtbloom_library is not None
         inputs["plugin"] = artifact(arguments.plugin)
         inputs["xtbloom"] = artifact(arguments.xtbloom_library)
     if mode == "qmmm-dpa4c":
+        assert arguments.deepmd_artifact_manifest is not None
+        inputs["deepmd_artifact_manifest"] = artifact(
+            arguments.deepmd_artifact_manifest
+        )
+        inputs["expected_deepmd_revision"] = arguments.expected_deepmd_revision
         inputs["models"] = [artifact(path) for path in arguments.deepmd_model]
         inputs["dprc_schedule"] = {
             "primary_model_index": 0,
@@ -355,6 +529,93 @@ def coordinate_identity(
     if mode == "classical":
         inputs["classical_backend"] = arguments.classical_backend
     return inputs
+
+
+def scientific_execution_contract(
+    *,
+    arguments: argparse.Namespace,
+    manifest: dict[str, Any],
+    matrix: dict[str, Any],
+    source: dict[str, Any],
+    execution_backend: str,
+    warmup_steps: int,
+    sample_steps: int,
+    repetitions: int,
+) -> dict[str, Any]:
+    """Bind correctness to the scientific inputs and launch protocol.
+
+    The contract is intentionally independent of the individual batch size so
+    one ledger can qualify several explicitly listed batch sizes. The batch
+    membership is deterministic from the manifest and benchmark-runner bytes.
+    Local staging paths are excluded; content hashes and numerical parameters
+    are retained.
+    """
+    tutorial_artifacts = sorted(
+        (
+            {
+                "relative_path": str(item["relative_path"]),
+                "sha256": str(item["sha256"]),
+            }
+            for item in source["artifacts"]
+        ),
+        key=lambda item: item["relative_path"],
+    )
+    return {
+        "workload_manifest": artifact(arguments.manifest),
+        # Keep the parsed payload as well as its byte hash so the QM region,
+        # PME mesh, cutoffs, timestep, thermostat, and umbrella protocol are
+        # directly auditable from a correctness ledger.
+        "scientific_parameters": manifest,
+        "tutorial_source": {
+            "revision": source["revision"],
+            "artifacts": tutorial_artifacts,
+        },
+        "input_protocol": {
+            "workload_renderer": artifact(ROOT / "tools/etpeth_workload.py"),
+            "benchmark_runner": artifact(Path(__file__)),
+            "benchmark_matrix": artifact(arguments.matrix),
+            "window_selection": "contiguous-centered-on-manifest-anchor",
+            "warmup_steps_per_window": warmup_steps,
+            "sample_steps_per_window": sample_steps,
+            "repetitions": repetitions,
+            "trajectory_frequency_steps": 0,
+        },
+        "launch_policy": {
+            "mpi_launcher": artifact(arguments.mpiexec),
+            "mpi_arguments": list(arguments.mpi_arg),
+            "worlds": "one-per-selected-umbrella-window",
+            "ranks_per_window": 1,
+            "lammps_arguments": list(
+                WORKLOAD.lammps_backend_arguments(execution_backend)
+            ),
+        },
+    }
+
+
+def correctness_runtime_identity(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Remove relocatable paths and batch size from a coordinate identity.
+
+    A correctness ledger can cover several batch sizes, but it must still bind
+    the exact executable, plugin, libraries, models, scientific inputs,
+    backend, and launch policy used for timing. Artifact byte counts and local
+    paths are not part of that identity because identical reviewed files may be
+    staged elsewhere.
+    """
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            if "sha256" in value and {"path", "bytes", "sha256"}.issubset(value):
+                return {"sha256": value["sha256"]}
+            return {
+                key: normalize(item)
+                for key, item in value.items()
+                if key != "batch_size"
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    return normalize(inputs)
 
 
 def run_coordinate(
@@ -375,7 +636,14 @@ def run_coordinate(
     warmup_steps = int(arguments.warmup_steps or measurement["warmup_steps"])
     sample_steps = int(arguments.sample_steps or measurement["sample_steps"])
     repetitions = int(arguments.repetitions or measurement["repetitions"])
-    coordinate = output / "coordinates" / mode / f"batch-{batch_size}"
+    execution_backend = coordinate_execution_backend(mode, arguments)
+    coordinate = (
+        output
+        / "coordinates"
+        / execution_backend
+        / mode
+        / f"batch-{batch_size}"
+    )
     log_directory = coordinate / "logs"
     log_directory.mkdir(parents=True, exist_ok=True)
     input_path = coordinate / "input.lammps"
@@ -405,6 +673,7 @@ def run_coordinate(
             trajectory_frequency=0,
             mode=mode,
             classical_backend=arguments.classical_backend,
+            lammps_execution_backend=execution_backend,
             # DeePMD model inputs belong only to the DPRc coordinate. Passing
             # them to other modes would violate the renderer's fail-closed
             # boundary.
@@ -423,10 +692,6 @@ def run_coordinate(
     )
 
     mpi_launcher = arguments.mpiexec.resolve()
-    uses_batched_classical = (
-        mode != "classical" or arguments.classical_backend == "batched-dprc"
-    )
-    kokkos_device = uses_batched_classical
     command = WORKLOAD.build_lammps_command(
         lammps=arguments.lammps,
         mpi_launcher=mpi_launcher,
@@ -435,27 +700,7 @@ def run_coordinate(
         ranks_per_window=1,
         log_directory=log_directory,
         input_path=input_path,
-        # Batched modes explicitly name the full Kokkos style chain in their
-        # input.  Kokkos must nevertheless be initialized before read_data
-        # creates the atom container.  GPU Kokkos defaults to a full neighbor
-        # list with Newton off, whereas the shared classical broker requires
-        # one-owner half-list accumulation, so the launcher pins the compatible
-        # pair. The in-plugin DeePMD C API adapter shares this launch shape.
-        lammps_args=(
-            (
-                "-k",
-                "on",
-                "g",
-                "1",
-                "-pk",
-                "kokkos",
-                "newton",
-                "on",
-                "neigh",
-                "half",
-            )
-            if kokkos_device else ()
-        ),
+        lammps_args=WORKLOAD.lammps_backend_arguments(execution_backend),
     )
     environment, selected_environment = runtime_environment(mode, arguments)
     loaded_xtbloom = None
@@ -486,10 +731,35 @@ def run_coordinate(
             cwd=coordinate,
         )
     process_wall_seconds = time.monotonic() - started
+    inputs = coordinate_identity(mode, batch_size, arguments)
+    inputs["scientific_execution_contract"] = scientific_execution_contract(
+        arguments=arguments,
+        manifest=manifest,
+        matrix=matrix,
+        source=source,
+        execution_backend=execution_backend,
+        warmup_steps=warmup_steps,
+        sample_steps=sample_steps,
+        repetitions=repetitions,
+    )
+    if mode == "qmmm-dpa4c":
+        # Unlike xTBloom, the CLI does not name an expected DeePMD library.
+        # Bind correctness to the exact runtime selected by the dynamic loader
+        # so a different libdeepmd_c cannot reuse an older qualification.
+        assert loaded_deepmd_c is not None
+        inputs["loaded_deepmd_c"] = {
+            "soname": loaded_deepmd_c["soname"],
+            "sha256": loaded_deepmd_c["sha256"],
+        }
+        deepmd_dependency = deepmd_dependency_record(arguments, loaded_deepmd_c)
+        inputs["deepmd_dependency"] = deepmd_dependency
+    else:
+        deepmd_dependency = None
     base: dict[str, Any] = {
         "schema_version": 1,
         "mode": mode,
         "batch_size": batch_size,
+        "lammps_execution_backend": execution_backend,
         "classical_backend": (
             arguments.classical_backend if mode == "classical" else None
         ),
@@ -499,11 +769,12 @@ def run_coordinate(
         "process_wall_seconds_including_setup": process_wall_seconds,
         "command": command,
         "selected_environment": selected_environment,
-        "inputs": coordinate_identity(mode, batch_size, arguments),
+        "inputs": inputs,
         "generated_input": artifact(input_path),
         "launcher_log": artifact(launcher_log),
         "loaded_xtbloom": loaded_xtbloom,
         "loaded_deepmd_c": loaded_deepmd_c,
+        "deepmd_dependency": deepmd_dependency,
         "project": project,
         "source_qualification": source["qualification"],
         "window_order": [item.window.tag for item in run_windows],
@@ -550,34 +821,22 @@ def run_coordinate(
         base["error"] = "missing final outputs: " + ", ".join(missing_outputs)
         return base
 
-    correctness, eligibility_reasons = correctness_record(
+    correctness, correctness_reasons = correctness_record(
         mode,
         batch_size,
         matrix["required_correctness"],
         correctness_by_mode,
+        correctness_runtime_identity(inputs),
     )
-    if source["qualification"] != "clean-source":
-        eligibility_reasons.append(
-            f"tutorial source qualification is {source['qualification']}"
-        )
-    if project.get("dirty"):
-        eligibility_reasons.append("LAMMPS-DPRc source tree is dirty")
-    dirty_dependencies = [
-        name
-        for name, record in project.get("dependencies", {}).items()
-        if record.get("dirty")
-    ]
-    if dirty_dependencies:
-        eligibility_reasons.append(
-            "dirty dependencies: " + ", ".join(sorted(dirty_dependencies))
-        )
-    if mode == "qmmm-dpa4c" and not arguments.dpa4c_models_qualified:
-        eligibility_reasons.append(
-            "DPA4c artifacts were admitted only for an unqualified performance "
-            "diagnostic and are not xTB-based DPRc evidence"
-        )
-    if any(value != 0 for value in dangerous.values()):
-        eligibility_reasons.append("dangerous neighbor builds were reported")
+    eligibility_reasons = publication_eligibility_reasons(
+        mode=mode,
+        source=source,
+        project=project,
+        deepmd_dependency=deepmd_dependency,
+        dpa4c_models_qualified=arguments.dpa4c_models_qualified,
+        dangerous_builds=dangerous,
+        correctness_reasons=correctness_reasons,
+    )
 
     base.update(
         {
@@ -668,6 +927,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xtbloom-library", type=Path)
     parser.add_argument("--deepmd-model", type=Path, action="append", default=[])
     parser.add_argument(
+        "--deepmd-artifact-manifest",
+        type=Path,
+        help=(
+            "declared source/header/library cohort for the loaded DeePMD C API"
+        ),
+    )
+    parser.add_argument(
+        "--deepmd-source",
+        type=Path,
+        help="DeePMD-kit checkout used to verify the declared artifact cohort",
+    )
+    parser.add_argument(
+        "--deepmd-include-dir",
+        type=Path,
+        help="include directory containing the loaded DeePMD C API header",
+    )
+    parser.add_argument(
+        "--expected-deepmd-revision",
+        help="reviewed DeePMD C API source revision required for evidence",
+    )
+    parser.add_argument(
         "--model-deviation-frequency",
         type=int,
         default=0,
@@ -704,6 +984,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mpi-arg", action="append", default=[])
     parser.add_argument("--library-dir", type=Path, action="append", default=[])
     parser.add_argument("--cuda-visible-devices", default="0")
+    parser.add_argument(
+        "--lammps-execution-backend",
+        choices=("host", "kokkos"),
+        default="host",
+        help=(
+            "run ordinary batched LAMMPS work on the host (default) or "
+            "explicitly through Kokkos; broker-owned GPU work is unchanged"
+        ),
+    )
     parser.add_argument("--mode", choices=MODES, action="append")
     parser.add_argument(
         "--classical-backend",
@@ -807,6 +1096,9 @@ def main() -> int:
                                 "schema_version": 1,
                                 "mode": mode,
                                 "batch_size": batch_size,
+                                "lammps_execution_backend": (
+                                    coordinate_execution_backend(mode, arguments)
+                                ),
                                 "status": "unavailable",
                                 "reason": "coordinate was not selected for this invocation",
                             }
@@ -821,6 +1113,9 @@ def main() -> int:
                             "schema_version": 1,
                             "mode": mode,
                             "batch_size": batch_size,
+                            "lammps_execution_backend": (
+                                coordinate_execution_backend(mode, arguments)
+                            ),
                             "status": "unavailable",
                             "reasons": reasons,
                         }
@@ -845,6 +1140,9 @@ def main() -> int:
                             "claim": matrix["claim"],
                             "matrix": artifact(arguments.matrix),
                             "manifest": artifact(arguments.manifest),
+                            "requested_lammps_execution_backend": (
+                                arguments.lammps_execution_backend
+                            ),
                             "source": source,
                             "project": project,
                             "environment": artifact(output / "environment.json"),

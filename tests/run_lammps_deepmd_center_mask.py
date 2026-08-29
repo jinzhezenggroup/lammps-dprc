@@ -159,7 +159,9 @@ def parse_energy(path: Path) -> float:
     return value
 
 
-def parse_atoms(path: Path) -> dict[int, dict[str, float | int]]:
+def parse_atoms(
+    path: Path, atom_count: int = ATOM_COUNT
+) -> dict[int, dict[str, float | int]]:
     """Parse one sorted ``write_dump`` frame with atomic energy and force."""
     lines = path.read_text(encoding="utf-8").splitlines()
     try:
@@ -174,7 +176,7 @@ def parse_atoms(path: Path) -> dict[int, dict[str, float | int]]:
         raise ValueError(f"unexpected atom dump fields: {fields}")
 
     atoms: dict[int, dict[str, float | int]] = {}
-    for line in lines[header_index + 1 : header_index + 1 + ATOM_COUNT]:
+    for line in lines[header_index + 1 : header_index + 1 + atom_count]:
         tokens = line.split()
         if len(tokens) != len(expected_fields):
             raise ValueError(f"invalid atom dump row: {line!r}")
@@ -189,7 +191,7 @@ def parse_atoms(path: Path) -> dict[int, dict[str, float | int]]:
             "fy": values[2],
             "fz": values[3],
         }
-    if atoms.keys() != set(range(1, ATOM_COUNT + 1)):
+    if atoms.keys() != set(range(1, atom_count + 1)):
         raise ValueError(f"unexpected atom IDs: {sorted(atoms)}")
     return atoms
 

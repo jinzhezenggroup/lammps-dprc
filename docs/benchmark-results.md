@@ -8,7 +8,7 @@ artifact rather than a real PBE0-minus-xTB DPRc model.
 
 The QM/MM+DPA4c rows used the earlier separately loaded DeePMD adapter. They
 are historical diagnostics and must not be presented as measurements of the
-current `dprc/deepmd/batch/kk` C API implementation. A fresh three-mode matrix
+current `dprc/deepmd/batch` C API implementation. A fresh three-mode matrix
 is required after the C API dependency and production model are published.
 
 ## Measurement contract

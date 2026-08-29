@@ -28,6 +28,11 @@ python3 benchmarks/run.py \
 
 For execution, additionally provide the exact `--plugin`,
 `--xtbloom-library`, CUDA/DeePMD `--library-dir` values, and one model artifact.
+The DPA4c coordinate also requires `--deepmd-artifact-manifest`,
+`--deepmd-source`, `--deepmd-include-dir`, and
+`--expected-deepmd-revision`; the runner invokes the repository's verifier to
+check the source checkout, declared manifest, public header, expected pin, and
+loaded-library digest as one cohort.
 The production `qmmm-dpa4c` curve evaluates one primary model every timestep
 through `dprcplugin.so` (`--model-deviation-frequency 0`). The runner rejects
 positive model-deviation frequencies and multiple models until an in-plugin
@@ -41,15 +46,28 @@ unqualified artifacts for diagnostic timing only.  The runner records the
 model hash and schedule but makes every resulting row evidence-ineligible;
 the diagnostic switch and the qualification assertion are mutually exclusive.
 
-The production path is rendered explicitly as `atom_style full/kk`,
-`run_style verlet/kk`, `dprc/deepmd/batch/kk`, and the available Kokkos bonded,
-SHAKE, integration, thermostat, momentum, and Colvars variants. The launcher
-initializes Kokkos with one GPU plus `newton on neigh half`; the latter pair is
-required by the shared batched classical broker instead of Kokkos GPU's
-full-list, Newton-off defaults. Evidence records
+The production benchmark defaults to ordinary host LAMMPS styles while the
+classical, xTBloom, and DeePMD brokers retain their single GPU-owner contexts.
+This avoids creating one unused Kokkos CUDA context per umbrella partition.
+`--lammps-execution-backend kokkos` enables the separately qualified Kokkos
+style chain and launcher explicitly. Every coordinate records the selected
+LAMMPS execution backend. Evidence also records
 `dprcplugin-deepmd-c-api-batch`, the exact `libdeepmd_c` identity inherited by
 the plugin under `loaded_deepmd_c` (resolved path, SONAME, and SHA-256), and the
 model hash.
+
+Correctness ledgers use schema version 2. In addition to the mode, covered
+batch sizes, and required checks, each ledger must contain the
+`runtime_identity` reported for the qualified run. This relocatable identity
+retains artifact SHA-256 values and all execution-policy fields, including the
+LAMMPS backend and the dynamically loaded DeePMD C-library SONAME and SHA-256,
+the complete parsed workload manifest, reviewed tutorial artifact hashes,
+input-renderer and benchmark-runner hashes, measurement schedule, and MPI
+launcher/rank policy, while omitting local paths, byte counts, and the
+individual batch size.
+Consequently, evidence from a Kokkos run cannot qualify a host timing (or vice
+versa), and replacing a binary, plugin, library, or model requires new
+correctness evidence.
 
 Each output contains `environment.json`, `summary.json`, `samples.csv`, the
 generated inputs, launcher logs, per-partition LAMMPS logs, and final state

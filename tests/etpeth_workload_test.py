@@ -36,6 +36,65 @@ class ETPETHWorkloadTest(unittest.TestCase):
         self.assertEqual((windows[16].tag, windows[16].center), ("m1p5", -1.5))
         self.assertEqual((windows[-1].tag, windows[-1].center), ("p1p6", 1.6))
 
+    def test_reviewed_dependency_record_requires_pin_cleanliness_and_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-dependency-record-") as temporary:
+            root = Path(temporary)
+            repository = root / "dependency"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "config", "user.name", "Test"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            artifact = repository / "runtime.dat"
+            artifact.write_bytes(b"reviewed bytes\n")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "runtime.dat"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            dependency = {
+                "name": "fixture",
+                "path": "dependency",
+                "revision": revision,
+                "required": True,
+                "artifacts": [
+                    {
+                        "path": "runtime.dat",
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+            record = WORKLOAD.reviewed_dependency_record(root, dependency)
+            self.assertTrue(record["publication_qualified"])
+
+            artifact.write_bytes(b"changed bytes\n")
+            record = WORKLOAD.reviewed_dependency_record(root, dependency)
+            self.assertFalse(record["publication_qualified"])
+            self.assertFalse(record["clean"])
+            self.assertFalse(record["artifacts_match"])
+
     def test_deepmd_c_loader_identity_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-deepmd-loader-") as temporary:
             root = Path(temporary)
@@ -166,7 +225,8 @@ class ETPETHWorkloadTest(unittest.TestCase):
             self.assertIn("variable start_data world &", text)
             self.assertIn("reset_timestep 5000", text)
             self.assertIn("fix qmmm qm qmmm/xtb/dprc", text)
-            self.assertIn("pair_style hybrid/overlay/kk lj/cut/dprc/batch", text)
+            self.assertIn("pair_style hybrid/overlay lj/cut/dprc/batch", text)
+            self.assertNotIn("/kk", text)
             self.assertIn("tip4p/long/dprc/batch", text)
             self.assertIn("kspace_style pppm/tip4p/dprc/batch", text)
             self.assertNotIn("fix qmmm qm qmmm/xtb elements", text)
@@ -186,8 +246,9 @@ class ETPETHWorkloadTest(unittest.TestCase):
             )
             self.assertIn("fix classical all dprc/classical/batch", classical)
             self.assertIn(
-                "pair_style hybrid/overlay/kk lj/cut/dprc/batch", classical
+                "pair_style hybrid/overlay lj/cut/dprc/batch", classical
             )
+            self.assertNotIn("/kk", classical)
             self.assertIn("pppm/tip4p/dprc/batch", classical)
             self.assertNotIn("fix qmmm", classical)
 
@@ -204,13 +265,14 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 deepmd_models=[dpa4c_model],
             )
             self.assertIn(
-                f"dprc/deepmd/batch/kk {dpa4c_model.resolve()} partition_batch yes",
+                f"dprc/deepmd/batch {dpa4c_model.resolve()} partition_batch yes",
                 dpa4c,
             )
+            self.assertNotIn("/kk", dpa4c)
             self.assertEqual(dpa4c.count("plugin load"), 1)
             self.assertNotIn("partition_batch yes", classical)
 
-            host_qmmm = WORKLOAD.render_lammps_input(
+            kokkos_qmmm = WORKLOAD.render_lammps_input(
                 self.manifest,
                 tutorial,
                 plugin,
@@ -218,14 +280,15 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 steps=3,
                 trajectory_frequency=0,
                 mode="qmmm",
-                lammps_execution_backend="host",
+                lammps_execution_backend="kokkos",
             )
-            self.assertIn("atom_style full\n", host_qmmm)
-            self.assertIn("pair_style hybrid/overlay lj/cut/dprc/batch", host_qmmm)
-            self.assertIn("fix integrate all nve\n", host_qmmm)
-            self.assertNotIn("/kk", host_qmmm)
+            self.assertIn("atom_style full/kk", kokkos_qmmm)
+            self.assertIn(
+                "pair_style hybrid/overlay/kk lj/cut/dprc/batch", kokkos_qmmm
+            )
+            self.assertIn("fix integrate all nve/kk", kokkos_qmmm)
 
-            host_dpa4c = WORKLOAD.render_lammps_input(
+            kokkos_dpa4c = WORKLOAD.render_lammps_input(
                 self.manifest,
                 tutorial,
                 plugin,
@@ -234,13 +297,12 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 trajectory_frequency=0,
                 mode="qmmm-dpa4c",
                 deepmd_models=[dpa4c_model],
-                lammps_execution_backend="host",
+                lammps_execution_backend="kokkos",
             )
             self.assertIn(
-                f"dprc/deepmd/batch {dpa4c_model.resolve()} partition_batch yes",
-                host_dpa4c,
+                f"dprc/deepmd/batch/kk {dpa4c_model.resolve()} partition_batch yes",
+                kokkos_dpa4c,
             )
-            self.assertNotIn("/kk", host_dpa4c)
 
     def test_seed_colvars_profile_is_stronger_but_sampling_contract_is_unchanged(
         self,
@@ -386,8 +448,6 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 "--model-deviation-frequency",
                 "0",
                 "--allow-unqualified-dpa4c-models",
-                "--lammps-execution-backend",
-                "host",
                 "--stage",
                 "batch-smoke",
             ]
@@ -913,6 +973,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 "selected_environment": environment,
                 "manifest_path": files["manifest.json"],
                 "provenance_path": files["provenance.json"],
+                "lammps_execution_backend": "kokkos",
             }
             self.assertTrue(
                 WORKLOAD.record_is_resumable(record, [run_window], **arguments)

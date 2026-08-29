@@ -76,7 +76,7 @@
     "failure_policy": "a nonconverged or incomplete frame is recorded and excluded from labels; no partial force slice is published"
   },
   "qualification": {
-    "suggested_run_directory": "../lammps-dprc-runs/quick-cuda-qmmm-pbe0-v1/pbe0-6-31g-star",
+    "suggested_run_directory": "runs/quick-cuda-qmmm-pbe0-v1/pbe0-6-31g-star",
     "fixture": "AmberTools alanine-dipeptide EXTERN QM/MM two-step MD",
     "expected_force_calls": 2,
     "expected_qm_gradient_vectors_per_call": 12,

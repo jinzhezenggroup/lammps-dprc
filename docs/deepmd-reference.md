@@ -25,9 +25,10 @@ dprc/deepmd/batch
 dprc/deepmd/batch/kk
 ```
 
-The `/kk` name is a LAMMPS style alias that composes with the Kokkos workflow;
-the adapter itself builds the compact graph on the host, while DeePMD inference
-uses CUDA through the public C API.
+The unsuffixed style is the production default. The `/kk` name is an opt-in
+LAMMPS style alias for a separately qualified Kokkos workflow; in both cases
+the adapter builds the compact graph on the host while DeePMD inference uses
+CUDA through the public C API.
 
 One partition-root communicator is created across independent LAMMPS worlds.
 Rank zero alone loads the model and owns the CUDA context. Every rank contributes
@@ -39,12 +40,12 @@ whole call succeeds.
 plugin load /path/to/dprcplugin.so
 
 group qm id 1:16
-pair_style hybrid/overlay/kk &
+pair_style hybrid/overlay &
   lj/cut/dprc/batch 9.0 &
-  dprc/deepmd/batch/kk /path/to/dprc.pt2 &
+  dprc/deepmd/batch /path/to/dprc.pt2 &
     partition_batch yes center_group qm &
     environment_cutoff 6.0 include_molecule yes
-pair_coeff * * dprc/deepmd/batch/kk P O O C H OW HW
+pair_coeff * * dprc/deepmd/batch P O O C H OW HW
 ```
 
 No separate DeePMD LAMMPS plugin is loaded. A DeePMD-enabled build has a direct

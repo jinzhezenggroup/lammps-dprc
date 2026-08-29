@@ -7,7 +7,7 @@
     "path": "patches/lammps-qmmm-xtb-fused.patch",
     "sha256": "8d4ceb3bc709f29edb068321a6b9f893aaf29d941d961b63f1d5eae6678307ba",
     "derived_from": {
-      "path": "lammps-dprc-runs/fused-recovery/lammps-9ab8ca5-fused-final.patch",
+      "path": "external/fused-recovery/lammps-9ab8ca5-fused-final.patch",
       "sha256": "f793e88d1ae7051eb5bbbaf7f6b9ac71e91f8ac460d4531713aa935d72f06ffd",
       "baseline_revision": "9ab8ca565e0f71d967587e0bca2015f7d689f19f"
     }
