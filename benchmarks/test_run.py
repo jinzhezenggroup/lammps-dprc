@@ -600,6 +600,7 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 matrix={"schema_version": 2},
                 source=source,
                 execution_backend="host",
+                batch_size=32,
                 warmup_steps=10,
                 sample_steps=20,
                 repetitions=3,
@@ -633,6 +634,41 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 "system"
             ]["cutoff_angstrom"] = 8.0
             self.assertNotEqual(identity, changed)
+
+    def test_serial_contract_does_not_require_an_mpi_launcher(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-serial-contract-") as temporary:
+            root = Path(temporary)
+            manifest_path = root / "manifest.json"
+            matrix_path = root / "matrix.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            matrix_path.write_text("{}\n", encoding="utf-8")
+            arguments = argparse.Namespace(
+                manifest=manifest_path,
+                matrix=matrix_path,
+                mpiexec=root / "missing-mpiexec",
+                mpi_arg=[],
+            )
+            contract = RUNNER.scientific_execution_contract(
+                arguments=arguments,
+                manifest={},
+                matrix={},
+                source={"revision": "tutorial", "artifacts": []},
+                execution_backend="host",
+                batch_size=1,
+                warmup_steps=1,
+                sample_steps=1,
+                repetitions=1,
+            )
+            self.assertEqual(
+                contract["launch_policy"],
+                {
+                    "launcher": "direct-lammps",
+                    "mpi_arguments": [],
+                    "worlds": "one-per-selected-umbrella-window",
+                    "ranks_per_window": 1,
+                    "lammps_arguments": [],
+                },
+            )
 
     def test_correctness_evidence_rejects_deepmd_library_mismatch(self) -> None:
         matrix = RUNNER.load_matrix(ROOT / "benchmarks/matrix.json")

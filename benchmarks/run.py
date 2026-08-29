@@ -538,6 +538,7 @@ def scientific_execution_contract(
     matrix: dict[str, Any],
     source: dict[str, Any],
     execution_backend: str,
+    batch_size: int,
     warmup_steps: int,
     sample_steps: int,
     repetitions: int,
@@ -560,6 +561,19 @@ def scientific_execution_contract(
         ),
         key=lambda item: item["relative_path"],
     )
+    launch_policy: dict[str, Any] = {
+        "mpi_arguments": list(arguments.mpi_arg),
+        "worlds": "one-per-selected-umbrella-window",
+        "ranks_per_window": 1,
+        "lammps_arguments": list(
+            WORKLOAD.lammps_backend_arguments(execution_backend)
+        ),
+    }
+    if batch_size == 1:
+        launch_policy["launcher"] = "direct-lammps"
+    else:
+        launch_policy["mpi_launcher"] = artifact(arguments.mpiexec)
+
     return {
         "workload_manifest": artifact(arguments.manifest),
         # Keep the parsed payload as well as its byte hash so the QM region,
@@ -580,15 +594,7 @@ def scientific_execution_contract(
             "repetitions": repetitions,
             "trajectory_frequency_steps": 0,
         },
-        "launch_policy": {
-            "mpi_launcher": artifact(arguments.mpiexec),
-            "mpi_arguments": list(arguments.mpi_arg),
-            "worlds": "one-per-selected-umbrella-window",
-            "ranks_per_window": 1,
-            "lammps_arguments": list(
-                WORKLOAD.lammps_backend_arguments(execution_backend)
-            ),
-        },
+        "launch_policy": launch_policy,
     }
 
 
@@ -738,6 +744,7 @@ def run_coordinate(
         matrix=matrix,
         source=source,
         execution_backend=execution_backend,
+        batch_size=batch_size,
         warmup_steps=warmup_steps,
         sample_steps=sample_steps,
         repetitions=repetitions,
