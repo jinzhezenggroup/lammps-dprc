@@ -55,14 +55,17 @@ class DeepmdPartitionBroker {
 
  private:
   void initialize_model(const std::string &model_path, int gpu_rank);
-  void ensure_host_capacity(std::size_t nodes, std::size_t edge_storage);
+  void ensure_shared_capacity(std::size_t nodes, std::size_t edge_storage);
+  void release_shared_storage() noexcept;
   bool local_graph_valid(const DeepmdCanonicalGraph &graph,
                          std::string &diagnostic) const;
 
   MPI_Comm communicator_ = MPI_COMM_NULL;
   MPI_Comm shared_communicator_ = MPI_COMM_NULL;
+  MPI_Win shared_data_window_ = MPI_WIN_NULL;
   int rank_ = -1;
   int size_ = 0;
+  bool shared_data_locked_ = false;
   std::unique_ptr<DeepmdBatchExecutor> executor_;
   DeepmdModelMetadata metadata_;
 
@@ -71,24 +74,26 @@ class DeepmdPartitionBroker {
   std::vector<int> edge_counts_;
   std::vector<int> node_displacements_;
   std::vector<int> edge_displacements_;
-  std::vector<int> force_counts_;
-  std::vector<int> force_displacements_;
-  std::vector<int> virial_counts_;
-  std::vector<int> virial_displacements_;
   std::vector<std::int64_t> local_nodes_per_frame_;
   std::vector<std::int64_t> all_nodes_per_frame_;
 
-  std::vector<std::int64_t> batch_atom_types_;
-  std::vector<std::uint32_t> batch_sources_;
-  std::vector<float> batch_edge_vectors_;
-  std::vector<std::int64_t> batch_destination_row_ptr_;
-  std::vector<std::int64_t> batch_source_row_ptr_;
-  std::vector<std::uint32_t> batch_source_order_;
+  // One root-owned MPI shared-memory allocation holds both staged canonical
+  // graphs and published results. Every rank writes and reads only its current
+  // displacement slice; rank zero alone offsets the block-diagonal graph and
+  // invokes DeePMD. Capacity grows collectively and is reused in steady state.
+  std::size_t shared_node_capacity_ = 0;
+  std::size_t shared_edge_capacity_ = 0;
+  std::int64_t *shared_atom_types_ = nullptr;
+  std::uint32_t *shared_sources_ = nullptr;
+  float *shared_edge_vectors_ = nullptr;
+  std::int64_t *shared_destination_row_ptr_ = nullptr;
+  std::int64_t *shared_source_row_ptr_ = nullptr;
+  std::uint32_t *shared_source_order_ = nullptr;
+  double *shared_atom_energy_ = nullptr;
+  double *shared_force_ = nullptr;
+  double *shared_atom_virial_ = nullptr;
   DeepmdCanonicalBatchResult batch_result_;
 
-  std::vector<double> local_atom_energy_;
-  std::vector<double> local_force_;
-  std::vector<double> local_atom_virial_;
   bool result_valid_ = false;
 };
 

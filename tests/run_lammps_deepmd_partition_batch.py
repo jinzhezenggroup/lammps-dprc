@@ -138,7 +138,7 @@ def main() -> int:
                 input_file = frame_dir / "input.lammps"
                 input_file.write_text(
                     CENTER.render_input(
-                        True,
+                        False,
                         arguments.dprc_plugin,
                         arguments.model,
                         data_files[frame],
@@ -150,16 +150,6 @@ def main() -> int:
                 run_command(
                     [
                         str(arguments.lammps.resolve()),
-                        "-k",
-                        "on",
-                        "g",
-                        "1",
-                        "-pk",
-                        "kokkos",
-                        "newton",
-                        "on",
-                        "neigh",
-                        "half",
                         "-log",
                         "none",
                         "-screen",
@@ -178,7 +168,7 @@ def main() -> int:
             batch_energy = [batch_dir / f"energy-{frame}.txt" for frame in range(2)]
             batch_atoms = [batch_dir / f"atoms-{frame}.dump" for frame in range(2)]
             template = CENTER.render_input(
-                True,
+                False,
                 arguments.dprc_plugin,
                 arguments.model,
                 data_files[0],
@@ -212,16 +202,6 @@ def main() -> int:
                     "-n",
                     "2",
                     str(arguments.lammps.resolve()),
-                    "-k",
-                    "on",
-                    "g",
-                    "1",
-                    "-pk",
-                    "kokkos",
-                    "newton",
-                    "on",
-                    "neigh",
-                    "half",
                     "-partition",
                     "2x1",
                     "-plog",

@@ -72,6 +72,7 @@ python3 tools/etpeth_workload.py run \
   --xtbloom-library /path/to/libxtbloom.so \
   --library-dir /path/to/cuda/lib64 \
   --mode qmmm \
+  --lammps-execution-backend host \
   --stage smoke
 ```
 
@@ -86,6 +87,7 @@ python3 tools/etpeth_workload.py run \
   --xtbloom-library /path/to/libxtbloom.so \
   --library-dir /path/to/cuda/lib64 \
   --mode qmmm \
+  --lammps-execution-backend host \
   --stage batch-smoke \
   --smoke-window-count 2 \
   --smoke-steps 25
@@ -107,6 +109,7 @@ python3 tools/etpeth_workload.py run \
   --xtbloom-library /path/to/libxtbloom.so \
   --deepmd-model /path/to/qualified-dpa4c.pt2 \
   --mode qmmm-dpa4c \
+  --lammps-execution-backend host \
   --dpa4c-models-qualified \
   --library-dir /path/to/deepmd/lib \
   --library-dir /path/to/cuda/lib64 \
@@ -115,9 +118,13 @@ python3 tools/etpeth_workload.py run \
   --smoke-steps 25
 ```
 
-The generated LAMMPS input uses `dprc/deepmd/batch/kk`, compact group-only
-graphs, and `partition_batch yes`. Broker rank zero owns the model and performs
-one block-diagonal C API call across all synchronized partitions.
+The recommended host execution backend renders ordinary LAMMPS styles without
+the `/kk` suffix and deliberately omits `-k on`. This prevents every umbrella
+partition from creating an otherwise unused Kokkos CUDA context. The xTBloom
+and DeePMD brokers remain GPU-backed; broker rank zero owns the DPA4c model and
+performs one block-diagonal C API call across all synchronized partitions.
+`--lammps-execution-backend kokkos` remains available only for separately
+qualified Kokkos runs.
 
 An unqualified model may be admitted only for private software diagnostics:
 

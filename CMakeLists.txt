@@ -890,7 +890,7 @@ if(DPRC_BUILD_TESTING)
             --evidence
               "${CMAKE_CURRENT_BINARY_DIR}/deepmd-partition-batch-evidence.json")
         set_tests_properties(lammps.deepmd_c_api.partition_batch PROPERTIES
-          TIMEOUT 240 LABELS "cuda;gpu;mpi;kokkos;deepmd")
+          TIMEOUT 240 LABELS "cuda;gpu;mpi;deepmd")
       endif()
     endif()
 

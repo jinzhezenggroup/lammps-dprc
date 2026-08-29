@@ -210,6 +210,38 @@ class ETPETHWorkloadTest(unittest.TestCase):
             self.assertEqual(dpa4c.count("plugin load"), 1)
             self.assertNotIn("partition_batch yes", classical)
 
+            host_qmmm = WORKLOAD.render_lammps_input(
+                self.manifest,
+                tutorial,
+                plugin,
+                run_windows,
+                steps=3,
+                trajectory_frequency=0,
+                mode="qmmm",
+                lammps_execution_backend="host",
+            )
+            self.assertIn("atom_style full\n", host_qmmm)
+            self.assertIn("pair_style hybrid/overlay lj/cut/dprc/batch", host_qmmm)
+            self.assertIn("fix integrate all nve\n", host_qmmm)
+            self.assertNotIn("/kk", host_qmmm)
+
+            host_dpa4c = WORKLOAD.render_lammps_input(
+                self.manifest,
+                tutorial,
+                plugin,
+                run_windows,
+                steps=3,
+                trajectory_frequency=0,
+                mode="qmmm-dpa4c",
+                deepmd_models=[dpa4c_model],
+                lammps_execution_backend="host",
+            )
+            self.assertIn(
+                f"dprc/deepmd/batch {dpa4c_model.resolve()} partition_batch yes",
+                host_dpa4c,
+            )
+            self.assertNotIn("/kk", host_dpa4c)
+
     def test_seed_colvars_profile_is_stronger_but_sampling_contract_is_unchanged(
         self,
     ) -> None:
@@ -298,6 +330,14 @@ class ETPETHWorkloadTest(unittest.TestCase):
             ],
         )
 
+    def test_lammps_backend_arguments_omit_kokkos_for_host(self) -> None:
+        self.assertEqual(WORKLOAD.lammps_backend_arguments("host"), ())
+        kokkos = WORKLOAD.lammps_backend_arguments("kokkos")
+        self.assertEqual(kokkos[:4], ("-k", "on", "g", "1"))
+        self.assertIn("kokkos", kokkos)
+        with self.assertRaisesRegex(ValueError, "execution backend"):
+            WORKLOAD.lammps_backend_arguments("invalid")
+
     def test_single_window_smoke_honors_step_override(self) -> None:
         windows = WORKLOAD.windows_from_manifest(self.manifest)
         with tempfile.TemporaryDirectory(prefix="dprc-etpeth-smoke-") as temporary:
@@ -346,6 +386,8 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 "--model-deviation-frequency",
                 "0",
                 "--allow-unqualified-dpa4c-models",
+                "--lammps-execution-backend",
+                "host",
                 "--stage",
                 "batch-smoke",
             ]
@@ -355,6 +397,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
         self.assertEqual(arguments.model_deviation_frequency, 0)
         self.assertTrue(arguments.allow_unqualified_dpa4c_models)
         self.assertFalse(arguments.dpa4c_models_qualified)
+        self.assertEqual(arguments.lammps_execution_backend, "host")
 
     def test_dpa4c_execution_policy_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-etpeth-policy-") as temporary:
@@ -414,6 +457,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 model_deviation_frequency=0,
                 dpa4c_models_qualified=False,
                 allow_unqualified_dpa4c_models=True,
+                lammps_execution_backend="host",
                 stage="smoke",
                 smoke_window_count=2,
                 smoke_steps=5,
@@ -429,6 +473,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
             self.assertEqual(forwarded["model_deviation_frequency"], 0)
             self.assertFalse(forwarded["dpa4c_models_qualified"])
             self.assertTrue(forwarded["allow_unqualified_dpa4c_models"])
+            self.assertEqual(forwarded["lammps_execution_backend"], "host")
 
     def test_chunked_stage_chains_outputs_and_preserves_ordered_series(self) -> None:
         window = WORKLOAD.windows_from_manifest(self.manifest)[16]
@@ -809,6 +854,10 @@ class ETPETHWorkloadTest(unittest.TestCase):
                         "window_order": [window.tag],
                         "ranks_per_window": 1,
                         "selected_environment": environment,
+                        "execution": {
+                            "mode": "qmmm",
+                            "lammps_execution_backend": "kokkos",
+                        },
                         "input": identity(files["input.in"]),
                         "colvars_configs": {
                             window.tag: identity(run_window.colvars_config)
@@ -868,6 +917,11 @@ class ETPETHWorkloadTest(unittest.TestCase):
             self.assertTrue(
                 WORKLOAD.record_is_resumable(record, [run_window], **arguments)
             )
+            arguments["lammps_execution_backend"] = "host"
+            self.assertFalse(
+                WORKLOAD.record_is_resumable(record, [run_window], **arguments)
+            )
+            arguments["lammps_execution_backend"] = "kokkos"
             extra_log = root / "log.lammps.extra"
             extra_log.write_bytes(b"stale partition log\n")
             self.assertFalse(

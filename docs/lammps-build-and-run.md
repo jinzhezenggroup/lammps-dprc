@@ -426,6 +426,7 @@ python3 "$DPRC_WORKSPACE/lammps-dprc/tools/etpeth_workload.py" run \
   --xtbloom-library "$DPRC_XTBLOOM_LIBRARY" \
   --deepmd-model /path/to/qualified-dpa4c.pt2 \
   --mode qmmm-dpa4c \
+  --lammps-execution-backend host \
   --dpa4c-models-qualified \
   --library-dir "$DPRC_DEEPMD_PREFIX/lib" \
   --library-dir "$DPRC_WORKSPACE/kokkos-install/lib" \
@@ -437,4 +438,6 @@ python3 "$DPRC_WORKSPACE/lammps-dprc/tools/etpeth_workload.py" run \
 
 Proceed to `anchor`, `seeds`, `equilibrate`, and `production` only after the
 one-window and batched correctness checks pass with the exact production
-artifacts.
+artifacts. The host execution backend keeps ordinary LAMMPS work on the CPU
+and avoids one unused Kokkos CUDA context per umbrella partition; xTBloom and
+DeePMD remain owned by their GPU-local brokers.
