@@ -377,8 +377,11 @@ def availability_reasons(
     reasons: list[str] = []
     if not arguments.lammps.is_file():
         reasons.append("LAMMPS executable is unavailable")
-    if batch_size > 1 and not arguments.mpiexec.is_file():
-        reasons.append("MPI launcher is unavailable")
+    if batch_size > 1:
+        try:
+            WORKLOAD.resolve_executable(arguments.mpiexec)
+        except ValueError:
+            reasons.append("MPI launcher is unavailable")
     uses_dprc_plugin = mode != "classical" or arguments.classical_backend == "batched-dprc"
     if uses_dprc_plugin:
         if arguments.plugin is None or not arguments.plugin.is_file():
@@ -691,7 +694,14 @@ def run_coordinate(
         encoding="utf-8",
     )
 
-    mpi_launcher = arguments.mpiexec.resolve()
+    # ``--mpiexec`` accepts either an explicit executable path or a command
+    # name discovered through PATH.  A serial coordinate does not invoke MPI,
+    # so it remains runnable when no launcher is installed.
+    mpi_launcher = (
+        WORKLOAD.resolve_executable(arguments.mpiexec)
+        if batch_size > 1
+        else arguments.mpiexec
+    )
     command = WORKLOAD.build_lammps_command(
         lammps=arguments.lammps,
         mpi_launcher=mpi_launcher,
