@@ -87,7 +87,9 @@ jobs:
           # enables CMake's explicit unpinned diagnostic mode below.
           ref: 5bc0c046e5fcc748e80c027f25c35214f363bd46
           path: xtbloom
-          fetch-depth: 1
+          # xTBloom resolves its product version from Git tags during CMake
+          # configuration, so a shallow checkout is not sufficient here.
+          fetch-depth: 0
 
       - name: Generate the xTBloom public version header
         run: |
