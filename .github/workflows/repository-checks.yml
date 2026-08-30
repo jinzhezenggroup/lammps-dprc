@@ -146,7 +146,6 @@ jobs:
         run: |
           lammps-build/lmp \
             -log none \
-            -screen /dev/stderr \
             -var dprc_plugin "$GITHUB_WORKSPACE/dprc-build/dprcplugin.so" \
             -var dprc_marker "$GITHUB_WORKSPACE/dprc-build/direct-dprc-info.txt" \
             -in "$GITHUB_WORKSPACE/tests/in.dprc_info"
