@@ -45,12 +45,16 @@ DeePMD models may explicitly use FP32 inference. The selected model artifact,
 backend, compact environment, and output precision must be recorded. FP32 is
 not inferred from the GPU name alone, and FP16/TF32 is a separate experiment.
 
-The in-plugin DeePMD path requires public C API version 31 or newer and exposes
+The in-plugin DeePMD path requires public C API version 30 or newer and exposes
 a deliberate mixed-representation boundary:
 
-- `DP_DeepPotComputeCanonicalGraphBatchGPU` consumes a block-diagonal,
-  device-resident compact graph with FP32 edge vectors and publishes FP64
-  atomic energies, forces, and virials;
+- API v31 or newer: `DP_DeepPotComputeCanonicalGraphBatchGPU` consumes a
+  block-diagonal, device-resident compact graph with FP32 edge vectors and
+  publishes FP64 atomic energies, forces, and virials;
+- API v30: `DP_DeepPotComputeCanonicalGraphGPU` consumes the same packed graph
+  without an explicit frame axis. LAMMPS-DPRc requires each packed component
+  to be local and qualifies the disconnected-graph equivalence before using
+  this fallback;
 - `DP_DeepPotUsesFP32EdgeVectors` and the related device/canonical-graph
   capability queries allow runtime selection instead of assuming a model
   representation from its filename.
