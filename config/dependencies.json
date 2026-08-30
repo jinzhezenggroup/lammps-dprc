@@ -71,22 +71,15 @@
       ]
     },
     {
-      "name": "deepmd-kit-pr-5943",
+      "name": "deepmd-kit-dpa4c",
       "path": "../deepmd-kit",
-      "upstream": "https://github.com/deepmodeling/deepmd-kit/pull/5943",
-      "revision": "835a42f001b41e1bee0646b7e1403855b7fe6340",
+      "upstream": "https://github.com/deepmodeling/deepmd-kit/pull/5972",
+      "revision": "bdb40072d57109e25e17842d24e1f0a926c00632",
       "license": "LGPL-3.0-or-later",
-      "classification": "open compact-evaluation design reference; the in-plugin runtime requires a newer published public C API v31 revision",
+      "classification": "DPA4c compact-evaluation reference with the public DeePMD C API v30 graph entry point",
       "required": false,
       "vendored": false,
-      "related_revisions": [
-        {
-          "name": "dpa4c-merge",
-          "upstream": "https://github.com/deepmodeling/deepmd-kit/pull/5972",
-          "revision": "bdb40072d57109e25e17842d24e1f0a926c00632",
-          "status": "not combined with the open compact-evaluation revision"
-        }
-      ]
+      "artifacts": []
     },
     {
       "name": "dprc-tutorial",

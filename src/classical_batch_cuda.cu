@@ -5,6 +5,7 @@
 #include <cufft.h>
 #include <cub/block/block_reduce.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr int kRealSpaceWarpsPerBlock = 8;
 constexpr int kRealSpaceThreads = kWarpSize * kRealSpaceWarpsPerBlock;
+constexpr int kReductionThreads = 32;
 
 [[noreturn]] void throw_cuda(cudaError_t status, const char *operation) {
   throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
@@ -539,8 +541,8 @@ struct RawContributionSum {
   }
 };
 
-__device__ void publish_raw_block(RawContribution contribution, double *raw,
-                                  std::size_t frame) {
+__device__ void publish_raw_block(RawContribution contribution,
+                                  double *block_partials) {
   using Reduction = cub::BlockReduce<RawContribution, kThreads>;
   __shared__ typename Reduction::TempStorage storage;
   const RawContribution block =
@@ -548,7 +550,28 @@ __device__ void publish_raw_block(RawContribution contribution, double *raw,
   if (threadIdx.x == 0)
 #pragma unroll
     for (int component = 0; component < 7; ++component)
-      atomicAdd(raw + 7 * frame + component, block.values[component]);
+      block_partials[7 * static_cast<std::size_t>(blockIdx.x) + component] =
+          block.values[component];
+}
+
+template <int Components>
+__global__ void deterministic_frame_sum_kernel(
+    const double *partials, double *sums, std::size_t partials_per_frame,
+    int batch) {
+  const int frame = static_cast<int>(blockIdx.x);
+  const int component = static_cast<int>(threadIdx.x);
+  if (frame >= batch || component >= Components) return;
+
+  // One thread owns one output component and visits partials in a fixed order.
+  // This second stage is intentionally simple: it removes launch-scheduling
+  // dependence from publication-scale energy and virial values while the
+  // expensive pair and mesh arithmetic remains fully parallel.
+  double sum = 0.0;
+  const std::size_t frame_offset =
+      static_cast<std::size_t>(frame) * partials_per_frame * Components;
+  for (std::size_t partial = 0; partial < partials_per_frame; ++partial)
+    sum += partials[frame_offset + partial * Components + component];
+  sums[static_cast<std::size_t>(frame) * Components + component] = sum;
 }
 
 __global__ void real_space_kernel(
@@ -563,7 +586,7 @@ __global__ void real_space_kernel(
     const double *table_r, const double *table_dr, const double *table_force,
     const double *table_dforce, const double *table_coulomb,
     const double *table_dcoulomb, const double *table_energy,
-    const double *table_denergy, double *forces, double *scalars,
+    const double *table_denergy, double *forces, double *scalar_partials,
     std::size_t total_atoms, DeviceParameters parameters) {
   // A warp owns one atom and evaluates a full (Newton-off) neighbor list.  The
   // pair arithmetic is intentionally repeated from the partner's warp: doing
@@ -716,14 +739,15 @@ __global__ void real_space_kernel(
     add_site_force(frame, atom1,
                    make_double3(site_force_x, site_force_y, site_force_z),
                    forces, oxygen_site, tip4p_sites, parameters);
-    atomicAdd(scalars + 8 * frame, lj_energy);
-    atomicAdd(scalars + 8 * frame + 1, coulomb_energy);
-    atomicAdd(scalars + 8 * frame + 2, virial_xx);
-    atomicAdd(scalars + 8 * frame + 3, virial_yy);
-    atomicAdd(scalars + 8 * frame + 4, virial_zz);
-    atomicAdd(scalars + 8 * frame + 5, virial_xy);
-    atomicAdd(scalars + 8 * frame + 6, virial_xz);
-    atomicAdd(scalars + 8 * frame + 7, virial_yz);
+    const std::size_t scalar_offset = 8 * global;
+    scalar_partials[scalar_offset] = lj_energy;
+    scalar_partials[scalar_offset + 1] = coulomb_energy;
+    scalar_partials[scalar_offset + 2] = virial_xx;
+    scalar_partials[scalar_offset + 3] = virial_yy;
+    scalar_partials[scalar_offset + 4] = virial_zz;
+    scalar_partials[scalar_offset + 5] = virial_xy;
+    scalar_partials[scalar_offset + 6] = virial_xz;
+    scalar_partials[scalar_offset + 7] = virial_yz;
   }
 }
 
@@ -771,7 +795,8 @@ __global__ void assign_density_kernel(const double3 *site_fractional,
 __global__ void prepare_mm_spectrum_kernel(
     const cufftDoubleComplex *density, const double *green, const double *kvector,
     const double *virial_factor, cufftDoubleComplex *normalized,
-    cufftDoubleComplex *transforms, double *raw, std::size_t total_grid,
+    cufftDoubleComplex *transforms, double *raw_partials,
+    std::size_t total_grid,
     std::size_t mesh_count, int fields_per_frame) {
   const std::size_t blocks_per_frame =
       (mesh_count + kThreads - 1) / kThreads;
@@ -807,13 +832,14 @@ __global__ void prepare_mm_spectrum_kernel(
       raw_contribution.values[1 + component] =
           contribution * virial_factor[6 * grid + component];
   }
-  publish_raw_block(raw_contribution, raw, frame);
+  publish_raw_block(raw_contribution, raw_partials);
 }
 
 __global__ void prepare_qm_spectrum_kernel(
     const cufftDoubleComplex *density, const double *green, const double *kvector,
     const double *virial_factor, cufftDoubleComplex *normalized,
-    cufftDoubleComplex *transforms, double *raw, std::size_t total_grid,
+    cufftDoubleComplex *transforms, double *raw_partials,
+    std::size_t total_grid,
     std::size_t mesh_count) {
   const std::size_t blocks_per_frame =
       (mesh_count + kThreads - 1) / kThreads;
@@ -842,7 +868,7 @@ __global__ void prepare_qm_spectrum_kernel(
       raw_contribution.values[1 + component] =
           contribution * virial_factor[6 * grid + component];
   }
-  publish_raw_block(raw_contribution, raw, frame);
+  publish_raw_block(raw_contribution, raw_partials);
 }
 
 __global__ void interpolate_mm_kernel(
@@ -1014,7 +1040,8 @@ __global__ void interpolate_qm_full_kernel(
 __global__ void cross_spectrum_kernel(const cufftDoubleComplex *mm,
                                       const cufftDoubleComplex *qm,
                                       const double *green,
-                                      const double *virial_factor, double *cross,
+                                      const double *virial_factor,
+                                      double *raw_partials,
                                       std::size_t total_grid,
                                       std::size_t mesh_count) {
   const std::size_t blocks_per_frame =
@@ -1033,7 +1060,7 @@ __global__ void cross_spectrum_kernel(const cufftDoubleComplex *mm,
       raw_contribution.values[1 + component] =
           product * virial_factor[6 * grid + component];
   }
-  publish_raw_block(raw_contribution, cross, frame);
+  publish_raw_block(raw_contribution, raw_partials);
 }
 
 __global__ void finalize_full_kernel(
@@ -1127,9 +1154,6 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     check_cuda(cudaMemsetAsync(d_pair_forces_.get(), 0, coordinates * sizeof(double),
                                stream_),
                "clear pair forces");
-    check_cuda(cudaMemsetAsync(d_pair_scalars_.get(), 0,
-                               8 * input.batch_count * sizeof(double), stream_),
-               "clear pair scalars");
     if (rebuild_bins)
       check_cuda(cudaMemsetAsync(
                      d_bin_counts_.get(), 0,
@@ -1139,9 +1163,6 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     check_cuda(cudaMemsetAsync(d_density_.get(), 0,
                                grid * sizeof(cufftDoubleComplex), stream_),
                "clear MM density");
-    check_cuda(cudaMemsetAsync(d_mm_raw_.get(), 0,
-                               7 * input.batch_count * sizeof(double), stream_),
-               "clear MM reductions");
     if (need_forces)
       check_cuda(cudaMemsetAsync(d_mm_forces_.get(), 0,
                                  coordinates * sizeof(double), stream_),
@@ -1188,8 +1209,13 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
         d_table_r_.get(), d_table_dr_.get(), d_table_force_.get(),
         d_table_dforce_.get(), d_table_coulomb_.get(), d_table_dcoulomb_.get(),
         d_table_energy_.get(), d_table_denergy_.get(), d_pair_forces_.get(),
-        d_pair_scalars_.get(), atoms, parameters_);
+        d_pair_scalar_partials_.get(), atoms, parameters_);
     launch_check("real_space_kernel");
+    deterministic_frame_sum_kernel<8>
+        <<<static_cast<int>(input.batch_count), kReductionThreads, 0, stream_>>>(
+            d_pair_scalar_partials_.get(), d_pair_scalars_.get(),
+            topology_.atom_count, static_cast<int>(input.batch_count));
+    launch_check("reduce pair energy and virial");
 
     assign_density_kernel<<<blocks(atoms), kThreads, 0, stream_>>>(
         d_site_fractional_.get(), d_mm_charges_.get(), d_spline_.get(),
@@ -1202,9 +1228,14 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
         static_cast<int>(input.batch_count) * blocks(prepared_.mesh_count);
     prepare_mm_spectrum_kernel<<<mm_spectrum_blocks, kThreads, 0, stream_>>>(
         d_density_.get(), d_green_.get(), d_kvector_.get(), d_virial_factor_.get(),
-        d_mm_spectrum_.get(), d_mm_transforms_.get(), d_mm_raw_.get(), grid,
-        prepared_.mesh_count, mm_fields);
+        d_mm_spectrum_.get(), d_mm_transforms_.get(),
+        d_reciprocal_partials_.get(), grid, prepared_.mesh_count, mm_fields);
     launch_check("prepare_mm_spectrum_kernel");
+    deterministic_frame_sum_kernel<7>
+        <<<static_cast<int>(input.batch_count), kReductionThreads, 0, stream_>>>(
+            d_reciprocal_partials_.get(), d_mm_raw_.get(),
+            reciprocal_partials_per_frame_, static_cast<int>(input.batch_count));
+    launch_check("reduce MM reciprocal energy and virial");
     if (mm_fields > 0) {
       cufftHandle inverse = mm_fields == 4 ? fft.inverse_mm : fft.inverse_qm;
       check_cufft(cufftExecZ2Z(inverse, d_mm_transforms_.get(),
@@ -1275,12 +1306,6 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     check_cuda(cudaMemsetAsync(d_density_.get(), 0,
                                grid * sizeof(cufftDoubleComplex), stream_),
                "clear QM density");
-    check_cuda(cudaMemsetAsync(d_qm_raw_.get(), 0,
-                               7 * input.batch_count * sizeof(double), stream_),
-               "clear QM reductions");
-    check_cuda(cudaMemsetAsync(d_cross_.get(), 0,
-                               7 * input.batch_count * sizeof(double), stream_),
-               "clear cross reductions");
     check_cuda(cudaMemsetAsync(d_qm_forces_.get(), 0, coordinates * sizeof(double),
                                stream_),
                "clear QM forces");
@@ -1299,9 +1324,14 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
         static_cast<int>(input.batch_count) * blocks(prepared_.mesh_count);
     prepare_qm_spectrum_kernel<<<qm_spectrum_blocks, kThreads, 0, stream_>>>(
         d_density_.get(), d_green_.get(), d_kvector_.get(), d_virial_factor_.get(),
-        d_qm_spectrum_.get(), d_qm_transforms_.get(), d_qm_raw_.get(), grid,
-        prepared_.mesh_count);
+        d_qm_spectrum_.get(), d_qm_transforms_.get(),
+        d_reciprocal_partials_.get(), grid, prepared_.mesh_count);
     launch_check("prepare_qm_spectrum_kernel");
+    deterministic_frame_sum_kernel<7>
+        <<<static_cast<int>(input.batch_count), kReductionThreads, 0, stream_>>>(
+            d_reciprocal_partials_.get(), d_qm_raw_.get(),
+            reciprocal_partials_per_frame_, static_cast<int>(input.batch_count));
+    launch_check("reduce QM reciprocal energy and virial");
     check_cufft(cufftExecZ2Z(fft.inverse_qm, d_qm_transforms_.get(),
                              d_qm_transforms_.get(), CUFFT_INVERSE),
                 "cuFFT QM inverse batch");
@@ -1313,8 +1343,14 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     launch_check("interpolate_qm_full_kernel");
     cross_spectrum_kernel<<<qm_spectrum_blocks, kThreads, 0, stream_>>>(
         d_mm_spectrum_.get(), d_qm_spectrum_.get(), d_green_.get(),
-        d_virial_factor_.get(), d_cross_.get(), grid, prepared_.mesh_count);
+        d_virial_factor_.get(), d_reciprocal_partials_.get(), grid,
+        prepared_.mesh_count);
     launch_check("cross_spectrum_kernel");
+    deterministic_frame_sum_kernel<7>
+        <<<static_cast<int>(input.batch_count), kReductionThreads, 0, stream_>>>(
+            d_reciprocal_partials_.get(), d_cross_.get(),
+            reciprocal_partials_per_frame_, static_cast<int>(input.batch_count));
+    launch_check("reduce MM-QM cross energy and virial");
 
     compute_charge_moments(input.qm_charges, input.batch_count, qm_qsum_host_,
                            qm_qsq_host_);
@@ -1473,6 +1509,8 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     const std::size_t coordinates = 3 * atoms;
     const std::size_t grid = max_batch_count_ * prepared_.mesh_count;
     const std::size_t bins = max_batch_count_ * parameters_.bins;
+    reciprocal_partials_per_frame_ =
+        (prepared_.mesh_count + kThreads - 1) / kThreads;
     d_positions_.allocate(coordinates, "positions");
     d_mm_charges_.allocate(atoms, "MM charges");
     d_qm_charges_.allocate(atoms, "QM charges");
@@ -1492,6 +1530,7 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     d_qm_forces_.allocate(coordinates, "QM reciprocal forces");
     d_full_forces_.allocate(coordinates, "full reciprocal forces");
     d_pair_scalars_.allocate(8 * max_batch_count_, "pair scalars");
+    d_pair_scalar_partials_.allocate(8 * atoms, "pair scalar partials");
     d_density_.allocate(grid, "PPPM density");
     d_mm_spectrum_.allocate(grid, "MM spectrum");
     d_qm_spectrum_.allocate(grid, "QM spectrum");
@@ -1501,6 +1540,9 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
     d_mm_raw_.allocate(7 * max_batch_count_, "MM reciprocal reductions");
     d_qm_raw_.allocate(7 * max_batch_count_, "QM reciprocal reductions");
     d_cross_.allocate(7 * max_batch_count_, "MM-QM cross reductions");
+    d_reciprocal_partials_.allocate(
+        7 * max_batch_count_ * reciprocal_partials_per_frame_,
+        "reciprocal block partials");
     d_mm_qsum_.allocate(max_batch_count_, "MM charge sums");
     d_mm_qsq_.allocate(max_batch_count_, "MM squared-charge sums");
     d_qm_qsum_.allocate(max_batch_count_, "QM charge sums");
@@ -1577,13 +1619,18 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
         static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
       throw std::overflow_error("Verlet neighbor list exceeds host size limits");
     const std::size_t required = static_cast<std::size_t>(required_u64);
+    if (required > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::overflow_error(
+          "Verlet neighbor list exceeds segmented-sort index limits");
     if (required > verlet_neighbor_capacity_) {
       const std::size_t spare = std::max(atoms * std::size_t{16}, required / 4);
       if (spare > std::numeric_limits<std::size_t>::max() - required)
         throw std::overflow_error("Verlet neighbor capacity overflows");
       verlet_neighbor_capacity_ = required + spare;
       d_verlet_neighbors_.allocate(verlet_neighbor_capacity_,
-                                   "Verlet neighbor list");
+                                   "sorted Verlet neighbor list");
+      d_verlet_neighbors_unsorted_.allocate(verlet_neighbor_capacity_,
+                                            "unsorted Verlet neighbor list");
     }
     check_cuda(cudaMemsetAsync(d_verlet_cursor_.get(), 0,
                                atoms * sizeof(int), stream_),
@@ -1593,8 +1640,33 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
         d_atom_fractional_.get(), d_atom_bins_.get(), d_bin_offsets_.get(),
         d_bin_atoms_.get(), d_neighbor_bin_offsets_.get(),
         d_neighbor_bins_.get(), d_verlet_offsets_.get(),
-        d_verlet_cursor_.get(), d_verlet_neighbors_.get(), atoms, parameters_);
+        d_verlet_cursor_.get(), d_verlet_neighbors_unsorted_.get(), atoms,
+        parameters_);
     launch_check("fill_verlet_neighbors_kernel");
+
+    // Atomic bin insertion deliberately leaves otherwise equivalent neighbor
+    // lists in launch-dependent order.  Sort every atom segment so pair
+    // arithmetic, scalar partials, and force publication see a stable atom-ID
+    // order for one-window and batched executions.
+    std::size_t sort_bytes = 0;
+    check_cuda(cub::DeviceSegmentedRadixSort::SortKeys(
+                   nullptr, sort_bytes, d_verlet_neighbors_unsorted_.get(),
+                   d_verlet_neighbors_.get(), static_cast<int>(required),
+                   static_cast<int>(atoms), d_verlet_offsets_.get(),
+                   d_verlet_offsets_.get() + 1, 0, sizeof(int) * 8, stream_),
+               "query CUB segmented neighbor-sort workspace");
+    if (sort_bytes > neighbor_sort_workspace_bytes_) {
+      d_neighbor_sort_workspace_.allocate(sort_bytes,
+                                          "CUB segmented neighbor-sort workspace");
+      neighbor_sort_workspace_bytes_ = sort_bytes;
+    }
+    check_cuda(cub::DeviceSegmentedRadixSort::SortKeys(
+                   d_neighbor_sort_workspace_.get(), sort_bytes,
+                   d_verlet_neighbors_unsorted_.get(), d_verlet_neighbors_.get(),
+                   static_cast<int>(required), static_cast<int>(atoms),
+                   d_verlet_offsets_.get(), d_verlet_offsets_.get() + 1, 0,
+                   sizeof(int) * 8, stream_),
+               "CUB segmented neighbor sort");
   }
 
   FftPlans &plans_for(std::size_t batch) {
@@ -1820,18 +1892,23 @@ class CudaClassicalBatchPlan final : public ClassicalBatchPlan {
   DeviceBuffer<double> d_positions_, d_mm_charges_, d_qm_charges_, d_full_charges_;
   DeviceBuffer<double3> d_atom_fractional_, d_site_fractional_;
   DeviceBuffer<int> d_atom_bins_, d_bin_counts_, d_bin_offsets_, d_bin_cursor_,
-      d_bin_atoms_, d_verlet_cursor_, d_verlet_neighbors_;
+      d_bin_atoms_, d_verlet_cursor_, d_verlet_neighbors_,
+      d_verlet_neighbors_unsorted_;
   DeviceBuffer<std::uint64_t> d_verlet_counts_, d_verlet_offsets_;
-  DeviceBuffer<std::uint8_t> d_scan_workspace_, d_verlet_scan_workspace_;
+  DeviceBuffer<std::uint8_t> d_scan_workspace_, d_verlet_scan_workspace_,
+      d_neighbor_sort_workspace_;
   DeviceBuffer<std::uint8_t> d_fft_workspace_;
   std::size_t scan_workspace_bytes_ = 0;
   std::size_t verlet_scan_workspace_bytes_ = 0;
   std::size_t verlet_neighbor_capacity_ = 0;
+  std::size_t neighbor_sort_workspace_bytes_ = 0;
+  std::size_t reciprocal_partials_per_frame_ = 0;
   DeviceBuffer<double> d_pair_forces_, d_mm_forces_, d_qm_forces_, d_full_forces_,
-      d_pair_scalars_;
+      d_pair_scalars_, d_pair_scalar_partials_;
   DeviceBuffer<cufftDoubleComplex> d_density_, d_mm_spectrum_, d_qm_spectrum_,
       d_mm_transforms_, d_qm_transforms_;
   DeviceBuffer<double> d_mm_potential_, d_mm_raw_, d_qm_raw_, d_cross_,
+      d_reciprocal_partials_,
       d_mm_qsum_, d_mm_qsq_, d_qm_qsum_, d_qm_qsq_, d_mm_energy_, d_qm_energy_,
       d_full_energy_, d_mm_virial_, d_qm_virial_, d_full_virial_;
 

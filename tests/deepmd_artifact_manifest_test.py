@@ -32,7 +32,7 @@ class DeepmdArtifactManifestTest(unittest.TestCase):
         source_header.parent.mkdir(parents=True)
         installed_header.parent.mkdir(parents=True)
         library.parent.mkdir(parents=True)
-        header = "#define DP_C_API_VERSION 31\n"
+        header = "#define DP_C_API_VERSION 30\n"
         source_header.write_text(header, encoding="utf-8")
         installed_header.write_text(header, encoding="utf-8")
         library.write_bytes(b"reviewed deepmd c api fixture\n")
@@ -42,22 +42,26 @@ class DeepmdArtifactManifestTest(unittest.TestCase):
             check=True,
         )
         subprocess.run(
-            ["git", "-C", str(source), "config", "user.email", "fixture@example.invalid"],
+            [
+                "git",
+                "-C",
+                str(source),
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ],
             check=True,
         )
         subprocess.run(["git", "-C", str(source), "add", "."], check=True)
         subprocess.run(
             ["git", "-C", str(source), "commit", "-qm", "fixture"], check=True
         )
-        revision = (
-            subprocess.run(
-                ["git", "-C", str(source), "rev-parse", "HEAD"],
-                check=True,
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-            .stdout.strip()
-        )
+        revision = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
         return source, include_dir, library, revision
 
     def test_clean_record_binds_source_header_and_library(self) -> None:
@@ -79,25 +83,23 @@ class DeepmdArtifactManifestTest(unittest.TestCase):
                 allow_dirty_source=False,
             )
             self.assertTrue(verified["source_clean"])
-            self.assertEqual(verified["c_api_version"], 31)
+            self.assertEqual(verified["c_api_version"], 30)
 
     def test_header_mismatch_and_dirty_source_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-deepmd-manifest-") as temporary:
             root = Path(temporary)
             source, include_dir, library, _ = self.fixture(root)
             (include_dir / "deepmd/c_api.h").write_text(
-                "#define DP_C_API_VERSION 32\n", encoding="utf-8"
+                "#define DP_C_API_VERSION 31\n", encoding="utf-8"
             )
-            with self.assertRaisesRegex(
-                MANIFEST.ManifestError, "does not match"
-            ):
+            with self.assertRaisesRegex(MANIFEST.ManifestError, "does not match"):
                 MANIFEST.create_record(
                     source, include_dir, library, allow_dirty_source=False
                 )
 
             source_header = source / "source/api_c/include/c_api.h"
             source_header.write_text(
-                "#define DP_C_API_VERSION 32\n", encoding="utf-8"
+                "#define DP_C_API_VERSION 31\n", encoding="utf-8"
             )
             with self.assertRaisesRegex(MANIFEST.ManifestError, "dirty"):
                 MANIFEST.create_record(
@@ -107,6 +109,40 @@ class DeepmdArtifactManifestTest(unittest.TestCase):
                 source, include_dir, library, allow_dirty_source=True
             )
             self.assertFalse(diagnostic["source_clean"])
+
+    def test_revision_stamped_source_export_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-deepmd-export-") as temporary:
+            root = Path(temporary)
+            source = root / "source-export"
+            source_header = source / "source/api_c/include/c_api.h"
+            include_dir = root / "install/include"
+            installed_header = include_dir / "deepmd/c_api.h"
+            library = root / "install/lib/libdeepmd_c.so"
+            source_header.parent.mkdir(parents=True)
+            installed_header.parent.mkdir(parents=True)
+            library.parent.mkdir(parents=True)
+            revision = "0123456789abcdef0123456789abcdef01234567"
+            (source / ".source-revision").write_text(revision + "\n", encoding="utf-8")
+            header = "#define DP_C_API_VERSION 30\n"
+            source_header.write_text(header, encoding="utf-8")
+            installed_header.write_text(header, encoding="utf-8")
+            library.write_bytes(b"source export fixture\n")
+            record = MANIFEST.create_record(
+                source, include_dir, library, allow_dirty_source=False
+            )
+            self.assertEqual(record["source_revision"], revision)
+            self.assertTrue(record["source_clean"])
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(record), encoding="utf-8")
+            MANIFEST.verify_record(
+                manifest,
+                source,
+                include_dir,
+                library,
+                expected_revision=revision,
+                expected_library_sha256=MANIFEST.sha256(library),
+                allow_dirty_source=False,
+            )
 
 
 if __name__ == "__main__":

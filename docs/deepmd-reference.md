@@ -1,22 +1,28 @@
 # DeePMD compact-evaluation reference
 
-The original compact-selection design reference is deepmodeling/deepmd-kit PR
-[#5943](https://github.com/deepmodeling/deepmd-kit/pull/5943), pinned at
-`835a42f001b41e1bee0646b7e1403855b7fe6340`.
+The compact DPA4c evaluation reference is deepmodeling/deepmd-kit PR
+[#5972](https://github.com/deepmodeling/deepmd-kit/pull/5972), pinned at
+`bdb40072d57109e25e17842d24e1f0a926c00632`.
 
 That PR introduced the useful `center_group`, `environment_cutoff`, and
-`include_molecule` concepts. It did not provide multi-window GPU batching or a
-public C API for a block-diagonal canonical graph.
+`include_molecule` concepts together with the public canonical-graph C entry
+point. It did not provide multi-window GPU batching; the broker and the
+block-diagonal composition are implemented here.
 
 ## Implemented C API boundary
 
 LAMMPS-DPRc now implements compact partition batching inside `dprcplugin.so`.
 The production code includes only `deepmd/c_api.h` and requires C API version
-31 or newer. Its numerical entry point is:
+30 or newer. Its v30 numerical entry point is:
 
 ```c
-DP_DeepPotComputeCanonicalGraphBatchGPU(...)
+DP_DeepPotComputeCanonicalGraphGPU(...)
 ```
+
+When a v31-or-newer header exposes the explicit frame-axis entry point, the
+executor selects it after the same validation. The v30 path is equivalent for
+the supported atomwise DPA4c model because disconnected block-diagonal graphs
+cannot exchange messages.
 
 The integration registers:
 
@@ -47,6 +53,10 @@ pair_style hybrid/overlay &
     environment_cutoff 6.0 include_molecule yes
 pair_coeff * * dprc/deepmd/batch P O O C H OW HW
 ```
+
+This host-style form is the recommended multi-window deployment because it
+does not initialize one Kokkos CUDA context per partition. The `/kk` alias is
+available only for a separately qualified Kokkos execution backend.
 
 No separate DeePMD LAMMPS plugin is loaded. A DeePMD-enabled build has a direct
 `libdeepmd_c` dependency, but the symbol gate rejects DeePMD C++ ABI symbols and
@@ -111,17 +121,16 @@ correction requires them, for example `O` versus `OW` and `H` versus `HW`.
 Ordinary elemental pretrained checkpoints do not satisfy that contract merely
 because their files load successfully.
 
-## C API v31 publication status
+## C API artifact provenance
 
-The implementation validated during development uses an unpublished C API v31
-extension. The reviewed public PR #5943 pin predates that API. Before a public
-release can claim reproducibility, the DeePMD changes must be clean, committed,
-published, reviewed, and recorded in `config/dependencies.json` with the exact
-library hash and license provenance.
-
-Until then, users may provide an explicit development revision and library hash
-to CMake, but all resulting correctness and performance records remain
-diagnostic.
+The build requires a manifest that binds the exact DeePMD source revision, the
+installed public header, and the linked `libdeepmd_c` bytes. Generate it with
+`tools/deepmd_artifact_manifest.py` and pass it as
+`DPRC_DEEPMD_ARTIFACT_MANIFEST`. CMake verifies the manifest before compiling
+the plugin, so a header/library mix-up cannot silently enter a run. Dirty
+development checkouts require the explicit
+`DPRC_REQUIRE_CLEAN_DEPENDENCIES=OFF` diagnostic override and remain ineligible
+for release evidence.
 
 ## Precision boundary
 

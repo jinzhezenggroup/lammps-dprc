@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -32,6 +33,21 @@ from typing import Any, Self
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = PROJECT_ROOT / "workloads/etpeth/manifest.json"
 DANGEROUS_BUILDS = re.compile(r"Dangerous builds\s*=\s*(\d+)")
+DANGEROUS_BUILDS_NOT_CHECKED = "Dangerous builds not checked"
+LAMMPS_TOPOLOGY_COUNT = re.compile(
+    r"^\s*(\d+)\s+(atoms|bonds|angles|dihedrals|impropers)\s*$"
+)
+NVE_MINIMUM_SAMPLES = 10
+NVE_MAXIMUM_ABSOLUTE_DRIFT_RATE_KCAL_MOL_PS_ATOM = 1.0e-4
+NVE_MAXIMUM_ABSOLUTE_NET_DRIFT_KCAL_MOL_ATOM = 5.0e-4
+NVE_MINIMUM_MEAN_TEMPERATURE_KELVIN = 200.0
+NVE_MAXIMUM_MEAN_TEMPERATURE_KELVIN = 400.0
+DPA4C_DPRC_GRAPH_POLICY = "exclude-all-environment-environment-edges"
+DPA4C_DPRC_ENVIRONMENT_TYPES = ("OW", "HW")
+
+
+class LammpsExecutionError(RuntimeError):
+    """Report a failed external LAMMPS process without hiding validation errors."""
 
 
 @dataclass(frozen=True)
@@ -88,6 +104,11 @@ class RunWindow:
     @property
     def final_restart(self) -> Path:
         return self.output_directory / f"{self.window.tag}.restart"
+
+    @property
+    def checkpoint_restart_root(self) -> Path:
+        """Return the root used for periodic hitting-time restart files."""
+        return self.output_directory / f"{self.window.tag}.checkpoint.restart"
 
     @property
     def trajectory(self) -> Path:
@@ -216,6 +237,42 @@ def git_output(repository: Path, *arguments: str) -> str:
     return process.stdout.strip()
 
 
+def source_tree_record(repository: Path) -> dict[str, Any]:
+    """Record a Git checkout or explicitly identify an unversioned snapshot.
+
+    Runtime binary identities are recorded separately with SHA-256.  This
+    source-level record must therefore remain honest when an execution node
+    carries only an exported build tree: absence of Git metadata is reported
+    as unknown revision and dirty state, never silently treated as clean.
+    """
+    repository = repository.resolve()
+    if (repository / ".git").exists():
+        dirty_output = git_output(repository, "status", "--porcelain=v1")
+        return {
+            "path": str(repository),
+            "identity_kind": "git-checkout",
+            "revision": git_output(repository, "rev-parse", "HEAD"),
+            "dirty": bool(dirty_output),
+            "dirty_entries": dirty_output.splitlines() if dirty_output else [],
+        }
+
+    revision_file = repository / ".source-revision"
+    revision = None
+    identity_kind = "unversioned-source-snapshot"
+    if revision_file.is_file():
+        candidate = revision_file.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", candidate):
+            revision = candidate
+            identity_kind = "revision-stamped-source-snapshot"
+    return {
+        "path": str(repository),
+        "identity_kind": identity_kind,
+        "revision": revision,
+        "dirty": None,
+        "dirty_entries": [],
+    }
+
+
 def windows_from_manifest(manifest: dict[str, Any]) -> list[Window]:
     """Build the exact integer-tenths grid without binary-float drift."""
     umbrella = manifest["umbrella"]
@@ -229,6 +286,87 @@ def windows_from_manifest(manifest: dict[str, Any]) -> list[Window]:
         Window(index=index, center_tenths=center)
         for index, center in enumerate(centers)
     ]
+
+
+def representative_nve_windows(windows: Sequence[Window]) -> list[Window]:
+    """Select endpoint and central windows for the pre-production NVE gate.
+
+    The three slots sample both ends of the umbrella coordinate and its middle
+    without using any result-dependent choice.  Stable ascending order is
+    retained so the same trajectory always occupies the same batch slot.
+    """
+    if len(windows) < 3:
+        raise ValueError("NVE stability diagnostics require at least three windows")
+    return [windows[0], windows[(len(windows) - 1) // 2], windows[-1]]
+
+
+def topology_contract(manifest: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Return the fail-closed topology identity for one execution mode.
+
+    The QM/MM topology deliberately removes internal classical terms from the
+    16-atom QM region.  Reusing it for a nominal all-MM calculation silently
+    deletes the solute bonded Hamiltonian, so classical and QM/MM inputs must
+    remain separate assets throughout the complete checkpoint chain.
+    """
+    if mode not in {"classical", "qmmm", "qmmm-dpa4c"}:
+        raise ValueError(f"unsupported ETP/ETH execution mode: {mode}")
+    name = "classical" if mode == "classical" else "qmmm"
+    topologies = manifest.get("system", {}).get("topologies")
+    if not isinstance(topologies, dict):
+        raise TypeError("workload manifest has no topology-contract map")
+    contract = topologies.get(name)
+    if not isinstance(contract, dict):
+        raise TypeError(f"workload manifest has no {name} topology contract")
+    required = ("data", "forcefield", "atoms", "bonds", "angles", "dihedrals")
+    missing = [field for field in required if field not in contract]
+    if missing:
+        raise ValueError(
+            f"{name} topology contract is missing: {', '.join(missing)}"
+        )
+    return contract
+
+
+def initial_data_for_mode(
+    manifest: dict[str, Any], tutorial: Path, mode: str
+) -> Path:
+    """Resolve the reviewed initial topology without cross-mode fallback."""
+    contract = topology_contract(manifest, mode)
+    return tutorial / str(contract["data"])
+
+
+def validate_lammps_topology(
+    path: Path, manifest: dict[str, Any], mode: str
+) -> dict[str, int]:
+    """Reject a checkpoint whose bonded topology belongs to another mode."""
+    if not path.is_file():
+        raise ValueError(f"LAMMPS start data is missing: {path}")
+    counts: dict[str, int] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            match = LAMMPS_TOPOLOGY_COUNT.fullmatch(line.rstrip("\n"))
+            if match:
+                counts[match.group(2)] = int(match.group(1))
+            if line_number >= 64 or line.strip() == "Masses":
+                break
+    contract = topology_contract(manifest, mode)
+    expected = {
+        name: int(contract[name])
+        for name in ("atoms", "bonds", "angles", "dihedrals")
+    }
+    # LAMMPS ``write_data`` omits a topology-count header when that count is
+    # zero.  Treat an absent zero-valued section as the canonical count, while
+    # retaining ``None`` for every missing nonzero section so a truncated or
+    # cross-mode checkpoint still fails closed.
+    observed = {
+        name: counts.get(name, 0 if expected[name] == 0 else None)
+        for name in expected
+    }
+    if observed != expected:
+        raise ValueError(
+            f"{mode} start data {path} has topology counts {observed}; "
+            f"expected {expected}. Refusing to mix full-MM and QM/MM states."
+        )
+    return expected
 
 
 def checkpoint_boundary_tolerances(
@@ -265,22 +403,41 @@ def verify_source(
     *,
     allow_unqualified_source: bool,
 ) -> dict[str, Any]:
-    """Verify revision, dirty state, and every external artifact digest."""
+    """Verify source identity and every external runtime artifact digest.
+
+    A Git checkout proves the reviewed revision and dirty state directly.  A
+    stripped source snapshot cannot make that claim, but it may still be used
+    for explicitly private diagnostics after every runtime artifact matches
+    the manifest.  Such snapshots remain unqualified and record no observed
+    revision instead of copying the expected revision into the evidence.
+    """
     tutorial = tutorial.resolve()
     if not tutorial.is_dir():
         raise ValueError(f"tutorial checkout is not a directory: {tutorial}")
 
     source = manifest["source"]
-    revision = git_output(tutorial, "rev-parse", "HEAD")
-    dirty_output = git_output(tutorial, "status", "--porcelain=v1")
-    dirty_entries = dirty_output.splitlines() if dirty_output else []
-    if revision != source["revision"]:
-        raise ValueError(
-            f"tutorial revision {revision} differs from reviewed {source['revision']}"
-        )
+    has_git_metadata = (tutorial / ".git").exists()
+    if has_git_metadata:
+        revision: str | None = git_output(tutorial, "rev-parse", "HEAD")
+        dirty_output = git_output(tutorial, "status", "--porcelain=v1")
+        dirty_entries = dirty_output.splitlines() if dirty_output else []
+        if revision != source["revision"]:
+            raise ValueError(
+                f"tutorial revision {revision} differs from reviewed "
+                f"{source['revision']}"
+            )
+        identity_kind = "git-checkout"
+    else:
+        revision = None
+        dirty_entries = []
+        identity_kind = "artifact-verified-source-snapshot"
     qualification_reasons = [
         reason
         for condition, reason in (
+            (
+                not has_git_metadata,
+                "source snapshot has no Git revision or dirty-state metadata",
+            ),
             (bool(dirty_entries), "source checkout is dirty"),
             (source["license"] == "NOASSERTION", "source license is unresolved"),
             (
@@ -321,7 +478,9 @@ def verify_source(
     return {
         "path": str(tutorial),
         "upstream": source["upstream"],
+        "identity_kind": identity_kind,
         "revision": revision,
+        "expected_revision": source["revision"],
         "dirty": bool(dirty_entries),
         "dirty_entries": dirty_entries,
         "license": source["license"],
@@ -439,6 +598,18 @@ def write_generated(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def generated_lammps_input_path(output: Path, name: str, content: str) -> Path:
+    """Return a content-addressed path for one generated LAMMPS input.
+
+    A rejected stochastic seed attempt reuses the logical invocation name but
+    must use a different deterministic Langevin seed on retry.  Keeping the
+    content digest in the filename preserves every attempted input and lets a
+    retry coexist with the failed record until that record is archived.
+    """
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return output / "generated/inputs" / f"{name}-{digest}.in"
+
+
 def prepare_workspace(
     output: Path,
     tutorial: Path,
@@ -524,7 +695,10 @@ def render_lammps_input(
     deepmd_plugin: Path | None = None,
     deepmd_models: Sequence[Path] = (),
     model_deviation_frequency: int = 0,
-    lammps_execution_backend: str = "host",
+    lammps_execution_backend: str = "kokkos",
+    restart_checkpoint_frequency: int = 0,
+    stop_on_seed_acceptance: bool = False,
+    thermostat_enabled: bool = True,
     run_commands: Sequence[str] | None = None,
     execution_directory: Path | None = None,
 ) -> str:
@@ -542,6 +716,10 @@ def render_lammps_input(
     stages leave it unset and retain the single ``run <steps>`` behavior.
     When ``execution_directory`` is supplied, every runtime artifact is
     rendered relative to that directory and LAMMPS must be launched there.
+
+    ``thermostat_enabled=False`` is reserved for explicit NVE stability
+    diagnostics. It removes both Langevin forcing and periodic center-of-mass
+    momentum removal while retaining the conservative umbrella potential.
     """
     if steps < 0:
         raise ValueError("LAMMPS step count must be nonnegative")
@@ -563,6 +741,15 @@ def render_lammps_input(
         raise ValueError(f"{mode} requires the LAMMPS-DPRc plugin")
     if model_deviation_frequency < 0:
         raise ValueError("model-deviation frequency must be nonnegative")
+    if restart_checkpoint_frequency < 0:
+        raise ValueError("restart-checkpoint frequency must be nonnegative")
+    if stop_on_seed_acceptance:
+        if len(run_windows) != 1:
+            raise ValueError("first-hit seed stopping requires exactly one window")
+        if run_windows[0].colvars_profile != "seed":
+            raise ValueError("first-hit seed stopping requires the seed restraint")
+        if steps <= 0:
+            raise ValueError("first-hit seed stopping requires a positive run length")
     if mode == "qmmm-dpa4c":
         if deepmd_plugin is not None:
             raise ValueError(
@@ -589,7 +776,12 @@ def render_lammps_input(
     dynamics = manifest["dynamics"]
     system = manifest["system"]
     xtb = manifest["xtb"]
-    source_forcefield = tutorial / "lammps/forcefield_qmmm_hybrid.inc"
+    contract = topology_contract(manifest, mode)
+    source_forcefield = tutorial / str(contract["forcefield"])
+    if not source_forcefield.is_file():
+        raise ValueError(
+            f"reviewed {mode} force-field include is missing: {source_forcefield}"
+        )
     workspaces = {item.workspace.resolve() for item in run_windows}
     if len(workspaces) != 1:
         raise ValueError("all synchronized windows must share one generated workspace")
@@ -613,6 +805,7 @@ def render_lammps_input(
     forcefield = path_token(forcefield_path)
 
     for item in run_windows:
+        validate_lammps_topology(item.start_data, manifest, mode)
         item.output_directory.mkdir(parents=True, exist_ok=True)
 
     variables: list[str] = []
@@ -632,6 +825,10 @@ def render_lammps_input(
         "trajectory": [path_token(item.trajectory) for item in run_windows],
         "thermostat_seed": [str(item.seed) for item in run_windows],
     }
+    if restart_checkpoint_frequency > 0:
+        variable_values["checkpoint_restart_root"] = [
+            path_token(item.checkpoint_restart_root) for item in run_windows
+        ]
     for name, values in variable_values.items():
         variables.extend(render_world_variable(name, values))
 
@@ -692,6 +889,12 @@ def render_lammps_input(
         "bond_style harmonic/kk" if kokkos_device else "bond_style harmonic",
         "angle_style harmonic/kk" if kokkos_device else "angle_style harmonic",
     ])
+    if mode == "classical":
+        commands.append(
+            "dihedral_style harmonic/kk"
+            if kokkos_device
+            else "dihedral_style harmonic"
+        )
 
     if mode == "classical" and classical_backend == "upstream-gpu":
         commands.extend(
@@ -732,7 +935,11 @@ def render_lammps_input(
             [
                 pair_style,
                 f"include {forcefield}",
-                "pair_coeff 6*7 6*7 tip4p/long/dprc/batch",
+                (
+                    "pair_coeff * * tip4p/long/dprc/batch"
+                    if mode == "classical"
+                    else "pair_coeff 6*7 6*7 tip4p/long/dprc/batch"
+                ),
             ]
         )
         if mode == "qmmm-dpa4c":
@@ -749,6 +956,22 @@ def render_lammps_input(
         )
         if mode == "classical":
             commands.append("fix classical all dprc/classical/batch")
+
+    if mode == "qmmm-dpa4c":
+        # LAMMPS reports the sum of hybrid-overlay van der Waals-style
+        # energies as ``evdwl``.  Keep the classical Lennard-Jones and DPA4c
+        # correction publications independently observable so single-window
+        # versus batched qualification can identify the responsible backend
+        # instead of inferring it from their potentially cancelling sum.
+        commands.extend(
+            [
+                "compute dprc_lj_energy all pair lj/cut/dprc/batch evdwl",
+                (
+                    "compute dprc_correction_energy all pair "
+                    f"{deepmd_pair_style} evdwl"
+                ),
+            ]
+        )
 
     commands.extend(
         [
@@ -776,8 +999,15 @@ def render_lammps_input(
         )
 
     thermo_fields = (
-        "step temp pe etotal evdwl etail ecoul ebond eangle elong "
+        "step temp pe etotal evdwl etail ecoul ebond eangle "
+        + ("edihed " if mode == "classical" else "")
+        + "elong "
         + ("f_qmmm " if mode != "classical" else "")
+        + (
+            "c_dprc_lj_energy c_dprc_correction_energy "
+            if mode == "qmmm-dpa4c"
+            else ""
+        )
         + "f_restraints"
     )
     commands.extend([
@@ -787,25 +1017,73 @@ def render_lammps_input(
             else "fix water_shake water shake 1.0e-6 200 0 b 1 a 1"
         ),
         "fix integrate all nve/kk" if kokkos_device else "fix integrate all nve",
-        (
-            f"fix thermostat all {'langevin/kk' if kokkos_device else 'langevin'} "
-            f"{dynamics['temperature_kelvin']} "
-            f"{dynamics['temperature_kelvin']} {dynamics['langevin_damping_fs']} "
-            "${thermostat_seed}"
-        ),
-        (
-            "fix remove_com all momentum/kk 1000 linear 1 1 1"
-            if kokkos_device
-            else "fix remove_com all momentum 1000 linear 1 1 1"
-        ),
+    ])
+    if thermostat_enabled:
+        commands.extend([
+            (
+                f"fix thermostat all "
+                f"{'langevin/kk' if kokkos_device else 'langevin'} "
+                f"{dynamics['temperature_kelvin']} "
+                f"{dynamics['temperature_kelvin']} "
+                f"{dynamics['langevin_damping_fs']} "
+                "${thermostat_seed}"
+            ),
+            (
+                "fix remove_com all momentum/kk 1000 linear 1 1 1"
+                if kokkos_device
+                else "fix remove_com all momentum 1000 linear 1 1 1"
+            ),
+        ])
+    commands.extend([
         (
             f"fix restraints all {'colvars/kk' if kokkos_device else 'colvars'} "
             "${colvars_config} output ${colvars_output}"
         ),
         "fix_modify restraints energy yes",
-        f"timestep {float(dynamics['timestep_fs']) / 1000.0:.6f}",
+    ])
+    if stop_on_seed_acceptance:
+        item = run_windows[0]
+        acceptance = manifest["protocol"]["seed_acceptance"]
+        angle_center = float(manifest["umbrella"]["attack_angle"]["center_degree"])
+        reaction_tolerance = float(
+            acceptance["max_abs_reaction_coordinate_error_angstrom"]
+        )
+        angle_tolerance = float(
+            acceptance["max_abs_attack_angle_error_degree"]
+        )
+        check_frequency = int(dynamics["colvars_frequency_steps"])
+        if check_frequency <= 0:
+            raise ValueError("Colvars frequency must be positive for first-hit stopping")
+        # Fix colvars exposes the current scalar CVs as rows of its global
+        # array.  Evaluating the reviewed gate from that array lets LAMMPS
+        # stop the stochastic trajectory in the same process and publish the
+        # exact accepted state; no chaotic GPU trajectory replay is involved.
+        commands.extend(
+            [
+                (
+                    'variable seed_gate_reached equal "'
+                    f"(abs(f_restraints[1][1]-({item.window.center:.17g})) <= "
+                    f"{reaction_tolerance:.17g}) && "
+                    f"(abs(f_restraints[2][1]-({angle_center:.17g})) <= "
+                    f'{angle_tolerance:.17g})"'
+                ),
+                (
+                    f"fix seed_first_hit all halt {check_frequency} "
+                    "v_seed_gate_reached != 0 error soft message yes"
+                ),
+            ]
+        )
+    commands.extend([
+        # Under ``units real`` LAMMPS already expresses time in femtoseconds.
+        # The manifest value is explicitly named ``timestep_fs``; converting
+        # it to picoseconds here would silently shorten every scientific stage
+        # by a factor of 1000.
+        f"timestep {float(dynamics['timestep_fs']):.6f}",
         f"neighbor {dynamics['neighbor_skin_angstrom']} bin",
-        f"neigh_modify every {dynamics['neighbor_every']} delay 0 check yes",
+        (
+            f"neigh_modify every {dynamics['neighbor_every']} delay 0 check "
+            f"{'yes' if dynamics.get('neighbor_check', True) else 'no'}"
+        ),
         f"thermo {dynamics['thermo_frequency_steps']}",
         f"thermo_style custom {thermo_fields}",
         "thermo_modify format float %.12g lost error flush yes",
@@ -819,6 +1097,14 @@ def render_lammps_input(
                 ),
                 "dump_modify trajectory sort id pbc yes",
             ]
+        )
+    if restart_checkpoint_frequency > 0:
+        # With the production every-step/check-no neighbor policy, these
+        # writes do not add a new rebuild point and therefore do not perturb
+        # the pilot trajectory.  A single restart root makes LAMMPS append the
+        # absolute timestep and preserve every Colvars-frequency checkpoint.
+        commands.append(
+            f"restart {restart_checkpoint_frequency} ${{checkpoint_restart_root}}"
         )
     commands.extend(run_commands if run_commands is not None else [f"run {steps}"])
     commands.extend(
@@ -887,6 +1173,28 @@ def parse_colvars(
     return final
 
 
+def completed_steps_for_record(
+    *,
+    requested_steps: int,
+    timestep_offset: int,
+    final_colvars_step: float,
+    stop_on_seed_acceptance: bool,
+) -> int:
+    """Return actual MD steps without mistaking sparse CV output for progress.
+
+    Ordinary LAMMPS runs complete their requested length even when that length
+    is not a multiple of the Colvars output frequency.  Only a first-hit seed
+    run can end early, in which case the halt and Colvars checks share the same
+    frequency and the final sampled timestep is the exact stopping point.
+    """
+    if not stop_on_seed_acceptance:
+        return requested_steps
+    completed = final_colvars_step - timestep_offset
+    if not float(completed).is_integer():
+        raise ValueError("first-hit completed step is not integral")
+    return int(completed)
+
+
 def merge_colvars(
     paths: Sequence[Path],
     reaction_tolerance: float = 0.0,
@@ -935,6 +1243,177 @@ def seed_for(
     return 1 + seed % 900_000_000
 
 
+def seed_attempt_schedule(
+    manifest: dict[str, Any], maximum_attempts: int
+) -> tuple[int, ...]:
+    """Return the exact adaptive seed-walk length for every allowed attempt.
+
+    A difficult umbrella center may require time to cross a local barrier even
+    under the stronger transient seed restraint.  Retrying only the Langevin
+    seed at one short duration does not address that failure mode, so the
+    manifest declares a reviewed, finite multiplier schedule.  The CLI may
+    select a prefix but cannot invent attempts beyond that declared protocol.
+    """
+    if maximum_attempts < 1:
+        raise ValueError("--seed-max-attempts must be positive")
+    protocol = manifest["protocol"]
+    base_steps = int(protocol["seed_walk_steps_per_center"])
+    raw_multipliers = protocol.get("seed_walk_attempt_step_multipliers")
+    if not isinstance(raw_multipliers, list) or not raw_multipliers:
+        raise ValueError(
+            "seed_walk_attempt_step_multipliers must be a nonempty list"
+        )
+    if any(
+        isinstance(multiplier, bool)
+        or not isinstance(multiplier, int)
+        or multiplier < 1
+        for multiplier in raw_multipliers
+    ):
+        raise ValueError(
+            "seed_walk_attempt_step_multipliers must contain positive integers"
+        )
+    if maximum_attempts > len(raw_multipliers):
+        raise ValueError(
+            "--seed-max-attempts exceeds the manifest's reviewed adaptive "
+            "seed schedule"
+        )
+    return tuple(
+        base_steps * multiplier
+        for multiplier in raw_multipliers[:maximum_attempts]
+    )
+
+
+def seed_attempt_metadata(
+    manifest: dict[str, Any],
+    windows: Sequence[Window],
+    *,
+    attempt_index: int,
+    step_schedule: Sequence[int],
+) -> dict[str, Any]:
+    """Describe one seed attempt completely enough for strict resumption."""
+    if attempt_index < 0 or attempt_index >= len(step_schedule):
+        raise ValueError("seed attempt index is outside the reviewed schedule")
+    base_steps = int(manifest["protocol"]["seed_walk_steps_per_center"])
+    scheduled_steps = int(step_schedule[attempt_index])
+    if scheduled_steps < base_steps or scheduled_steps % base_steps != 0:
+        raise ValueError("adaptive seed steps are not an integer base-step multiple")
+    return {
+        "schema_version": 1,
+        "attempt_index": attempt_index,
+        "attempt_number": attempt_index + 1,
+        "maximum_attempts": len(step_schedule),
+        "base_steps_per_center": base_steps,
+        "step_multiplier": scheduled_steps // base_steps,
+        "scheduled_steps": scheduled_steps,
+        "step_schedule": [int(steps) for steps in step_schedule],
+        "restart_policy": "unchanged-accepted-parent",
+        "thermostat_seed_policy": "distinct-deterministic-per-attempt-and-window",
+        "thermostat_seeds": {
+            window.tag: seed_for(manifest, window, 3, trial=attempt_index)
+            for window in windows
+        },
+    }
+
+
+def seed_row_is_accepted(
+    manifest: dict[str, Any], window: Window, row: dict[str, float]
+) -> bool:
+    """Return whether one sampled seed configuration satisfies the fixed gate."""
+    acceptance = manifest["protocol"]["seed_acceptance"]
+    angle_center = float(manifest["umbrella"]["attack_angle"]["center_degree"])
+    return (
+        abs(float(row["reaction_coordinate"]) - window.center)
+        <= float(acceptance["max_abs_reaction_coordinate_error_angstrom"])
+        and abs(float(row["attack_angle"]) - angle_center)
+        <= float(acceptance["max_abs_attack_angle_error_degree"])
+    )
+
+
+def first_seed_hitting_row(
+    manifest: dict[str, Any], window: Window, colvars_path: Path
+) -> dict[str, float] | None:
+    """Select the earliest positive-time Colvars sample that passes the seed gate."""
+    return next(
+        (
+            row
+            for row in parse_colvars_rows(colvars_path)
+            if row["step"] > 0.0 and seed_row_is_accepted(manifest, window, row)
+        ),
+        None,
+    )
+
+
+def seed_capture_metadata(
+    manifest: dict[str, Any],
+    window: Window,
+    *,
+    attempt_index: int,
+    step_schedule: Sequence[int],
+    selected_row: dict[str, float],
+) -> dict[str, Any]:
+    """Describe publication of the first accepted pilot restart checkpoint."""
+    pilot = seed_attempt_metadata(
+        manifest,
+        [window],
+        attempt_index=attempt_index,
+        step_schedule=step_schedule,
+    )
+    selected_step = int(selected_row["step"])
+    if selected_step <= 0 or selected_step > pilot["scheduled_steps"]:
+        raise ValueError("seed capture step is outside its pilot trajectory")
+    return {
+        "schema_version": 1,
+        "strategy": "periodic-restart-hitting-time-capture",
+        "selection_policy": "earliest-positive-qualified-colvars-sample",
+        "pilot_attempt": pilot,
+        "selected_step": selected_step,
+        "selected_values": {
+            "step": float(selected_row["step"]),
+            "reaction_coordinate": float(selected_row["reaction_coordinate"]),
+            "attack_angle": float(selected_row["attack_angle"]),
+        },
+        "thermostat_seed": pilot["thermostat_seeds"][window.tag],
+        "restart_policy": "exact-pilot-binary-restart",
+    }
+
+
+def seed_first_hit_metadata(
+    manifest: dict[str, Any],
+    window: Window,
+    *,
+    attempt_index: int,
+    step_schedule: Sequence[int],
+    selected_row: dict[str, float],
+) -> dict[str, Any]:
+    """Describe an accepted state stopped and written by its pilot process."""
+    attempt = seed_attempt_metadata(
+        manifest,
+        [window],
+        attempt_index=attempt_index,
+        step_schedule=step_schedule,
+    )
+    selected_step = int(selected_row["step"])
+    if selected_step <= 0 or selected_step > attempt["scheduled_steps"]:
+        raise ValueError("seed first-hit step is outside its pilot trajectory")
+    return {
+        "schema_version": 1,
+        "strategy": "in-process-first-hitting-time-capture",
+        "selection_policy": "earliest-positive-qualified-colvars-sample",
+        "pilot_attempt": attempt,
+        "selected_step": selected_step,
+        "selected_values": {
+            "step": float(selected_row["step"]),
+            "reaction_coordinate": float(selected_row["reaction_coordinate"]),
+            "attack_angle": float(selected_row["attack_angle"]),
+        },
+        "thermostat_seed": attempt["thermostat_seeds"][window.tag],
+        "halt_check_frequency_steps": int(
+            manifest["dynamics"]["colvars_frequency_steps"]
+        ),
+        "state_publication_policy": "atomic-byte-copy-of-same-process-final-state",
+    }
+
+
 def command_output(
     command: Sequence[str], environment: dict[str, str] | None = None
 ) -> str | None:
@@ -964,6 +1443,85 @@ def resolve_executable(path: Path) -> Path:
     return Path(discovered).resolve()
 
 
+def validate_canonical_dprc_artifact(path: Path) -> dict[str, Any]:
+    """Require the exact graph-build contract consumed by the LAMMPS plugin.
+
+    The compact DPA4c kernel has no runtime pair mask.  A scientifically
+    qualified artifact must therefore declare that its redundant descriptor
+    exclusion was removed and that all MM environment--environment edges are
+    omitted by the caller before inference.
+    """
+    try:
+        with zipfile.ZipFile(path) as archive:
+            metadata_names = [
+                name
+                for name in archive.namelist()
+                if name.endswith("/extra/metadata.json")
+            ]
+            model_names = [
+                name
+                for name in archive.namelist()
+                if name.endswith("/extra/model.json")
+            ]
+            if len(metadata_names) != 1 or len(model_names) != 1:
+                raise ValueError(
+                    "must contain exactly one metadata.json and model.json"
+                )
+            metadata = json.loads(archive.read(metadata_names[0]))
+            model_json = json.loads(archive.read(model_names[0]))
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid DPA4c canonical artifact {path}: {error}") from error
+
+    required = {
+        "lower_input_kind": "dpa4c_canonical",
+        "graph_edge_dtype": "float32",
+        "canonical_index_dtype": "uint32",
+        "dprc_graph_policy": DPA4C_DPRC_GRAPH_POLICY,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": metadata.get(key)}
+        for key, expected in required.items()
+        if metadata.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"DPA4c canonical metadata mismatch: {mismatches}")
+    type_map = metadata.get("type_map")
+    if not isinstance(type_map, list) or not all(
+        isinstance(name, str) and name for name in type_map
+    ):
+        raise ValueError("DPA4c canonical metadata has an invalid type_map")
+    try:
+        environment_indices = [
+            type_map.index(name) for name in DPA4C_DPRC_ENVIRONMENT_TYPES
+        ]
+    except ValueError as error:
+        raise ValueError("DPA4c canonical type_map requires OW and HW") from error
+    expected_pairs = sorted(
+        [min(first, second), max(first, second)]
+        for position, first in enumerate(environment_indices)
+        for second in environment_indices[position:]
+    )
+    if metadata.get("dprc_environment_type_names") != list(
+        DPA4C_DPRC_ENVIRONMENT_TYPES
+    ):
+        raise ValueError("DPA4c artifact declares different environment type names")
+    if metadata.get("dprc_environment_type_indices") != environment_indices:
+        raise ValueError("DPA4c artifact environment indices disagree with type_map")
+    if metadata.get("pair_exclude_types") != expected_pairs:
+        raise ValueError(
+            "DPA4c artifact pair exclusions do not exactly cover MM--MM pairs"
+        )
+    serialized = model_json.get("model")
+    descriptor = serialized.get("descriptor") if isinstance(serialized, dict) else None
+    if not isinstance(descriptor, dict) or descriptor.get("exclude_types") != []:
+        raise ValueError(
+            "DPA4c canonical deployment must remove redundant descriptor exclusions"
+        )
+    if serialized.get("pair_exclude_types") != expected_pairs:
+        raise ValueError("DPA4c model.json lost the MM--MM exclusion contract")
+    return metadata
+
+
 def validate_execution_policy(
     *,
     mode: str,
@@ -972,16 +1530,10 @@ def validate_execution_policy(
     model_deviation_frequency: int,
     dpa4c_models_qualified: bool,
     allow_unqualified_dpa4c_models: bool,
-    lammps_execution_backend: str = "host",
 ) -> None:
     """Fail closed on ambiguous or scientifically mislabeled DPRc inputs."""
-    if mode not in {"qmmm", "qmmm-dpa4c"}:
+    if mode not in {"classical", "qmmm", "qmmm-dpa4c"}:
         raise ValueError(f"unsupported production execution mode: {mode}")
-    if lammps_execution_backend not in {"host", "kokkos"}:
-        raise ValueError(
-            "unsupported LAMMPS execution backend: "
-            f"{lammps_execution_backend}"
-        )
     if model_deviation_frequency < 0:
         raise ValueError("--model-deviation-frequency must be nonnegative")
     if dpa4c_models_qualified and allow_unqualified_dpa4c_models:
@@ -989,7 +1541,7 @@ def validate_execution_policy(
             "--dpa4c-models-qualified and "
             "--allow-unqualified-dpa4c-models are mutually exclusive"
         )
-    if mode == "qmmm":
+    if mode in {"classical", "qmmm"}:
         if (
             deepmd_plugin is not None
             or deepmd_models
@@ -1025,6 +1577,8 @@ def validate_execution_policy(
             "qmmm-dpa4c requires either --dpa4c-models-qualified or the explicit "
             "diagnostic opt-in --allow-unqualified-dpa4c-models"
         )
+    if dpa4c_models_qualified:
+        validate_canonical_dprc_artifact(deepmd_models[0])
 
 
 def execution_record(
@@ -1033,7 +1587,8 @@ def execution_record(
     model_deviation_frequency: int,
     dpa4c_models_qualified: bool,
     allow_unqualified_dpa4c_models: bool,
-    lammps_execution_backend: str = "host",
+    lammps_execution_backend: str = "kokkos",
+    thermostat_enabled: bool = True,
 ) -> dict[str, Any]:
     """Describe the force composition and model-qualification boundary."""
     if lammps_execution_backend not in {"host", "kokkos"}:
@@ -1045,6 +1600,13 @@ def execution_record(
         "mode": mode,
         "lammps_execution_backend": lammps_execution_backend,
     }
+    if not thermostat_enabled:
+        record["dynamics"] = {
+            "ensemble": "NVE",
+            "thermostat": "disabled",
+            "center_of_mass_momentum_removal": "disabled",
+            "umbrella_restraints": "enabled",
+        }
     if mode == "qmmm-dpa4c":
         record["dprc_schedule"] = {
             "primary_model_index": 0,
@@ -1106,6 +1668,35 @@ def build_runtime_environment(
         selected["DP_INTRA_OP_PARALLELISM_THREADS"] = "1"
         selected["DP_INTER_OP_PARALLELISM_THREADS"] = "1"
     return environment, selected
+
+
+def runtime_environment_contract(
+    selected_environment: object,
+) -> dict[str, str] | None:
+    """Return the cross-invocation environment identity.
+
+    Slurm may bind two dependent jobs to different physical GPU ordinals on
+    the same qualified node.  ``CUDA_VISIBLE_DEVICES`` must therefore remain
+    recorded for each invocation, but its value is a scheduler-local launch
+    detail rather than a scientific dependency of an accepted checkpoint.
+    Loader paths and thread/launcher controls remain part of the strict
+    contract because changing any of them can change the executed runtime.
+    """
+    if not isinstance(selected_environment, dict):
+        return None
+    if not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in selected_environment.items()
+    ):
+        return None
+    cuda_visible_devices = selected_environment.get("CUDA_VISIBLE_DEVICES")
+    if not cuda_visible_devices:
+        return None
+    return {
+        key: value
+        for key, value in selected_environment.items()
+        if key != "CUDA_VISIBLE_DEVICES"
+    }
 
 
 def runtime_record(
@@ -1255,85 +1846,22 @@ def verify_loaded_deepmd_c(
     }
 
 
-def reviewed_dependency_record(
-    repository_root: Path, dependency: dict[str, Any]
-) -> dict[str, Any]:
-    """Record whether one checkout exactly matches its reviewed dependency pin."""
-    repository = (repository_root / dependency["path"]).resolve()
-    record: dict[str, Any] = {
-        "path": str(repository),
-        "required": bool(dependency["required"]),
-        "expected_revision": dependency["revision"],
-        "available": repository.is_dir(),
-        "revision_matches": False,
-        "clean": False,
-        "artifacts_match": False,
-        "publication_qualified": False,
-        "qualification_reasons": [],
-    }
-    if not record["available"]:
-        record["qualification_reasons"].append("checkout is unavailable")
-        return record
-
-    record["revision"] = git_output(repository, "rev-parse", "HEAD")
-    record["revision_matches"] = (
-        record["revision"] == record["expected_revision"]
-    )
-    dirty_output = git_output(
-        repository, "status", "--porcelain=v1", "--untracked-files=all"
-    )
-    record["dirty"] = bool(dirty_output)
-    record["clean"] = not record["dirty"]
-    record["dirty_entries"] = dirty_output.splitlines() if dirty_output else []
-
-    artifacts: list[dict[str, Any]] = []
-    artifacts_match = True
-    for expected in dependency.get("artifacts", []):
-        path = repository / expected["path"]
-        item: dict[str, Any] = {
-            "relative_path": expected["path"],
-            "expected_sha256": expected["sha256"],
-            "available": path.is_file(),
-            "matches": False,
-        }
-        if item["available"]:
-            item["sha256"] = sha256(path)
-            item["matches"] = item["sha256"] == item["expected_sha256"]
-        artifacts_match = artifacts_match and item["matches"]
-        artifacts.append(item)
-    record["artifacts"] = artifacts
-    record["artifacts_match"] = artifacts_match
-
-    if not record["revision_matches"]:
-        record["qualification_reasons"].append("revision differs from reviewed pin")
-    if not record["clean"]:
-        record["qualification_reasons"].append("checkout is dirty")
-    if not record["artifacts_match"]:
-        record["qualification_reasons"].append("reviewed artifact bytes differ")
-    record["publication_qualified"] = not record["qualification_reasons"]
-    return record
-
-
 def project_record(manifest_path: Path, output: Path) -> dict[str, Any]:
-    """Identify the project and every required reviewed dependency checkout."""
-    revision = git_output(PROJECT_ROOT, "rev-parse", "HEAD")
-    dirty_output = git_output(PROJECT_ROOT, "status", "--porcelain=v1")
+    """Identify the dirty development runner that produced diagnostic data."""
+    project = source_tree_record(PROJECT_ROOT)
     provenance = output / "provenance.json"
-    dependency_manifest = PROJECT_ROOT / "config/dependencies.json"
-    dependency_payload = json.loads(dependency_manifest.read_text(encoding="utf-8"))
-    dependencies = {
-        dependency["name"]: reviewed_dependency_record(PROJECT_ROOT, dependency)
-        for dependency in dependency_payload["dependencies"]
-        if dependency["required"]
-    }
-    dependencies_qualified = all(
-        record["publication_qualified"] for record in dependencies.values()
+    dependencies = {}
+    for name, repository in (
+        ("lammps", PROJECT_ROOT.parent / "lammps"),
+        ("xtbloom", PROJECT_ROOT.parent / "xtbloom"),
+    ):
+        if repository.is_dir():
+            dependencies[name] = source_tree_record(repository)
+    source_evidence_qualified = project["dirty"] is False and all(
+        dependency["dirty"] is False for dependency in dependencies.values()
     )
     return {
-        "path": str(PROJECT_ROOT),
-        "revision": revision,
-        "dirty": bool(dirty_output),
-        "dirty_entries": dirty_output.splitlines() if dirty_output else [],
+        **project,
         "runner": {
             "path": str(Path(__file__).resolve()),
             "sha256": sha256(Path(__file__).resolve()),
@@ -1342,19 +1870,13 @@ def project_record(manifest_path: Path, output: Path) -> dict[str, Any]:
             "path": str(manifest_path.resolve()),
             "sha256": sha256(manifest_path),
         },
-        "dependency_manifest": {
-            "path": str(dependency_manifest.resolve()),
-            "sha256": sha256(dependency_manifest),
-        },
         "provenance": {
             "path": str(provenance.resolve()),
             "sha256": sha256(provenance),
         },
         "dependencies": dependencies,
         "qualification": (
-            "clean-source"
-            if not dirty_output and dependencies_qualified
-            else "private-diagnostic"
+            "clean-source" if source_evidence_qualified else "private-diagnostic"
         ),
     }
 
@@ -1369,6 +1891,40 @@ def artifact_matches(record: dict[str, Any] | None, path: Path) -> bool:
     )
 
 
+def restart_checkpoint_timesteps(
+    *, timestep_offset: int, steps: int, frequency: int
+) -> list[int]:
+    """Return every periodic-restart timestep expected during one run.
+
+    LAMMPS does not write a periodic restart on the first timestep of a run.
+    The first expected checkpoint is therefore the first positive multiple of
+    ``frequency`` after ``timestep_offset``.
+    """
+    if frequency <= 0:
+        return []
+    completed = timestep_offset + steps
+    first = (timestep_offset // frequency + 1) * frequency
+    return list(range(first, completed + 1, frequency))
+
+
+def restart_checkpoint_paths(
+    item: RunWindow,
+    *,
+    timestep_offset: int,
+    steps: int,
+    frequency: int,
+) -> list[tuple[int, Path]]:
+    """Return timesteps and paths for one window's periodic restarts."""
+    return [
+        (timestep, Path(f"{item.checkpoint_restart_root}.{timestep}"))
+        for timestep in restart_checkpoint_timesteps(
+            timestep_offset=timestep_offset,
+            steps=steps,
+            frequency=frequency,
+        )
+    ]
+
+
 def record_is_resumable(
     path: Path,
     run_windows: Sequence[RunWindow],
@@ -1377,6 +1933,8 @@ def record_is_resumable(
     steps: int,
     timestep_offset: int,
     trajectory_frequency: int,
+    restart_checkpoint_frequency: int = 0,
+    stop_on_seed_acceptance: bool = False,
     ranks_per_window: int,
     lammps: Path,
     plugin: Path,
@@ -1395,7 +1953,9 @@ def record_is_resumable(
     model_deviation_frequency: int = 0,
     dpa4c_models_qualified: bool = False,
     allow_unqualified_dpa4c_models: bool = False,
-    lammps_execution_backend: str = "host",
+    lammps_execution_backend: str = "kokkos",
+    thermostat_enabled: bool = True,
+    seed_attempt: dict[str, Any] | None = None,
 ) -> bool:
     """Accept a checkpoint only when its complete dependency chain matches."""
     if not path.is_file():
@@ -1418,7 +1978,10 @@ def record_is_resumable(
         or record.get("timestep_offset") != timestep_offset
         or record.get("worlds") != len(run_windows)
         or record.get("ranks_per_window") != ranks_per_window
-        or record.get("selected_environment") != selected_environment
+        or runtime_environment_contract(record.get("selected_environment"))
+        != runtime_environment_contract(selected_environment)
+        or record.get("environment_contract")
+        != runtime_environment_contract(record.get("selected_environment"))
         or not artifact_matches(record.get("input"), input_path)
         or record.get("execution", {"mode": "qmmm"})
         != execution_record(
@@ -1427,7 +1990,13 @@ def record_is_resumable(
             dpa4c_models_qualified=dpa4c_models_qualified,
             allow_unqualified_dpa4c_models=allow_unqualified_dpa4c_models,
             lammps_execution_backend=lammps_execution_backend,
+            thermostat_enabled=thermostat_enabled,
         )
+        or record.get("seed_attempt") != seed_attempt
+        or record.get("restart_checkpoint_frequency_steps", 0)
+        != restart_checkpoint_frequency
+        or record.get("stop_on_seed_acceptance", False)
+        != stop_on_seed_acceptance
     ):
         return False
     runtime = record.get("runtime", {})
@@ -1544,6 +2113,29 @@ def record_is_resumable(
             required_outputs.append(
                 artifact_matches(outputs.get("model_deviation"), item.model_deviation)
             )
+        checkpoints = outputs.get("restart_checkpoints")
+        if restart_checkpoint_frequency > 0:
+            expected_checkpoints = restart_checkpoint_paths(
+                item,
+                timestep_offset=timestep_offset,
+                steps=steps,
+                frequency=restart_checkpoint_frequency,
+            )
+            if not isinstance(checkpoints, list) or len(checkpoints) != len(
+                expected_checkpoints
+            ):
+                return False
+            for identity, (timestep, checkpoint_path) in zip(
+                checkpoints, expected_checkpoints, strict=True
+            ):
+                if (
+                    not isinstance(identity, dict)
+                    or identity.get("timestep") != timestep
+                    or not artifact_matches(identity, checkpoint_path)
+                ):
+                    return False
+        elif checkpoints is not None:
+            return False
         if not all(required_outputs):
             return False
     expected_order = [item.window.tag for item in run_windows]
@@ -1590,6 +2182,17 @@ def validate_invocation_record_current(
         ) from error
     if record.get("status") != "passed":
         raise ValueError(f"invocation did not pass: {record_path}")
+    restart_checkpoint_frequency = record.get(
+        "restart_checkpoint_frequency_steps", 0
+    )
+    if (
+        isinstance(restart_checkpoint_frequency, bool)
+        or not isinstance(restart_checkpoint_frequency, int)
+        or restart_checkpoint_frequency < 0
+    ):
+        raise ValueError(
+            f"invocation has invalid restart checkpoint frequency: {record_path}"
+        )
     wall_seconds = record.get("wall_seconds")
     if (
         not isinstance(wall_seconds, (int, float))
@@ -1610,7 +2213,7 @@ def validate_invocation_record_current(
         common.get("allow_unqualified_dpa4c_models", False)
     )
     lammps_execution_backend = str(
-        common.get("lammps_execution_backend", "host")
+        common.get("lammps_execution_backend", "kokkos")
     )
     expected_execution = execution_record(
         mode=mode,
@@ -1618,6 +2221,7 @@ def validate_invocation_record_current(
         dpa4c_models_qualified=dpa4c_models_qualified,
         allow_unqualified_dpa4c_models=allow_unqualified_dpa4c_models,
         lammps_execution_backend=lammps_execution_backend,
+        thermostat_enabled=bool(common.get("thermostat_enabled", True)),
     )
     if record.get("execution", {"mode": "qmmm"}) != expected_execution:
         raise ValueError(f"execution policy changed since {record_path}")
@@ -1694,7 +2298,14 @@ def validate_invocation_record_current(
     ):
         if not artifact_matches(project.get(name), current):
             raise ValueError(f"{name} identity changed since {record_path}")
-    if record.get("selected_environment") != selected:
+    recorded_contract = runtime_environment_contract(
+        record.get("selected_environment")
+    )
+    if (
+        recorded_contract is None
+        or record.get("environment_contract") != recorded_contract
+        or recorded_contract != runtime_environment_contract(selected)
+    ):
         raise ValueError(f"runtime environment changed since {record_path}")
     loaded = verify_loaded_xtbloom(
         common["plugin"], common["xtbloom_library"], environment
@@ -1749,7 +2360,36 @@ def validate_invocation_record_current(
                     "reaction_coordinate_error_angstrom",
                     "attack_angle_error_degree",
                     "seed_acceptance",
+                    "first_hit",
                 }:
+                    continue
+                if kind == "restart_checkpoints":
+                    expected_steps = restart_checkpoint_timesteps(
+                        timestep_offset=int(record["timestep_offset"]),
+                        steps=int(record["steps_per_window"]),
+                        frequency=restart_checkpoint_frequency,
+                    )
+                    if not isinstance(identity, list) or len(identity) != len(
+                        expected_steps
+                    ):
+                        raise ValueError(
+                            f"restart checkpoints changed for {tag} in {record_path}"
+                        )
+                    for checkpoint, expected_step in zip(
+                        identity, expected_steps, strict=True
+                    ):
+                        if (
+                            not isinstance(checkpoint, dict)
+                            or checkpoint.get("timestep") != expected_step
+                            or "path" not in checkpoint
+                            or not artifact_matches(
+                                checkpoint, Path(checkpoint["path"])
+                            )
+                        ):
+                            raise ValueError(
+                                f"restart checkpoint changed for {tag}/"
+                                f"{expected_step} in {record_path}"
+                            )
                     continue
                 if not isinstance(identity, dict) or "path" not in identity:
                     raise TypeError(
@@ -1782,6 +2422,7 @@ def require_completed_stage(
     maximum_chunk_steps: int,
     trajectory_frequency: int,
     common: dict[str, Any],
+    colvars_profile: str = "sampling",
 ) -> dict[str, Any]:
     """Validate the complete chunk DAG before consuming its final states."""
     if not ledger_path.is_file():
@@ -1797,6 +2438,20 @@ def require_completed_stage(
         raise TypeError("stage validation requires the workload manifest")
     expected_order = [window.tag for window in windows]
     qualification = ledger.get("qualification", "native-chunked")
+    if qualification == "native-first-hit":
+        return require_first_hit_stage(
+            ledger_path,
+            ledger=ledger,
+            stage=stage,
+            windows=windows,
+            expected_start_data=expected_start_data,
+            expected_final_data=expected_final_data,
+            total_steps=total_steps,
+            maximum_chunk_steps=maximum_chunk_steps,
+            trajectory_frequency=trajectory_frequency,
+            common=common,
+            colvars_profile=colvars_profile,
+        )
     if qualification != "native-chunked":
         raise ValueError(f"unsupported stage qualification in {ledger_path}")
     if (
@@ -1805,6 +2460,7 @@ def require_completed_stage(
         or ledger.get("stage") != stage
         or ledger.get("total_steps_per_window") != total_steps
         or ledger.get("maximum_chunk_steps") != maximum_chunk_steps
+        or ledger.get("colvars_profile", "sampling") != colvars_profile
         or ledger.get("window_order") != expected_order
         or ledger.get("series_merge_policy") != series_merge_policy(manifest)
     ):
@@ -1931,16 +2587,580 @@ def require_completed_stage(
     return ledger
 
 
+def require_first_hit_stage(
+    ledger_path: Path,
+    *,
+    ledger: dict[str, Any],
+    stage: str,
+    windows: Sequence[Window],
+    expected_start_data: dict[str, Path],
+    expected_final_data: dict[str, Path],
+    total_steps: int,
+    maximum_chunk_steps: int,
+    trajectory_frequency: int,
+    common: dict[str, Any],
+    colvars_profile: str,
+) -> dict[str, Any]:
+    """Validate a stage whose state is captured at its first accepted sample.
+
+    The anchor is an initialization gate rather than a production trajectory.
+    Its final state must therefore be the same-process first Colvars sample
+    satisfying the fixed seed gate; validating only the requested endpoint
+    would allow a later thermal fluctuation to replace an already-qualified
+    configuration.
+    """
+    expected_order = [window.tag for window in windows]
+    check_frequency = int(common["manifest"]["dynamics"]["colvars_frequency_steps"])
+    if (
+        ledger.get("schema_version") != 1
+        or ledger.get("status") != "passed"
+        or ledger.get("qualification") != "native-first-hit"
+        or ledger.get("stage") != stage
+        or ledger.get("total_steps_per_window") != total_steps
+        or ledger.get("maximum_chunk_steps") != maximum_chunk_steps
+        or ledger.get("colvars_profile") != colvars_profile
+        or ledger.get("window_order") != expected_order
+        or ledger.get("record_kind") != "anchor-first-hit-ledger"
+        or set(ledger.get("outputs", {})) != set(expected_order)
+    ):
+        raise ValueError(f"first-hit stage protocol in {ledger_path} does not match the request")
+    if len(windows) != 1:
+        raise ValueError("native first-hit stages currently require one window")
+
+    record_identity = ledger.get("record")
+    if not isinstance(record_identity, dict) or "path" not in record_identity:
+        raise ValueError(f"first-hit stage record identity is missing: {ledger_path}")
+    record_path = Path(record_identity["path"])
+    if not artifact_matches(record_identity, record_path):
+        raise ValueError(f"first-hit stage invocation changed: {record_path}")
+    record = validate_invocation_record_current(record_path, common)
+    tag = windows[0].tag
+    if (
+        record.get("name") != f"{stage}-first-hit"
+        or record.get("status") != "passed"
+        or record.get("steps_per_window") != total_steps
+        or record.get("timestep_offset") != 0
+        or record.get("worlds") != 1
+        or record.get("window_order") != expected_order
+        or record.get("ranks_per_window") != common["ranks_per_window"]
+        or record.get("stop_on_seed_acceptance") is not True
+        or set(record.get("start_inputs", {})) != {tag}
+        or set(record.get("outputs", {})) != {tag}
+    ):
+        raise ValueError(f"first-hit stage invocation protocol mismatch in {record_path}")
+    if not artifact_matches(record["start_inputs"][tag], expected_start_data[tag]):
+        raise ValueError(f"first-hit stage start changed for {tag}")
+
+    output_record = record["outputs"][tag]
+    if not isinstance(output_record, dict):
+        raise ValueError(f"first-hit stage output is missing for {tag}")
+    expected_data = expected_final_data[tag]
+    if not artifact_matches(output_record.get("data"), expected_data):
+        raise ValueError(f"first-hit stage final state changed for {tag}")
+    if output_record.get("seed_acceptance") is not True:
+        raise ValueError(f"first-hit stage output was not accepted for {tag}")
+    first_hit = output_record.get("first_hit")
+    if not isinstance(first_hit, dict):
+        raise ValueError(f"first-hit evidence is missing for {tag}")
+    completed_steps = first_hit.get("completed_steps")
+    if (
+        isinstance(completed_steps, bool)
+        or not isinstance(completed_steps, int)
+        or completed_steps <= 0
+        or completed_steps > total_steps
+        or completed_steps % check_frequency != 0
+        or first_hit.get("check_frequency_steps") != check_frequency
+        or first_hit.get("scheduled_steps") != total_steps
+        or first_hit.get("accepted_sample_found") is not True
+        or first_hit.get("halted_early") is not (completed_steps < total_steps)
+    ):
+        raise ValueError(f"first-hit stop evidence changed for {tag}")
+    if (
+        record.get("completed_steps_by_window", {}).get(tag) != completed_steps
+        or record.get("aggregate_window_steps") != completed_steps
+    ):
+        raise ValueError(f"first-hit aggregate step count changed for {tag}")
+
+    colvars_identity = output_record.get("colvars")
+    if not isinstance(colvars_identity, dict) or "path" not in colvars_identity:
+        raise ValueError(f"first-hit Colvars identity is missing for {tag}")
+    colvars_path = Path(colvars_identity["path"])
+    selected = first_seed_hitting_row(common["manifest"], windows[0], colvars_path)
+    if selected is None or selected != output_record.get("final_values"):
+        raise ValueError(f"first-hit Colvars selection changed for {tag}")
+    if selected["step"] != float(completed_steps):
+        raise ValueError(f"first-hit Colvars step disagrees with the halted state for {tag}")
+
+    if trajectory_frequency > 0:
+        if "trajectory" not in output_record:
+            raise ValueError(f"first-hit trajectory is missing for {tag}")
+    elif "trajectory" in output_record:
+        raise ValueError(f"unexpected first-hit trajectory for {tag}")
+
+    try:
+        record_wall = float(record["wall_seconds"])
+        ledger_wall = float(ledger["wall_seconds"])
+        ledger_throughput = float(ledger["aggregate_window_steps_per_second"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("first-hit stage performance aggregate is malformed") from error
+    if not math.isclose(record_wall, ledger_wall, rel_tol=1.0e-12, abs_tol=1.0e-9):
+        raise ValueError("first-hit stage wall time differs from its invocation record")
+    expected_throughput = completed_steps / record_wall if record_wall else None
+    if expected_throughput is None or not math.isclose(
+        ledger_throughput, expected_throughput, rel_tol=1.0e-12, abs_tol=1.0e-12
+    ):
+        raise ValueError("first-hit stage throughput is inconsistent")
+    if ledger.get("outputs") != {tag: output_record}:
+        raise ValueError(f"first-hit stage outputs differ from {record_path}")
+    return ledger
+
+
+def validate_hitting_time_seed_round_record(
+    record_path: Path,
+    record: dict[str, Any],
+    *,
+    manifest: dict[str, Any],
+    round_index: int,
+    expected_windows: Sequence[tuple[str, Window]],
+    previous: dict[str, dict[str, str]],
+    step_schedule: Sequence[int],
+    common: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate periodic-restart hitting-time evidence for one seed round."""
+    expected_name = f"seed-round-{round_index + 1:02d}"
+    expected_tags = [window.tag for _, window in expected_windows]
+    if (
+        record.get("schema_version") != 3
+        or record.get("record_kind") != "seed-hitting-time-ledger"
+        or record.get("status") != "passed"
+        or record.get("name") != expected_name
+        or record.get("strategy")
+        != "per-window-periodic-restart-hitting-time-capture"
+        or record.get("selection_policy")
+        != "earliest-positive-qualified-colvars-sample"
+        or record.get("restart_policy")
+        != "exact-pilot-binary-restart-at-colvars-frequency"
+        or record.get("checkpoint_frequency_steps")
+        != int(manifest["dynamics"]["colvars_frequency_steps"])
+        or record.get("window_order") != expected_tags
+        or record.get("worlds") != len(expected_tags)
+        or record.get("ranks_per_window") != common["ranks_per_window"]
+        or record.get("step_schedule") != list(step_schedule)
+        or set(record.get("start_inputs", {})) != set(expected_tags)
+        or set(record.get("outputs", {})) != set(expected_tags)
+        or set(record.get("captures", {})) != set(expected_tags)
+    ):
+        raise ValueError(f"seed hitting-time protocol mismatch in {record_path}")
+
+    for branch, window in expected_windows:
+        tag = window.tag
+        if record["start_inputs"][tag] != previous[branch]:
+            raise ValueError(
+                f"seed branch parent changed before {tag} in {record_path}"
+            )
+        capture = record["captures"][tag]
+        attempt_index = capture.get("attempt_index")
+        if (
+            isinstance(attempt_index, bool)
+            or not isinstance(attempt_index, int)
+            or attempt_index < 0
+            or attempt_index >= len(step_schedule)
+            or capture.get("attempt_number") != attempt_index + 1
+        ):
+            raise ValueError(f"seed capture attempt is invalid for {tag}")
+
+        pilot_identity = capture.get("pilot_record")
+        capture_identity = capture.get("capture_record")
+        if not isinstance(pilot_identity, dict) or "path" not in pilot_identity:
+            raise ValueError(f"seed pilot identity is missing for {tag}")
+        if not isinstance(capture_identity, dict) or "path" not in capture_identity:
+            raise ValueError(f"seed capture identity is missing for {tag}")
+        pilot_path = Path(pilot_identity["path"])
+        captured_path = Path(capture_identity["path"])
+        if not artifact_matches(pilot_identity, pilot_path):
+            raise ValueError(f"seed pilot record changed for {tag}")
+        if not artifact_matches(capture_identity, captured_path):
+            raise ValueError(f"seed capture record changed for {tag}")
+
+        pilot = validate_invocation_record_current(pilot_path, common)
+        expected_pilot_attempt = seed_attempt_metadata(
+            manifest,
+            [window],
+            attempt_index=attempt_index,
+            step_schedule=step_schedule,
+        )
+        expected_pilot_name = (
+            f"seed-pilot-round-{round_index + 1:02d}-{tag}-"
+            f"attempt-{attempt_index + 1:02d}"
+        )
+        if (
+            pilot.get("name") != expected_pilot_name
+            or pilot.get("steps_per_window") != step_schedule[attempt_index]
+            or pilot.get("timestep_offset") != 0
+            or pilot.get("worlds") != 1
+            or pilot.get("window_order") != [tag]
+            or pilot.get("ranks_per_window") != common["ranks_per_window"]
+            or pilot.get("seed_attempt") != expected_pilot_attempt
+            or pilot.get("start_inputs", {}).get(tag) != previous[branch]
+            or pilot.get("restart_checkpoint_frequency_steps")
+            != int(manifest["dynamics"]["colvars_frequency_steps"])
+        ):
+            raise ValueError(f"seed pilot protocol mismatch for {tag}")
+        pilot_colvars = pilot.get("outputs", {}).get(tag, {}).get("colvars")
+        if not isinstance(pilot_colvars, dict) or "path" not in pilot_colvars:
+            raise ValueError(f"seed pilot Colvars identity is missing for {tag}")
+        selected_row = first_seed_hitting_row(
+            manifest, window, Path(pilot_colvars["path"])
+        )
+        if selected_row is None:
+            raise ValueError(f"seed pilot has no accepted configuration for {tag}")
+        expected_capture_attempt = seed_capture_metadata(
+            manifest,
+            window,
+            attempt_index=attempt_index,
+            step_schedule=step_schedule,
+            selected_row=selected_row,
+        )
+        if (
+            capture.get("selected_step")
+            != expected_capture_attempt["selected_step"]
+            or capture.get("selected_values")
+            != expected_capture_attempt["selected_values"]
+            or capture.get("selection_policy")
+            != expected_capture_attempt["selection_policy"]
+        ):
+            raise ValueError(f"seed hitting-time selection changed for {tag}")
+
+        checkpoint_identity = require_restart_checkpoint(
+            pilot, tag, expected_capture_attempt["selected_step"]
+        )
+        if capture.get("checkpoint_restart") != checkpoint_identity:
+            raise ValueError(f"seed checkpoint restart changed for {tag}")
+        conversion_identity = capture.get("checkpoint_conversion_record")
+        if not isinstance(conversion_identity, dict) or "path" not in conversion_identity:
+            raise ValueError(f"seed checkpoint conversion is missing for {tag}")
+        conversion_path = Path(conversion_identity["path"])
+        if not artifact_matches(conversion_identity, conversion_path):
+            raise ValueError(f"seed checkpoint conversion record changed for {tag}")
+        conversion = validate_restart_conversion_record_current(
+            conversion_path,
+            restart_identity=checkpoint_identity,
+            common=common,
+        )
+        converted_start = conversion["output"]
+
+        captured = validate_invocation_record_current(captured_path, common)
+        expected_capture_name = f"seed-capture-round-{round_index + 1:02d}-{tag}"
+        if (
+            captured.get("name") != expected_capture_name
+            or captured.get("steps_per_window") != 0
+            or captured.get("timestep_offset") != 0
+            or captured.get("worlds") != 1
+            or captured.get("window_order") != [tag]
+            or captured.get("ranks_per_window") != common["ranks_per_window"]
+            or captured.get("seed_attempt") != expected_capture_attempt
+            or captured.get("start_inputs", {}).get(tag) != converted_start
+        ):
+            raise ValueError(f"seed capture protocol mismatch for {tag}")
+        output_record = captured.get("outputs", {}).get(tag)
+        expected_output = state_output(common["output"], "seeds", window)
+        if (
+            not isinstance(output_record, dict)
+            or output_record.get("seed_acceptance") is not True
+            or not artifact_matches(output_record.get("data"), expected_output)
+            or record["outputs"][tag] != output_record
+        ):
+            raise ValueError(f"seed capture output changed for {tag}")
+    return record
+
+
+def validate_first_hit_seed_round_record(
+    record_path: Path,
+    record: dict[str, Any],
+    *,
+    manifest: dict[str, Any],
+    round_index: int,
+    expected_windows: Sequence[tuple[str, Window]],
+    previous: dict[str, dict[str, str]],
+    step_schedule: Sequence[int],
+    common: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate same-process first-hit evidence and canonical byte copies."""
+    expected_name = f"seed-round-{round_index + 1:02d}"
+    expected_tags = [window.tag for _, window in expected_windows]
+    check_frequency = int(manifest["dynamics"]["colvars_frequency_steps"])
+    if (
+        record.get("schema_version") != 4
+        or record.get("record_kind") != "seed-first-hit-ledger"
+        or record.get("name") != expected_name
+        or record.get("status") != "passed"
+        or record.get("strategy")
+        != "per-window-in-process-first-hitting-time-capture"
+        or record.get("selection_policy")
+        != "earliest-positive-qualified-colvars-sample"
+        or record.get("state_publication_policy")
+        != "atomic-byte-copy-of-same-process-final-state"
+        or record.get("halt_check_frequency_steps") != check_frequency
+        or record.get("window_order") != expected_tags
+        or record.get("worlds") != len(expected_tags)
+        or record.get("ranks_per_window") != common["ranks_per_window"]
+        or record.get("step_schedule") != list(step_schedule)
+    ):
+        raise ValueError(f"seed first-hit protocol mismatch in {record_path}")
+    for section in ("start_inputs", "outputs", "captures", "attempts_by_window"):
+        if set(record.get(section, {})) != set(expected_tags):
+            raise ValueError(f"seed first-hit {section} changed in {record_path}")
+
+    for branch, window in expected_windows:
+        tag = window.tag
+        if record["start_inputs"][tag] != previous[branch]:
+            raise ValueError(
+                f"seed branch parent changed before {tag} in {record_path}"
+            )
+        attempts = record["attempts_by_window"][tag]
+        capture = record["captures"][tag]
+        selected_attempt = capture.get("attempt_index")
+        if (
+            isinstance(selected_attempt, bool)
+            or not isinstance(selected_attempt, int)
+            or selected_attempt < 0
+            or selected_attempt >= len(step_schedule)
+            or len(attempts) != selected_attempt + 1
+        ):
+            raise ValueError(f"seed first-hit attempt chain is invalid for {tag}")
+
+        accepted_record: dict[str, Any] | None = None
+        accepted_identity: dict[str, str] | None = None
+        for attempt_index, attempt_entry in enumerate(attempts):
+            if (
+                not isinstance(attempt_entry, dict)
+                or attempt_entry.get("attempt_index") != attempt_index
+                or attempt_entry.get("attempt_number") != attempt_index + 1
+            ):
+                raise ValueError(f"seed first-hit attempt order changed for {tag}")
+            identity = attempt_entry.get("record")
+            if not isinstance(identity, dict) or "path" not in identity:
+                raise ValueError(f"seed first-hit record identity is missing for {tag}")
+            invocation_path = Path(identity["path"])
+            if not artifact_matches(identity, invocation_path):
+                raise ValueError(f"seed first-hit record changed for {tag}")
+            invocation = validate_invocation_record_current(invocation_path, common)
+            expected_attempt = seed_attempt_metadata(
+                manifest,
+                [window],
+                attempt_index=attempt_index,
+                step_schedule=step_schedule,
+            )
+            expected_invocation_name = (
+                f"seed-first-hit-round-{round_index + 1:02d}-{tag}-"
+                f"attempt-{attempt_index + 1:02d}"
+            )
+            if (
+                invocation.get("name") != expected_invocation_name
+                or invocation.get("steps_per_window") != step_schedule[attempt_index]
+                or invocation.get("timestep_offset") != 0
+                or invocation.get("worlds") != 1
+                or invocation.get("window_order") != [tag]
+                or invocation.get("ranks_per_window") != common["ranks_per_window"]
+                or invocation.get("seed_attempt") != expected_attempt
+                or invocation.get("stop_on_seed_acceptance") is not True
+                or invocation.get("restart_checkpoint_frequency_steps", 0) != 0
+                or invocation.get("start_inputs", {}).get(tag) != previous[branch]
+            ):
+                raise ValueError(f"seed first-hit invocation mismatch for {tag}")
+            invocation_output = invocation.get("outputs", {}).get(tag)
+            if not isinstance(invocation_output, dict):
+                raise ValueError(f"seed first-hit output is missing for {tag}")
+            accepted = invocation_output.get("seed_acceptance") is True
+            if attempt_entry.get("seed_acceptance") is not accepted:
+                raise ValueError(f"seed first-hit acceptance changed for {tag}")
+            first_hit = invocation_output.get("first_hit")
+            completed_steps = (
+                first_hit.get("completed_steps")
+                if isinstance(first_hit, dict)
+                else None
+            )
+            scheduled_steps = (
+                first_hit.get("scheduled_steps")
+                if isinstance(first_hit, dict)
+                else None
+            )
+            if (
+                not isinstance(first_hit, dict)
+                or isinstance(completed_steps, bool)
+                or not isinstance(completed_steps, int)
+                or isinstance(scheduled_steps, bool)
+                or not isinstance(scheduled_steps, int)
+                or first_hit.get("check_frequency_steps") != check_frequency
+                or scheduled_steps != step_schedule[attempt_index]
+                or attempt_entry.get("completed_steps")
+                != completed_steps
+                or first_hit.get("accepted_sample_found") is not accepted
+                or first_hit.get("halted_early")
+                is not (completed_steps < scheduled_steps)
+                or invocation.get("completed_steps_by_window", {}).get(tag)
+                != completed_steps
+                or invocation.get("aggregate_window_steps") != completed_steps
+            ):
+                raise ValueError(f"seed first-hit stop evidence changed for {tag}")
+            colvars_identity = invocation_output.get("colvars")
+            if not isinstance(colvars_identity, dict) or "path" not in colvars_identity:
+                raise ValueError(f"seed first-hit Colvars identity is missing for {tag}")
+            selected_row = first_seed_hitting_row(
+                manifest, window, Path(colvars_identity["path"])
+            )
+            if accepted:
+                if selected_row != invocation_output.get("final_values"):
+                    raise ValueError(f"seed first-hit final sample changed for {tag}")
+            elif selected_row is not None:
+                raise ValueError(f"rejected seed search contains an accepted hit for {tag}")
+            if attempt_index < selected_attempt and accepted:
+                raise ValueError(f"seed first-hit selection skipped an earlier hit for {tag}")
+            if attempt_index == selected_attempt:
+                if not accepted:
+                    raise ValueError(f"selected seed first-hit attempt failed for {tag}")
+                accepted_record = invocation
+                accepted_identity = identity
+
+        assert accepted_record is not None and accepted_identity is not None
+        accepted_output = accepted_record["outputs"][tag]
+        expected_capture = seed_first_hit_metadata(
+            manifest,
+            window,
+            attempt_index=selected_attempt,
+            step_schedule=step_schedule,
+            selected_row=accepted_output["final_values"],
+        )
+        if (
+            capture.get("attempt_number") != selected_attempt + 1
+            or capture.get("first_hit_record") != accepted_identity
+            or capture.get("selected_step") != expected_capture["selected_step"]
+            or capture.get("selected_values") != expected_capture["selected_values"]
+            or capture.get("selection_policy")
+            != expected_capture["selection_policy"]
+            or capture.get("halt_check_frequency_steps")
+            != expected_capture["halt_check_frequency_steps"]
+            or capture.get("state_publication_policy")
+            != expected_capture["state_publication_policy"]
+            or capture.get("source_data") != accepted_output["data"]
+            or capture.get("source_restart") != accepted_output["restart"]
+        ):
+            raise ValueError(f"seed first-hit capture changed for {tag}")
+
+        expected_data = state_output(common["output"], "seeds", window)
+        expected_restart = expected_data.with_suffix(".restart")
+        published_data = capture.get("published_data")
+        published_restart = capture.get("published_restart")
+        if (
+            not artifact_matches(published_data, expected_data)
+            or not artifact_matches(published_restart, expected_restart)
+            or published_data.get("sha256") != accepted_output["data"].get("sha256")
+            or published_restart.get("sha256")
+            != accepted_output["restart"].get("sha256")
+        ):
+            raise ValueError(f"seed first-hit publication changed for {tag}")
+        expected_output = dict(accepted_output)
+        expected_output["data"] = published_data
+        expected_output["restart"] = published_restart
+        if record["outputs"][tag] != expected_output:
+            raise ValueError(f"seed first-hit ledger output changed for {tag}")
+    return record
+
+
+def validate_seed_round_record(
+    record_path: Path,
+    *,
+    manifest: dict[str, Any],
+    round_index: int,
+    expected_windows: Sequence[tuple[str, Window]],
+    previous: dict[str, dict[str, str]],
+    step_schedule: Sequence[int],
+    common: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one accepted seed round against its adaptive retry protocol."""
+    expected_name = f"seed-round-{round_index + 1:02d}"
+    expected_tags = [window.tag for _, window in expected_windows]
+    try:
+        candidate = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read seed record {record_path}: {error}") from error
+    if candidate.get("record_kind") == "seed-hitting-time-ledger":
+        return validate_hitting_time_seed_round_record(
+            record_path,
+            candidate,
+            manifest=manifest,
+            round_index=round_index,
+            expected_windows=expected_windows,
+            previous=previous,
+            step_schedule=step_schedule,
+            common=common,
+        )
+    if candidate.get("record_kind") == "seed-first-hit-ledger":
+        return validate_first_hit_seed_round_record(
+            record_path,
+            candidate,
+            manifest=manifest,
+            round_index=round_index,
+            expected_windows=expected_windows,
+            previous=previous,
+            step_schedule=step_schedule,
+            common=common,
+        )
+    record = validate_invocation_record_current(record_path, common)
+    metadata = record.get("seed_attempt")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"seed attempt metadata is missing in {record_path}")
+    attempt_index = metadata.get("attempt_index")
+    if isinstance(attempt_index, bool) or not isinstance(attempt_index, int):
+        raise ValueError(f"seed attempt index is invalid in {record_path}")
+    if attempt_index < 0 or attempt_index >= len(step_schedule):
+        raise ValueError(
+            f"seed attempt is outside the reviewed schedule in {record_path}"
+        )
+    expected_metadata = seed_attempt_metadata(
+        manifest,
+        [window for _, window in expected_windows],
+        attempt_index=attempt_index,
+        step_schedule=step_schedule,
+    )
+    if metadata != expected_metadata:
+        raise ValueError(f"seed attempt protocol mismatch in {record_path}")
+    if (
+        record.get("name") != expected_name
+        or record.get("steps_per_window") != step_schedule[attempt_index]
+        or record.get("timestep_offset") != 0
+        or record.get("worlds") != len(expected_windows)
+        or record.get("ranks_per_window") != common["ranks_per_window"]
+        or record.get("window_order") != expected_tags
+        or set(record.get("start_inputs", {})) != set(expected_tags)
+        or set(record.get("outputs", {})) != set(expected_tags)
+    ):
+        raise ValueError(f"seed round protocol mismatch in {record_path}")
+    for branch, window in expected_windows:
+        if record["start_inputs"][window.tag] != previous[branch]:
+            raise ValueError(
+                f"seed branch parent changed before {window.tag} in {record_path}"
+            )
+        expected_output = state_output(common["output"], "seeds", window)
+        output_record = record["outputs"][window.tag]
+        if not artifact_matches(output_record.get("data"), expected_output):
+            raise ValueError(f"seed output changed for {window.tag}")
+        if output_record.get("seed_acceptance") is not True:
+            raise ValueError(f"seed output was not accepted for {window.tag}")
+    return record
+
+
 def require_seed_records(
     output: Path,
     windows: Sequence[Window],
     anchor: Window,
     *,
     anchor_ledger: dict[str, Any],
-    seed_steps: int,
+    manifest: dict[str, Any],
+    step_schedule: Sequence[int],
     common: dict[str, Any],
 ) -> dict[str, Path]:
-    """Validate both ordered seed branches and every parent/output hash edge."""
+    """Validate both adaptive seed branches and every parent/output hash edge."""
     anchor_index = windows.index(anchor)
     lower = list(reversed(windows[:anchor_index]))
     upper = list(windows[anchor_index + 1 :])
@@ -1968,30 +3188,18 @@ def require_seed_records(
             expected_windows.append(("lower", lower[round_index]))
         if round_index < len(upper):
             expected_windows.append(("upper", upper[round_index]))
-        expected_tags = [window.tag for _, window in expected_windows]
-        record = validate_invocation_record_current(record_path, common)
-        if (
-            record.get("name") != f"seed-round-{round_index + 1:02d}"
-            or record.get("steps_per_window") != seed_steps
-            or record.get("timestep_offset") != 0
-            or record.get("worlds") != len(expected_windows)
-            or record.get("ranks_per_window") != common["ranks_per_window"]
-            or record.get("window_order") != expected_tags
-            or set(record.get("start_inputs", {})) != set(expected_tags)
-            or set(record.get("outputs", {})) != set(expected_tags)
-        ):
-            raise ValueError(f"seed round protocol mismatch in {record_path}")
+        record = validate_seed_round_record(
+            record_path,
+            manifest=manifest,
+            round_index=round_index,
+            expected_windows=expected_windows,
+            previous=previous,
+            step_schedule=step_schedule,
+            common=common,
+        )
         for branch, window in expected_windows:
-            if record["start_inputs"][window.tag] != previous[branch]:
-                raise ValueError(
-                    f"seed branch parent changed before {window.tag} in {record_path}"
-                )
             expected_output = state_output(output, "seeds", window)
             output_record = record["outputs"][window.tag]
-            if not artifact_matches(output_record.get("data"), expected_output):
-                raise ValueError(f"seed output changed for {window.tag}")
-            if output_record.get("seed_acceptance") is not True:
-                raise ValueError(f"seed output was not accepted for {window.tag}")
             previous[branch] = output_record["data"]
             accepted[window.tag] = expected_output
     if set(accepted) != {window.tag for window in windows}:
@@ -2001,15 +3209,21 @@ def require_seed_records(
 
 def inspect_dangerous_builds(
     log_directory: Path, expected_worlds: int
-) -> dict[str, int]:
-    """Require one completed dangerous-build summary per partition log."""
-    results: dict[str, int] = {}
+) -> dict[str, int | None]:
+    """Require one completed neighbor-rebuild summary per partition log.
+
+    ``None`` records LAMMPS' exact ``Dangerous builds not checked`` summary.
+    It is accepted only by the caller's stronger every-step rebuild policy;
+    this parser never silently translates an unchecked run into zero events.
+    """
+    results: dict[str, int | None] = {}
     for path in sorted(log_directory.glob("log.lammps*")):
-        matches = DANGEROUS_BUILDS.findall(
-            path.read_text(encoding="utf-8", errors="replace")
-        )
+        text = path.read_text(encoding="utf-8", errors="replace")
+        matches = DANGEROUS_BUILDS.findall(text)
         if matches:
             results[path.name] = int(matches[-1])
+        elif DANGEROUS_BUILDS_NOT_CHECKED in text:
+            results[path.name] = None
     if not results:
         raise ValueError(f"no Dangerous builds summary found under {log_directory}")
     if len(results) != expected_worlds:
@@ -2041,6 +3255,16 @@ def archive_stale_invocation_artifacts(
     archived = output / "superseded" / f"{name}-{time.time_ns()}"
     archived.mkdir(parents=True)
     if record_path.exists():
+        # Preserve a convenient copy beside the superseded record. Generated
+        # inputs are content-addressed and therefore remain immutable, while
+        # this colocated copy keeps each stochastic attempt self-contained.
+        try:
+            stale_record = json.loads(record_path.read_text(encoding="utf-8"))
+            stale_input = Path(stale_record.get("input", {}).get("path", ""))
+        except (OSError, TypeError, json.JSONDecodeError):
+            stale_input = Path()
+        if stale_input.is_file():
+            shutil.copy2(stale_input, archived / "input.lammps")
         record_path.replace(archived / "record.json")
     if populated_logs:
         log_directory.replace(archived / "logs")
@@ -2112,11 +3336,11 @@ def build_lammps_command(
 
 
 def lammps_backend_arguments(backend: str) -> tuple[str, ...]:
-    """Return launcher arguments for the selected LAMMPS backend.
+    """Return launcher arguments for the selected LAMMPS execution backend.
 
     The host path intentionally omits ``-k on``. This prevents non-owner MPI
     ranks from initializing otherwise unused Kokkos CUDA contexts while the
-    GPU-local xTBloom and DeePMD brokers continue to own their CUDA work.
+    GPU-local brokers continue to own their CUDA work through public APIs.
     """
     if backend == "host":
         return ()
@@ -2134,6 +3358,317 @@ def lammps_backend_arguments(backend: str) -> tuple[str, ...]:
             "half",
         )
     raise ValueError(f"unsupported LAMMPS execution backend: {backend}")
+
+
+def require_restart_checkpoint(
+    pilot_record: dict[str, Any], tag: str, selected_step: int
+) -> dict[str, Any]:
+    """Return and revalidate the pilot restart at one accepted Colvars step."""
+    checkpoints = pilot_record.get("outputs", {}).get(tag, {}).get(
+        "restart_checkpoints"
+    )
+    if not isinstance(checkpoints, list):
+        raise ValueError(f"seed pilot has no restart checkpoints for {tag}")
+    matches = [
+        checkpoint
+        for checkpoint in checkpoints
+        if isinstance(checkpoint, dict)
+        and checkpoint.get("timestep") == selected_step
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"seed pilot has no unique restart at step {selected_step} for {tag}"
+        )
+    identity = matches[0]
+    path = Path(str(identity.get("path", "")))
+    if not artifact_matches(identity, path):
+        raise ValueError(
+            f"seed pilot restart changed at step {selected_step} for {tag}"
+        )
+    return identity
+
+
+def archive_stale_restart_conversion(
+    *,
+    name: str,
+    output: Path,
+    record_path: Path,
+    log_directory: Path,
+    converted_data: Path,
+) -> Path | None:
+    """Preserve a failed checkpoint conversion before retrying its paths."""
+    populated_logs = log_directory.is_dir() and any(log_directory.iterdir())
+    if not record_path.exists() and not populated_logs and not converted_data.exists():
+        return None
+    archived = output / "superseded" / f"{name}-{time.time_ns()}"
+    archived.mkdir(parents=True)
+    if record_path.exists():
+        record_path.replace(archived / "record.json")
+    if populated_logs:
+        log_directory.replace(archived / "logs")
+        log_directory.mkdir(parents=True)
+    if converted_data.exists():
+        converted_data.replace(archived / "converted.data")
+    print(f"archive: stale {name} artifacts moved to {archived}")
+    return archived
+
+
+def convert_restart_checkpoint_to_data(
+    *,
+    name: str,
+    restart_identity: dict[str, Any],
+    converted_data: Path,
+    common: dict[str, Any],
+) -> tuple[Path, Path]:
+    """Convert one exact binary restart into a velocity-preserving data file.
+
+    Seed propagation consumes data files, but the only exact state captured
+    during a stochastic pilot is a LAMMPS binary restart.  This zero-dynamics
+    conversion loads the same plugin/runtime boundary and writes ``nocoeff``
+    data so downstream stages keep their reviewed force-field includes.
+    """
+    output: Path = common["output"]
+    restart = Path(str(restart_identity["path"])).resolve()
+    if not artifact_matches(restart_identity, restart):
+        raise ValueError(f"restart checkpoint changed before conversion: {restart}")
+    converted_data = converted_data.resolve()
+    record_path = output / "records" / f"{name}.json"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    log_directory = output / "logs" / name
+    log_directory.mkdir(parents=True, exist_ok=True)
+    launcher_log = log_directory / "launcher.log"
+
+    plugin: Path = common["plugin"]
+    lammps: Path = common["lammps"]
+    xtbloom_library: Path = common["xtbloom_library"]
+    manifest_path: Path = common["manifest_path"]
+    mode = str(common.get("mode", "qmmm"))
+    input_text = "\n".join(
+        [
+            "# Generated checkpoint conversion; do not hand-edit.",
+            "clear",
+            f"plugin load {ensure_lammps_token(plugin.resolve())}",
+            f"read_restart {ensure_lammps_token(restart)}",
+            f"write_data {ensure_lammps_token(converted_data)} nocoeff",
+            "",
+        ]
+    )
+    input_path = generated_lammps_input_path(output, name, input_text)
+    write_generated(input_path, input_text)
+
+    environment, selected_environment = build_runtime_environment(
+        xtbloom_library,
+        common["library_dirs"],
+        common["cuda_visible_devices"],
+        uses_deepmd=mode == "qmmm-dpa4c",
+    )
+    mpi_launcher = resolve_executable(common["mpiexec"])
+    runtime_before = runtime_record(
+        lammps,
+        plugin,
+        xtbloom_library,
+        mpi_launcher,
+        environment,
+        deepmd_plugin=common.get("deepmd_plugin"),
+        deepmd_models=common.get("deepmd_models", ()),
+    )
+    project_before = project_record(manifest_path, output)
+    input_identity = {"path": str(input_path.resolve()), "sha256": sha256(input_path)}
+
+    if record_path.is_file():
+        try:
+            previous = validate_restart_conversion_record_current(
+                record_path,
+                restart_identity=restart_identity,
+                common=common,
+            )
+        except ValueError:
+            pass
+        else:
+            if Path(previous["output"]["path"]).resolve() == converted_data:
+                print(f"resume: {name} already converted an unchanged restart")
+                return converted_data, record_path
+
+    archive_stale_restart_conversion(
+        name=name,
+        output=output,
+        record_path=record_path,
+        log_directory=log_directory,
+        converted_data=converted_data,
+    )
+    converted_data.parent.mkdir(parents=True, exist_ok=True)
+    command = build_lammps_command(
+        lammps=lammps,
+        mpi_launcher=mpi_launcher,
+        mpi_args=common["mpi_args"],
+        worlds=1,
+        ranks_per_window=common["ranks_per_window"],
+        log_directory=log_directory,
+        input_path=input_path,
+        lammps_args=(
+            "-k",
+            "on",
+            "g",
+            "1",
+            "-pk",
+            "kokkos",
+            "newton",
+            "on",
+            "neigh",
+            "half",
+        ),
+    )
+    started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
+    started = time.monotonic()
+    print(f"run: {name}: {shlex.join(command)}")
+    with launcher_log.open("w", encoding="utf-8") as handle:
+        process = subprocess.run(
+            command,
+            check=False,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=environment,
+        )
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "record_kind": "restart-checkpoint-to-data",
+        "name": name,
+        "status": "failed",
+        "started_utc": started_utc,
+        "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "wall_seconds": time.monotonic() - started,
+        "command": command,
+        "returncode": process.returncode,
+        "restart": restart_identity,
+        "input": input_identity,
+        "runtime": runtime_before,
+        "project": project_before,
+        "selected_environment": selected_environment,
+        "environment_contract": runtime_environment_contract(selected_environment),
+        "launcher_log": {
+            "path": str(launcher_log.resolve()),
+            "sha256": sha256(launcher_log),
+        },
+    }
+    try:
+        if process.returncode != 0:
+            tail = launcher_log.read_text(encoding="utf-8", errors="replace")[-8000:]
+            raise RuntimeError(
+                f"LAMMPS restart conversion returned {process.returncode}:\n{tail}"
+            )
+        if not converted_data.is_file():
+            raise ValueError("LAMMPS restart conversion did not write a data file")
+        for label, identity, current in (
+            ("restart", restart_identity, restart),
+            ("generated input", input_identity, input_path),
+            ("LAMMPS executable", runtime_before["lammps"], lammps),
+            ("plugin", runtime_before["plugin"], plugin),
+            ("xTBloom library", runtime_before["xtbloom"], xtbloom_library),
+            ("runner", project_before["runner"], Path(__file__).resolve()),
+            ("manifest", project_before["manifest"], manifest_path),
+            ("provenance", project_before["provenance"], output / "provenance.json"),
+        ):
+            if not artifact_matches(identity, current):
+                raise ValueError(f"{label} changed during restart conversion")
+        record["output"] = {
+            "path": str(converted_data),
+            "sha256": sha256(converted_data),
+        }
+        record["status"] = "passed"
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        record["error"] = str(error)
+        write_json_atomic(record_path, record)
+        raise
+    write_json_atomic(record_path, record)
+    print(f"pass: {name}: converted restart checkpoint without dynamics")
+    return converted_data, record_path
+
+
+def validate_restart_conversion_record_current(
+    record_path: Path,
+    *,
+    restart_identity: dict[str, Any],
+    common: dict[str, Any],
+) -> dict[str, Any]:
+    """Revalidate one checkpoint-to-data conversion and its dependency bytes."""
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"could not read restart conversion record {record_path}: {error}"
+        ) from error
+    if (
+        record.get("status") != "passed"
+        or record.get("record_kind") != "restart-checkpoint-to-data"
+        or record.get("restart") != restart_identity
+    ):
+        raise ValueError(f"restart conversion protocol changed in {record_path}")
+    restart = Path(str(restart_identity.get("path", "")))
+    if not artifact_matches(restart_identity, restart):
+        raise ValueError(f"restart conversion input changed in {record_path}")
+    for section in ("input", "output", "launcher_log"):
+        identity = record.get(section)
+        if (
+            not isinstance(identity, dict)
+            or "path" not in identity
+            or not artifact_matches(identity, Path(identity["path"]))
+        ):
+            raise ValueError(f"restart conversion {section} changed in {record_path}")
+    project = record.get("project", {})
+    for name, current in (
+        ("runner", Path(__file__).resolve()),
+        ("manifest", common["manifest_path"]),
+        ("provenance", common["output"] / "provenance.json"),
+    ):
+        if not artifact_matches(project.get(name), current):
+            raise ValueError(
+                f"restart conversion {name} identity changed in {record_path}"
+            )
+    runtime = record.get("runtime", {})
+    mpi_launcher = resolve_executable(common["mpiexec"])
+    for name, current in (
+        ("lammps", common["lammps"]),
+        ("plugin", common["plugin"]),
+        ("xtbloom", common["xtbloom_library"]),
+        ("mpiexec", mpi_launcher),
+    ):
+        if not artifact_matches(runtime.get(name), current):
+            raise ValueError(
+                f"restart conversion runtime {name} changed in {record_path}"
+            )
+    if common.get("mode", "qmmm") == "qmmm-dpa4c":
+        deepmd_c_api = runtime.get("deepmd_c_api")
+        if (
+            not isinstance(deepmd_c_api, dict)
+            or "path" not in deepmd_c_api
+            or not artifact_matches(deepmd_c_api, Path(deepmd_c_api["path"]))
+        ):
+            raise ValueError(
+                f"restart conversion DeePMD C API changed in {record_path}"
+            )
+        recorded_models = runtime.get("models")
+        expected_models = tuple(common.get("deepmd_models", ()))
+        if (
+            not isinstance(recorded_models, list)
+            or len(recorded_models) != len(expected_models)
+            or not all(
+                artifact_matches(identity, model)
+                for identity, model in zip(
+                    recorded_models, expected_models, strict=True
+                )
+            )
+        ):
+            raise ValueError(
+                f"restart conversion DPA4c model identity changed in {record_path}"
+            )
+    if record.get("environment_contract") != runtime_environment_contract(
+        record.get("selected_environment")
+    ):
+        raise ValueError(
+            f"restart conversion environment contract changed in {record_path}"
+        )
+    return record
 
 
 def run_invocation(
@@ -2160,9 +3695,14 @@ def run_invocation(
     deepmd_plugin: Path | None = None,
     deepmd_models: Sequence[Path] = (),
     model_deviation_frequency: int = 0,
+    restart_checkpoint_frequency: int = 0,
+    stop_on_seed_acceptance: bool = False,
     dpa4c_models_qualified: bool = False,
     allow_unqualified_dpa4c_models: bool = False,
-    lammps_execution_backend: str = "host",
+    lammps_execution_backend: str = "kokkos",
+    thermostat_enabled: bool = True,
+    seed_attempt: dict[str, Any] | None = None,
+    process_attempt: dict[str, int] | None = None,
 ) -> Path:
     """Run one synchronized batch and atomically publish its evidence record."""
     validate_execution_policy(
@@ -2172,7 +3712,6 @@ def run_invocation(
         model_deviation_frequency=model_deviation_frequency,
         dpa4c_models_qualified=dpa4c_models_qualified,
         allow_unqualified_dpa4c_models=allow_unqualified_dpa4c_models,
-        lammps_execution_backend=lammps_execution_backend,
     )
     current_execution = execution_record(
         mode=mode,
@@ -2180,25 +3719,30 @@ def run_invocation(
         dpa4c_models_qualified=dpa4c_models_qualified,
         allow_unqualified_dpa4c_models=allow_unqualified_dpa4c_models,
         lammps_execution_backend=lammps_execution_backend,
+        thermostat_enabled=thermostat_enabled,
     )
     record_path = output / "records" / f"{name}.json"
-    input_path = output / "generated/inputs" / f"{name}.in"
+    input_text = render_lammps_input(
+        manifest,
+        tutorial,
+        plugin,
+        run_windows,
+        steps=steps,
+        timestep_offset=timestep_offset,
+        trajectory_frequency=trajectory_frequency,
+        mode=mode,
+        deepmd_plugin=deepmd_plugin,
+        deepmd_models=deepmd_models,
+        model_deviation_frequency=model_deviation_frequency,
+        lammps_execution_backend=lammps_execution_backend,
+        restart_checkpoint_frequency=restart_checkpoint_frequency,
+        stop_on_seed_acceptance=stop_on_seed_acceptance,
+        thermostat_enabled=thermostat_enabled,
+    )
+    input_path = generated_lammps_input_path(output, name, input_text)
     write_generated(
         input_path,
-        render_lammps_input(
-            manifest,
-            tutorial,
-            plugin,
-            run_windows,
-            steps=steps,
-            timestep_offset=timestep_offset,
-            trajectory_frequency=trajectory_frequency,
-            mode=mode,
-            deepmd_plugin=deepmd_plugin,
-            deepmd_models=deepmd_models,
-            model_deviation_frequency=model_deviation_frequency,
-            lammps_execution_backend=lammps_execution_backend,
-        ),
+        input_text,
     )
     log_directory = output / "logs" / name
     log_directory.mkdir(parents=True, exist_ok=True)
@@ -2256,6 +3800,8 @@ def run_invocation(
         steps=steps,
         timestep_offset=timestep_offset,
         trajectory_frequency=trajectory_frequency,
+        restart_checkpoint_frequency=restart_checkpoint_frequency,
+        stop_on_seed_acceptance=stop_on_seed_acceptance,
         ranks_per_window=ranks_per_window,
         lammps=lammps,
         plugin=plugin,
@@ -2279,6 +3825,8 @@ def run_invocation(
         dpa4c_models_qualified=dpa4c_models_qualified,
         allow_unqualified_dpa4c_models=allow_unqualified_dpa4c_models,
         lammps_execution_backend=lammps_execution_backend,
+        thermostat_enabled=thermostat_enabled,
+        seed_attempt=seed_attempt,
     ):
         print(f"resume: {name} already passed with an unchanged dependency chain")
         return record_path
@@ -2314,6 +3862,8 @@ def run_invocation(
         "wall_seconds": wall_seconds,
         "steps_per_window": steps,
         "timestep_offset": timestep_offset,
+        "restart_checkpoint_frequency_steps": restart_checkpoint_frequency,
+        "stop_on_seed_acceptance": stop_on_seed_acceptance,
         "worlds": worlds,
         "window_order": [item.window.tag for item in run_windows],
         "ranks_per_window": ranks_per_window,
@@ -2324,6 +3874,9 @@ def run_invocation(
         "command": command,
         "execution": current_execution,
         "selected_environment": selected_environment,
+        "environment_contract": runtime_environment_contract(
+            selected_environment
+        ),
         "runtime": runtime_before,
         "loaded_xtbloom": loaded_xtbloom,
         "project": project_before,
@@ -2334,11 +3887,22 @@ def run_invocation(
         "colvars_configs": colvars_configs_before,
         "outputs": {},
     }
+    if seed_attempt is not None:
+        # Keep the stochastic retry protocol next to the runtime evidence so
+        # a later stage can prove which reviewed duration and seed were used.
+        record["seed_attempt"] = seed_attempt
+    if process_attempt is not None:
+        # Process recovery is operational rather than scientific, but it must
+        # remain visible so failed wall time is never mistaken for benchmark
+        # evidence and a successful record does not conceal earlier crashes.
+        record["process_attempt"] = process_attempt
 
     try:
         if process.returncode != 0:
             tail = launcher_log.read_text(encoding="utf-8", errors="replace")[-8000:]
-            raise RuntimeError(f"LAMMPS returned {process.returncode}:\n{tail}")
+            raise LammpsExecutionError(
+                f"LAMMPS returned {process.returncode}:\n{tail}"
+            )
         changed_inputs = [
             label
             for label, identity, artifact in (
@@ -2415,11 +3979,47 @@ def run_invocation(
                 "DeePMD C API loader resolution changed while LAMMPS was running"
             )
         dangerous = inspect_dangerous_builds(log_directory, worlds)
-        if manifest["protocol"]["seed_acceptance"][
+        require_zero_dangerous = manifest["protocol"]["seed_acceptance"][
             "require_zero_dangerous_builds"
-        ] and any(value != 0 for value in dangerous.values()):
-            raise ValueError(f"dangerous neighbor builds were reported: {dangerous}")
+        ]
+        neighbor_every = int(manifest["dynamics"]["neighbor_every"])
+        neighbor_check = bool(
+            manifest["dynamics"].get("neighbor_check", True)
+        )
+        if require_zero_dangerous:
+            if neighbor_check:
+                if any(value is None for value in dangerous.values()):
+                    raise ValueError(
+                        "dangerous neighbor builds were not checked despite "
+                        "the checked-rebuild contract"
+                    )
+                if any(value != 0 for value in dangerous.values()):
+                    raise ValueError(
+                        f"dangerous neighbor builds were reported: {dangerous}"
+                    )
+            else:
+                # ``check no`` with every=1 and delay=0 rebuilds the neighbor
+                # list before every force evaluation.  This is stronger than
+                # accepting a nonzero warning counter: displacement-based
+                # deferral is disabled, so an interaction cannot be missed
+                # while waiting for a later rebuild opportunity.
+                if neighbor_every != 1:
+                    raise ValueError(
+                        "unchecked neighbor displacement requires every-step "
+                        "rebuilding"
+                    )
+                if any(value is not None for value in dangerous.values()):
+                    raise ValueError(
+                        "LAMMPS unexpectedly checked dangerous builds under "
+                        "the every-step rebuild contract"
+                    )
         record["dangerous_builds"] = dangerous
+        record["neighbor_rebuild_policy"] = {
+            "every_steps": neighbor_every,
+            "delay_steps": 0,
+            "displacement_check": neighbor_check,
+            "rebuild_every_step": not neighbor_check and neighbor_every == 1,
+        }
         record["lammps_logs"] = {
             path.name: {"path": str(path.resolve()), "sha256": sha256(path)}
             for path in sorted(log_directory.glob("log.lammps*"))
@@ -2434,10 +4034,53 @@ def run_invocation(
             completed_timestep if completed_timestep % colvars_frequency == 0 else None
         )
         rejected_seeds: list[str] = []
+        rejected_first_hits: list[str] = []
+        completed_steps_by_window: dict[str, int] = {}
         for item in run_windows:
             colvars_path = Path(str(item.colvars_prefix) + ".colvars.traj")
-            values = parse_colvars(
-                colvars_path, expected_final_step=expected_colvars_step
+            rows = parse_colvars_rows(colvars_path)
+            values = rows[-1]
+            if stop_on_seed_acceptance:
+                if values["step"] <= timestep_offset:
+                    raise ValueError(
+                        "first-hit seed run produced no positive-time Colvars sample"
+                    )
+                if values["step"] > completed_timestep:
+                    raise ValueError(
+                        "first-hit seed run exceeded its reviewed step schedule"
+                    )
+                if values["step"] % colvars_frequency != 0:
+                    raise ValueError(
+                        "first-hit seed run stopped outside the Colvars sampling grid"
+                    )
+                first_hit = next(
+                    (
+                        row
+                        for row in rows
+                        if row["step"] > timestep_offset
+                        and seed_row_is_accepted(manifest, item.window, row)
+                    ),
+                    None,
+                )
+                if first_hit is not None and values != first_hit:
+                    raise ValueError(
+                        "first-hit seed run continued beyond its earliest accepted sample"
+                    )
+            else:
+                first_hit = None
+                if (
+                    expected_colvars_step is not None
+                    and values["step"] != expected_colvars_step
+                ):
+                    raise ValueError(
+                        f"Colvars final step {values['step']} in {colvars_path} "
+                        f"differs from expected {expected_colvars_step}"
+                    )
+            completed_steps_by_window[item.window.tag] = completed_steps_for_record(
+                requested_steps=steps,
+                timestep_offset=timestep_offset,
+                final_colvars_step=values["step"],
+                stop_on_seed_acceptance=stop_on_seed_acceptance,
             )
             reaction_error = abs(values["reaction_coordinate"] - item.window.center)
             angle_error = abs(values["attack_angle"] - angle_center)
@@ -2466,6 +4109,24 @@ def run_invocation(
                 "attack_angle_error_degree": angle_error,
                 "seed_acceptance": accepted,
             }
+            if stop_on_seed_acceptance:
+                record["outputs"][item.window.tag]["first_hit"] = {
+                    "check_frequency_steps": colvars_frequency,
+                    "scheduled_steps": steps,
+                    "completed_steps": completed_steps_by_window[item.window.tag],
+                    "halted_early": values["step"] < completed_timestep,
+                    "accepted_sample_found": first_hit is not None,
+                }
+                # A first-hit invocation is only a successful checkpoint when
+                # the in-process halt actually observed the acceptance gate.
+                # Keep this failure inside ``run_invocation`` so the evidence
+                # record remains ``failed`` and cannot be mistaken for a
+                # resumable successful run on the next invocation.
+                if first_hit is None:
+                    rejected_first_hits.append(
+                        f"{item.window.tag}: no accepted Colvars sample within "
+                        f"{steps} scheduled steps"
+                    )
             if trajectory_frequency > 0:
                 if not item.trajectory.is_file():
                     raise ValueError(
@@ -2485,13 +4146,52 @@ def run_invocation(
                     "path": str(item.model_deviation),
                     "sha256": sha256(item.model_deviation),
                 }
+            if restart_checkpoint_frequency > 0:
+                checkpoints = restart_checkpoint_paths(
+                    item,
+                    timestep_offset=timestep_offset,
+                    steps=steps,
+                    frequency=restart_checkpoint_frequency,
+                )
+                missing = [path for _, path in checkpoints if not path.is_file()]
+                if missing:
+                    raise ValueError(
+                        "LAMMPS did not publish restart checkpoint for "
+                        f"{item.window.tag}: {missing[0]}"
+                    )
+                record["outputs"][item.window.tag]["restart_checkpoints"] = [
+                    {
+                        "timestep": checkpoint_step,
+                        "path": str(checkpoint_path.resolve()),
+                        "sha256": sha256(checkpoint_path),
+                    }
+                    for checkpoint_step, checkpoint_path in checkpoints
+                ]
             if require_seed_acceptance and not accepted:
                 rejected_seeds.append(
                     f"{item.window.tag}: reaction error {reaction_error:.6f} "
                     f"Angstrom, angle error {angle_error:.6f} degree"
                 )
+        record["completed_steps_by_window"] = completed_steps_by_window
+        record["aggregate_window_steps"] = sum(completed_steps_by_window.values())
+        record["aggregate_window_steps_per_second"] = (
+            record["aggregate_window_steps"] / wall_seconds
+            if wall_seconds
+            else None
+        )
         if rejected_seeds:
             raise ValueError("seed acceptance failed: " + "; ".join(rejected_seeds))
+        if rejected_first_hits:
+            # A short pilot that did not hit the gate is an expected scientific
+            # outcome for the adaptive seed schedule.  Publish it as a failed
+            # record (never ``passed``/resumable), but return the record so the
+            # caller can advance to the next reviewed pilot duration.
+            record["status"] = "failed"
+            record["error"] = (
+                "first-hit acceptance failed: " + "; ".join(rejected_first_hits)
+            )
+            write_json_atomic(record_path, record)
+            return record_path
         record["status"] = "passed"
     except (OSError, TypeError, ValueError, RuntimeError) as error:
         record["error"] = str(error)
@@ -2504,6 +4204,39 @@ def run_invocation(
         "aggregate window-steps/s"
     )
     return record_path
+
+
+def run_invocation_with_retries(
+    *, maximum_attempts: int = 1, **arguments: Any
+) -> Path:
+    """Retry only process-level LAMMPS failures from an unchanged start state.
+
+    ``run_invocation`` writes a failed evidence record before raising.  Its
+    next call archives that record and every partial output before launching
+    the same hash-pinned request again, so a retry cannot publish a mixture of
+    failed and accepted window slices.  Scientific validation failures are not
+    caught here and therefore remain immediate hard failures.
+    """
+    if maximum_attempts <= 0:
+        raise ValueError("maximum LAMMPS attempts must be positive")
+    name = str(arguments.get("name", "LAMMPS invocation"))
+    for attempt in range(1, maximum_attempts + 1):
+        current_arguments = dict(arguments)
+        current_arguments["process_attempt"] = {
+            "attempt_number": attempt,
+            "maximum_attempts": maximum_attempts,
+        }
+        try:
+            return run_invocation(**current_arguments)
+        except LammpsExecutionError:
+            if attempt == maximum_attempts:
+                raise
+            print(
+                f"retry: {name}: LAMMPS process attempt "
+                f"{attempt}/{maximum_attempts} failed; restarting from the "
+                "last accepted input state"
+            )
+    raise AssertionError("unreachable LAMMPS retry loop")
 
 
 def state_output(output: Path, stage: str, window: Window) -> Path:
@@ -2534,9 +4267,83 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def publish_artifact_copy(source: Path, destination: Path) -> dict[str, str]:
+    """Atomically publish an exact byte copy of an immutable run artifact.
+
+    Seed searches write into attempt-specific diagnostic directories so every
+    rejected trajectory remains auditable.  Once a first-hit run succeeds,
+    this helper publishes its same-process final state at the canonical branch
+    path without parsing, rounding, replaying, or otherwise transforming it.
+    """
+    if not source.is_file():
+        raise ValueError(f"source artifact is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        with source.open("rb") as source_handle, temporary.open("wb") as handle:
+            shutil.copyfileobj(source_handle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if sha256(source) != sha256(destination):
+        raise ValueError(f"published artifact differs from source: {destination}")
+    return {"path": str(destination.resolve()), "sha256": sha256(destination)}
+
+
 def stage_record_path(output: Path, stage: str) -> Path:
     """Return the only accepted native or explicitly adopted stage ledger."""
     return output / "records" / f"{stage}-complete.json"
+
+
+def require_nve_stability_qualification(
+    output: Path,
+    manifest_path: Path,
+    deepmd_models: Sequence[Path],
+) -> dict[str, Any]:
+    """Require the fixed-threshold, hash-pinned NVE gate before DPRc production."""
+    path = output / "qualification/nve-stability.json"
+    if not path.is_file():
+        raise ValueError(f"required NVE stability qualification is missing: {path}")
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read NVE qualification {path}: {error}") from error
+    if result.get("status") != "passed":
+        raise ValueError(f"NVE stability qualification did not pass: {path}")
+    if result.get("scope") != "three-window-qmmm-dpa4c-nve-stability":
+        raise ValueError(f"unexpected NVE qualification scope in {path}")
+
+    inputs = result.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError(f"NVE qualification inputs are missing from {path}")
+    record_path = output / "records/nve-stability.json"
+    if not artifact_matches(inputs.get("record"), record_path):
+        raise ValueError("NVE qualification does not cover the current invocation record")
+    if not artifact_matches(inputs.get("manifest"), manifest_path):
+        raise ValueError("NVE qualification does not cover the current workload manifest")
+    expected_models = [
+        {"path": str(model.resolve()), "sha256": sha256(model)}
+        for model in deepmd_models
+    ]
+    if inputs.get("models") != expected_models:
+        raise ValueError("NVE qualification covers different DPA4c model bytes")
+
+    expected_thresholds = {
+        "minimum_samples": NVE_MINIMUM_SAMPLES,
+        "maximum_absolute_drift_rate_kcal_mol_ps_atom": (
+            NVE_MAXIMUM_ABSOLUTE_DRIFT_RATE_KCAL_MOL_PS_ATOM
+        ),
+        "maximum_absolute_net_drift_kcal_mol_atom": (
+            NVE_MAXIMUM_ABSOLUTE_NET_DRIFT_KCAL_MOL_ATOM
+        ),
+        "minimum_mean_temperature_kelvin": NVE_MINIMUM_MEAN_TEMPERATURE_KELVIN,
+        "maximum_mean_temperature_kelvin": NVE_MAXIMUM_MEAN_TEMPERATURE_KELVIN,
+    }
+    if result.get("thresholds") != expected_thresholds:
+        raise ValueError("NVE qualification thresholds differ from the reviewed gate")
+    return result
 
 
 def run_chunked_stage(
@@ -2553,8 +4360,17 @@ def run_chunked_stage(
     trajectory_frequency: int,
     require_final_acceptance: bool,
     common: dict[str, Any],
+    colvars_profile: str = "sampling",
+    lammps_attempts: int = 1,
 ) -> Path:
-    """Run a long synchronized stage as an exact, resumable chunk chain."""
+    """Run a long synchronized stage as an exact, resumable chunk chain.
+
+    ``colvars_profile`` is normally the production-strength umbrella.  The
+    anchor uses the already-reviewed stronger seed profile so its accepted
+    final structure is not determined by a rare endpoint fluctuation in either
+    the classical or QM/MM force path; equilibration and production always
+    retain the sampling profile.
+    """
     sizes = chunk_sizes(total_steps, maximum_chunk_steps)
     ledger_path = common["output"] / "records" / f"{stage}-complete.json"
     expected_final_data = {
@@ -2572,6 +4388,7 @@ def run_chunked_stage(
                 maximum_chunk_steps=maximum_chunk_steps,
                 trajectory_frequency=trajectory_frequency,
                 common=common,
+                colvars_profile=colvars_profile,
             )
         except (TypeError, ValueError) as error:
             print(f"resume rejected: {stage}: {error}")
@@ -2610,10 +4427,12 @@ def run_chunked_stage(
                     seed_stage_code,
                     trial * 1000 + chunk_index,
                 ),
+                colvars_profile=colvars_profile,
             )
             for window in windows
         ]
-        record_path = run_invocation(
+        record_path = run_invocation_with_retries(
+            maximum_attempts=lammps_attempts,
             name=chunk_name,
             run_windows=batch,
             steps=steps,
@@ -2657,6 +4476,7 @@ def run_chunked_stage(
         "window_order": [window.tag for window in windows],
         "total_steps_per_window": total_steps,
         "maximum_chunk_steps": maximum_chunk_steps,
+        "colvars_profile": colvars_profile,
         "chunk_count": len(sizes),
         "chunks": chunk_records,
         "summed_chunk_wall_seconds": summed_chunk_wall_seconds,
@@ -2681,10 +4501,325 @@ def run_chunked_stage(
     return ledger_path
 
 
+def run_first_hit_stage(
+    *,
+    stage: str,
+    manifest: dict[str, Any],
+    window: Window,
+    start_data: Path,
+    stage_root: Path,
+    total_steps: int,
+    maximum_chunk_steps: int,
+    trajectory_frequency: int,
+    common: dict[str, Any],
+    colvars_profile: str = "seed",
+    lammps_attempts: int = 1,
+) -> Path:
+    """Run and publish a one-window stage at its earliest accepted sample.
+
+    This path is intentionally a single in-process LAMMPS invocation.  A
+    chunked endpoint restart can move away from a previously valid anchor,
+    while ``fix halt`` evaluates the fixed gate on the same trajectory and
+    writes the exact accepted state before the process exits.
+    """
+    if colvars_profile != "seed":
+        raise ValueError("first-hit stages require the seed Colvars profile")
+    output: Path = common["output"]
+    ledger_path = output / "records" / f"{stage}-complete.json"
+    expected_final_data = {window.tag: stage_root / window.tag / f"{window.tag}.data"}
+    if ledger_path.is_file():
+        try:
+            require_completed_stage(
+                ledger_path,
+                stage=stage,
+                windows=[window],
+                expected_start_data={window.tag: start_data},
+                expected_final_data=expected_final_data,
+                total_steps=total_steps,
+                maximum_chunk_steps=maximum_chunk_steps,
+                trajectory_frequency=trajectory_frequency,
+                common=common,
+                colvars_profile=colvars_profile,
+            )
+        except (TypeError, ValueError) as error:
+            print(f"resume rejected: {stage}: {error}")
+        else:
+            print(f"resume: {stage} first-hit ledger and dependency DAG are unchanged")
+            return ledger_path
+
+    run_window = RunWindow(
+        window,
+        start_data,
+        stage_root / window.tag,
+        output,
+        seed_for(manifest, window, 2),
+        colvars_profile=colvars_profile,
+    )
+    record_path = run_invocation_with_retries(
+        maximum_attempts=lammps_attempts,
+        name=f"{stage}-first-hit",
+        run_windows=[run_window],
+        steps=total_steps,
+        timestep_offset=0,
+        trajectory_frequency=trajectory_frequency,
+        require_seed_acceptance=False,
+        stop_on_seed_acceptance=True,
+        **common,
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    output_record = record["outputs"][window.tag]
+    first_hit = output_record.get("first_hit")
+    if (
+        output_record.get("seed_acceptance") is not True
+        or not isinstance(first_hit, dict)
+        or first_hit.get("accepted_sample_found") is not True
+    ):
+        error = (
+            f"{stage} did not encounter an accepted configuration within "
+            f"{total_steps} steps"
+        )
+        # Keep this defensive transition for records produced by older runner
+        # versions (or a test double): a no-hit invocation must never remain
+        # marked ``passed`` because ``record_is_resumable`` keys exclusively
+        # on that status field.
+        if record.get("status") == "passed":
+            record["status"] = "failed"
+            record["error"] = error
+            write_json_atomic(record_path, record)
+        raise ValueError(error)
+
+    ledger = {
+        "schema_version": 1,
+        "record_kind": "anchor-first-hit-ledger",
+        "stage": stage,
+        "status": "passed",
+        "qualification": "native-first-hit",
+        "window_order": [window.tag],
+        "total_steps_per_window": total_steps,
+        "maximum_chunk_steps": maximum_chunk_steps,
+        "colvars_profile": colvars_profile,
+        "record": {"path": str(record_path.resolve()), "sha256": sha256(record_path)},
+        "outputs": {window.tag: output_record},
+        "selected_step": first_hit["completed_steps"],
+        "halt_check_frequency_steps": first_hit["check_frequency_steps"],
+        "wall_seconds": record["wall_seconds"],
+        "aggregate_window_steps": record["aggregate_window_steps"],
+        "aggregate_window_steps_per_second": record[
+            "aggregate_window_steps_per_second"
+        ],
+        "selection_policy": "earliest-positive-qualified-colvars-sample",
+        "state_publication_policy": "same-process-final-state-at-first-hit",
+    }
+    write_json_atomic(ledger_path, ledger)
+    return ledger_path
+
+
+def run_hitting_time_seed_round(
+    *,
+    round_index: int,
+    expected_windows: Sequence[tuple[str, Window]],
+    round_start: dict[str, Path],
+    step_schedule: Sequence[int],
+    common: dict[str, Any],
+    lammps_attempts: int = 1,
+) -> Path:
+    """Stop each pilot at its first qualified sample and publish that state.
+
+    GPU/Kokkos trajectories are not guaranteed to replay bit-for-bit in a new
+    process, even with the same nominal Langevin seed.  The generated LAMMPS
+    input therefore evaluates the fixed gate directly from the ``fix colvars``
+    global array and uses ``fix halt`` to end the original process at the
+    earliest sampled hit.  Its ordinary final data and restart are the exact
+    accepted state and are copied byte-for-byte to the canonical branch path.
+    """
+    output: Path = common["output"]
+    manifest: dict[str, Any] = common["manifest"]
+    round_number = round_index + 1
+    round_name = f"seed-round-{round_number:02d}"
+    record_path = output / "records" / f"{round_name}.json"
+
+    canonical_windows = [
+        RunWindow(
+            window,
+            round_start[branch],
+            output / "states/seeds" / window.tag,
+            output,
+            seed_for(manifest, window, 3),
+            colvars_profile="seed",
+        )
+        for branch, window in expected_windows
+    ]
+    archive_stale_invocation_artifacts(
+        name=round_name,
+        output=output,
+        record_path=record_path,
+        log_directory=output / "logs" / round_name,
+        run_windows=canonical_windows,
+    )
+
+    captures: dict[str, dict[str, Any]] = {}
+    attempts_by_window: dict[str, list[dict[str, Any]]] = {}
+    outputs: dict[str, Any] = {}
+    start_inputs: dict[str, dict[str, str]] = {}
+    for branch, window in expected_windows:
+        parent = round_start[branch]
+        parent_identity = {"path": str(parent.resolve()), "sha256": sha256(parent)}
+        start_inputs[window.tag] = parent_identity
+        attempts_by_window[window.tag] = []
+        captured = False
+        for attempt_index, pilot_steps in enumerate(step_schedule):
+            pilot_attempt = seed_attempt_metadata(
+                manifest,
+                [window],
+                attempt_index=attempt_index,
+                step_schedule=step_schedule,
+            )
+            pilot_name = (
+                f"seed-first-hit-round-{round_number:02d}-{window.tag}-"
+                f"attempt-{attempt_index + 1:02d}"
+            )
+            pilot_window = RunWindow(
+                window,
+                parent,
+                output
+                / "diagnostic/seed-first-hit-searches"
+                / f"round-{round_number:02d}"
+                / f"attempt-{attempt_index + 1:02d}"
+                / window.tag,
+                output,
+                pilot_attempt["thermostat_seeds"][window.tag],
+                colvars_profile="seed",
+            )
+            pilot_path = run_invocation_with_retries(
+                maximum_attempts=lammps_attempts,
+                name=pilot_name,
+                run_windows=[pilot_window],
+                steps=pilot_steps,
+                trajectory_frequency=0,
+                require_seed_acceptance=False,
+                seed_attempt=pilot_attempt,
+                stop_on_seed_acceptance=True,
+                **common,
+            )
+            pilot_record = json.loads(pilot_path.read_text(encoding="utf-8"))
+            output_record = pilot_record["outputs"][window.tag]
+            attempts_by_window[window.tag].append(
+                {
+                    "attempt_index": attempt_index,
+                    "attempt_number": attempt_index + 1,
+                    "record": {
+                        "path": str(pilot_path.resolve()),
+                        "sha256": sha256(pilot_path),
+                    },
+                    "seed_acceptance": output_record["seed_acceptance"],
+                    "completed_steps": output_record["first_hit"][
+                        "completed_steps"
+                    ],
+                }
+            )
+            colvars_path = Path(output_record["colvars"]["path"])
+            selected_row = first_seed_hitting_row(manifest, window, colvars_path)
+            if selected_row is None:
+                print(
+                    "retry: "
+                    f"{round_name} {window.tag} first-hit search "
+                    f"{attempt_index + 1}/{len(step_schedule)} had no accepted sample"
+                )
+                continue
+            if (
+                output_record.get("seed_acceptance") is not True
+                or output_record.get("final_values") != selected_row
+                or output_record.get("first_hit", {}).get(
+                    "accepted_sample_found"
+                )
+                is not True
+            ):
+                raise ValueError(
+                    f"{pilot_name} did not stop on its recorded first accepted sample"
+                )
+
+            capture_attempt = seed_first_hit_metadata(
+                manifest,
+                window,
+                attempt_index=attempt_index,
+                step_schedule=step_schedule,
+                selected_row=selected_row,
+            )
+            canonical_directory = output / "states/seeds" / window.tag
+            published_data = publish_artifact_copy(
+                Path(output_record["data"]["path"]),
+                canonical_directory / f"{window.tag}.data",
+            )
+            published_restart = publish_artifact_copy(
+                Path(output_record["restart"]["path"]),
+                canonical_directory / f"{window.tag}.restart",
+            )
+            published_output = dict(output_record)
+            published_output["data"] = published_data
+            published_output["restart"] = published_restart
+            outputs[window.tag] = published_output
+            captures[window.tag] = {
+                "attempt_index": attempt_index,
+                "attempt_number": attempt_index + 1,
+                "first_hit_record": {
+                    "path": str(pilot_path.resolve()),
+                    "sha256": sha256(pilot_path),
+                },
+                "selected_step": capture_attempt["selected_step"],
+                "selected_values": capture_attempt["selected_values"],
+                "selection_policy": capture_attempt["selection_policy"],
+                "halt_check_frequency_steps": capture_attempt[
+                    "halt_check_frequency_steps"
+                ],
+                "state_publication_policy": capture_attempt[
+                    "state_publication_policy"
+                ],
+                "source_data": output_record["data"],
+                "source_restart": output_record["restart"],
+                "published_data": published_data,
+                "published_restart": published_restart,
+            }
+            captured = True
+            break
+        if not captured:
+            raise ValueError(
+                f"seed acceptance failed: {window.tag} had no accepted configuration "
+                f"across {len(step_schedule)} reviewed first-hit searches"
+            )
+
+    ledger = {
+        "schema_version": 4,
+        "record_kind": "seed-first-hit-ledger",
+        "name": round_name,
+        "status": "passed",
+        "strategy": "per-window-in-process-first-hitting-time-capture",
+        "selection_policy": "earliest-positive-qualified-colvars-sample",
+        "halt_check_frequency_steps": int(
+            manifest["dynamics"]["colvars_frequency_steps"]
+        ),
+        "state_publication_policy": "atomic-byte-copy-of-same-process-final-state",
+        "window_order": [window.tag for _, window in expected_windows],
+        "worlds": len(expected_windows),
+        "ranks_per_window": common["ranks_per_window"],
+        "step_schedule": list(step_schedule),
+        "start_inputs": start_inputs,
+        "outputs": outputs,
+        "captures": captures,
+        "attempts_by_window": attempts_by_window,
+    }
+    write_json_atomic(record_path, ledger)
+    return record_path
+
+
 def run_stage(
     arguments: argparse.Namespace, manifest: dict[str, Any], windows: list[Window]
 ) -> None:
     """Execute one resumable scientific stage or an ordered stage prefix."""
+    seed_max_attempts = int(getattr(arguments, "seed_max_attempts", 3))
+    lammps_attempts = int(getattr(arguments, "lammps_attempts", 1))
+    if lammps_attempts <= 0:
+        raise ValueError("--lammps-attempts must be positive")
+    seed_steps_by_attempt = seed_attempt_schedule(manifest, seed_max_attempts)
     output = arguments.output.resolve()
     tutorial = arguments.tutorial.resolve()
     initial_center = int(
@@ -2692,10 +4827,10 @@ def run_stage(
     )
     by_center = {window.center_tenths: window for window in windows}
     anchor_window = by_center[initial_center]
-    initial_data = tutorial / "lammps/ETP_ETH.data"
     protocol = manifest["protocol"]
     trajectory_frequency = int(manifest["dynamics"]["trajectory_frequency_steps"])
     mode = getattr(arguments, "mode", "qmmm")
+    initial_data = initial_data_for_mode(manifest, tutorial, mode)
     deepmd_plugin = getattr(arguments, "deepmd_plugin", None)
     deepmd_models = tuple(getattr(arguments, "deepmd_model", ()))
     model_deviation_frequency = int(
@@ -2708,7 +4843,7 @@ def run_stage(
         getattr(arguments, "allow_unqualified_dpa4c_models", False)
     )
     lammps_execution_backend = str(
-        getattr(arguments, "lammps_execution_backend", "host")
+        getattr(arguments, "lammps_execution_backend", "kokkos")
     )
     validate_execution_policy(
         mode=mode,
@@ -2717,7 +4852,6 @@ def run_stage(
         model_deviation_frequency=model_deviation_frequency,
         dpa4c_models_qualified=dpa4c_models_qualified,
         allow_unqualified_dpa4c_models=allow_unqualified_dpa4c_models,
-        lammps_execution_backend=lammps_execution_backend,
     )
 
     common = {
@@ -2755,6 +4889,13 @@ def run_stage(
             maximum_chunk_steps=arguments.chunk_steps,
             trajectory_frequency=trajectory_frequency,
             common=common,
+            # The anchor is an initialization gate, not a production sample.
+            # Use the strong, reviewed seed restraint for every force path so
+            # thermal endpoint noise cannot turn an initially valid center
+            # into a rejected parent for the two-branch seed walk.  The
+            # equilibration and production stages below continue to use the
+            # declared sampling restraint.
+            colvars_profile="seed",
         )
 
     def accepted_seed_starts(anchor_ledger: dict[str, Any]) -> dict[str, Path]:
@@ -2763,12 +4904,22 @@ def run_stage(
             windows,
             anchor_window,
             anchor_ledger=anchor_ledger,
-            seed_steps=int(protocol["seed_walk_steps_per_center"]),
+            manifest=manifest,
+            step_schedule=seed_steps_by_attempt,
             common=common,
         )
 
     requested = arguments.stage
-    stages = ["smoke", "batch-smoke", "anchor", "seeds", "equilibrate", "production"]
+    stages = [
+        "smoke",
+        "batch-smoke",
+        "anchor",
+        "seeds",
+        "equilibrate",
+    ]
+    if mode == "qmmm-dpa4c":
+        stages.append("nve-stability")
+    stages.append("production")
     if requested.startswith("through-"):
         end = requested.removeprefix("through-")
         selected = stages[: stages.index(end) + 1]
@@ -2783,7 +4934,8 @@ def run_stage(
             output,
             seed_for(manifest, anchor_window, 1),
         )
-        run_invocation(
+        run_invocation_with_retries(
+            maximum_attempts=lammps_attempts,
             name="smoke",
             run_windows=[smoke],
             # Use the same override for one-window and batched diagnostics so
@@ -2810,7 +4962,8 @@ def run_stage(
             )
             for window in windows[first : first + count]
         ]
-        run_invocation(
+        run_invocation_with_retries(
+            maximum_attempts=lammps_attempts,
             name=f"batch-smoke-{count}",
             run_windows=batch,
             steps=arguments.smoke_steps or int(protocol["smoke_steps"]),
@@ -2820,19 +4973,18 @@ def run_stage(
         )
 
     if "anchor" in selected:
-        run_chunked_stage(
+        run_first_hit_stage(
             stage="anchor",
             manifest=manifest,
-            windows=[anchor_window],
-            start_data={anchor_window.tag: initial_data},
+            window=anchor_window,
+            start_data=initial_data,
             stage_root=output / "states/anchor",
             total_steps=int(protocol["anchor_relaxation_steps"]),
             maximum_chunk_steps=arguments.chunk_steps,
-            seed_stage_code=2,
-            trial=0,
             trajectory_frequency=trajectory_frequency,
-            require_final_acceptance=True,
             common=common,
+            colvars_profile="seed",
+            lammps_attempts=lammps_attempts,
         )
         accepted_anchor()
 
@@ -2855,29 +5007,76 @@ def run_stage(
         previous = {"lower": anchor_data, "upper": anchor_data}
         rounds = max(len(lower), len(upper))
         for round_index in range(rounds):
-            batch: list[RunWindow] = []
-            for branch, centers in (("lower", lower), ("upper", upper)):
-                if round_index >= len(centers):
+            round_start = previous.copy()
+            expected_windows = [
+                (branch, by_center[centers[round_index]])
+                for branch, centers in (("lower", lower), ("upper", upper))
+                if round_index < len(centers)
+            ]
+            record_path = output / "records" / f"seed-round-{round_index + 1:02d}.json"
+            previous_identities = {
+                branch: {
+                    "path": str(path.resolve()),
+                    "sha256": sha256(path),
+                }
+                for branch, path in round_start.items()
+            }
+            if record_path.is_file():
+                try:
+                    record = validate_seed_round_record(
+                        record_path,
+                        manifest=manifest,
+                        round_index=round_index,
+                        expected_windows=expected_windows,
+                        previous=previous_identities,
+                        step_schedule=seed_steps_by_attempt,
+                        common=common,
+                    )
+                except (TypeError, ValueError) as error:
+                    print(
+                        f"resume rejected: seed-round-{round_index + 1:02d}: {error}"
+                    )
+                else:
+                    for branch, window in expected_windows:
+                        previous[branch] = Path(
+                            record["outputs"][window.tag]["data"]["path"]
+                        )
+                    if record.get("record_kind") == "seed-first-hit-ledger":
+                        print(
+                            f"resume: seed-round-{round_index + 1:02d} passed "
+                            "with in-process first-hit captures"
+                        )
+                    elif record.get("record_kind") == "seed-hitting-time-ledger":
+                        print(
+                            f"resume: seed-round-{round_index + 1:02d} passed "
+                            "with exact periodic-restart hitting-time captures"
+                        )
+                    else:
+                        print(
+                            f"resume: seed-round-{round_index + 1:02d} passed "
+                            f"attempt {record['seed_attempt']['attempt_number']} with "
+                            "an unchanged dependency chain"
+                        )
                     continue
-                window = by_center[centers[round_index]]
-                item = RunWindow(
-                    window,
-                    previous[branch],
-                    output / "states/seeds" / window.tag,
-                    output,
-                    seed_for(manifest, window, 3),
-                    colvars_profile="seed",
-                )
-                batch.append(item)
-                previous[branch] = item.final_data
-            run_invocation(
-                name=f"seed-round-{round_index + 1:02d}",
-                run_windows=batch,
-                steps=int(protocol["seed_walk_steps_per_center"]),
-                trajectory_frequency=0,
-                require_seed_acceptance=True,
-                **common,
+            record_path = run_hitting_time_seed_round(
+                round_index=round_index,
+                expected_windows=expected_windows,
+                round_start=round_start,
+                step_schedule=seed_steps_by_attempt,
+                common=common,
+                lammps_attempts=lammps_attempts,
             )
+            record = validate_seed_round_record(
+                record_path,
+                manifest=manifest,
+                round_index=round_index,
+                expected_windows=expected_windows,
+                previous=previous_identities,
+                step_schedule=seed_steps_by_attempt,
+                common=common,
+            )
+            for branch, window in expected_windows:
+                previous[branch] = Path(record["outputs"][window.tag]["data"]["path"])
         accepted_seed_starts(anchor_ledger)
 
     if "equilibrate" in selected:
@@ -2895,6 +5094,7 @@ def run_stage(
             trajectory_frequency=trajectory_frequency,
             require_final_acceptance=False,
             common=common,
+            lammps_attempts=lammps_attempts,
         )
         require_completed_stage(
             equilibration_ledger,
@@ -2911,7 +5111,55 @@ def run_stage(
             common=common,
         )
 
+    if "nve-stability" in selected:
+        if mode != "qmmm-dpa4c":
+            raise ValueError("NVE stability gating is specific to QM/MM+DPA4c")
+        seed_starts = accepted_seed_starts(accepted_anchor())
+        equilibrated = {
+            window.tag: state_output(output, "equilibrated", window)
+            for window in windows
+        }
+        require_completed_stage(
+            stage_record_path(output, "equilibrate"),
+            stage="equilibrate",
+            windows=windows,
+            expected_start_data=seed_starts,
+            expected_final_data=equilibrated,
+            total_steps=int(protocol["equilibration_steps_per_window"]),
+            maximum_chunk_steps=arguments.chunk_steps,
+            trajectory_frequency=trajectory_frequency,
+            common=common,
+        )
+        nve_windows = representative_nve_windows(windows)
+        nve_batch = [
+            RunWindow(
+                window,
+                equilibrated[window.tag],
+                output / "diagnostic/nve-stability" / window.tag,
+                output,
+                seed_for(manifest, window, 7),
+            )
+            for window in nve_windows
+        ]
+        nve_common = dict(common)
+        nve_common["thermostat_enabled"] = False
+        run_invocation_with_retries(
+            maximum_attempts=lammps_attempts,
+            name="nve-stability",
+            run_windows=nve_batch,
+            steps=arguments.nve_steps,
+            trajectory_frequency=0,
+            require_seed_acceptance=False,
+            **nve_common,
+        )
+
     if "production" in selected:
+        if mode == "qmmm-dpa4c":
+            require_nve_stability_qualification(
+                output,
+                arguments.manifest,
+                deepmd_models,
+            )
         seed_starts = accepted_seed_starts(accepted_anchor())
         equilibrated = {
             window.tag: state_output(output, "equilibrated", window)
@@ -2951,6 +5199,7 @@ def run_stage(
                 trajectory_frequency=trajectory_frequency,
                 require_final_acceptance=False,
                 common=common,
+                lammps_attempts=lammps_attempts,
             )
             require_completed_stage(
                 production_ledger,
@@ -2995,11 +5244,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--xtbloom-library", type=Path, required=True)
     run.add_argument(
         "--mode",
-        choices=("qmmm", "qmmm-dpa4c"),
+        choices=("classical", "qmmm", "qmmm-dpa4c"),
         default="qmmm",
         help=(
-            "run batched xTB QM/MM alone or overlay a compact DPA4c DPRc "
-            "model; the default preserves the historical qmmm workflow"
+            "run the complete classical force field, batched xTB QM/MM, or "
+            "QM/MM overlaid with one compact DPA4c DPRc model; the default "
+            "preserves the historical qmmm workflow"
         ),
     )
     run.add_argument("--deepmd-model", type=Path, action="append", default=[])
@@ -3038,12 +5288,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--lammps-execution-backend",
         choices=("host", "kokkos"),
-        default="host",
+        default="kokkos",
         help=(
-            "run ordinary LAMMPS work on the host (default) or explicitly "
-            "through Kokkos; the host backend avoids one unused Kokkos CUDA "
-            "context per umbrella window while broker-owned xTBloom and DeePMD "
-            "work remains on the GPU"
+            "run ordinary LAMMPS work on the host or through Kokkos; the host "
+            "backend avoids one unused Kokkos CUDA context per umbrella window "
+            "while broker-owned xTBloom and DeePMD work remains on the GPU"
         ),
     )
     run.add_argument("--ranks-per-window", type=int, default=1)
@@ -3057,6 +5306,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--lammps-attempts",
+        type=int,
+        default=1,
+        help=(
+            "maximum attempts for a process-level LAMMPS failure; validation "
+            "failures are never retried and the default preserves fail-fast "
+            "behavior"
+        ),
+    )
+    run.add_argument(
         "--stage",
         choices=(
             "smoke",
@@ -3064,6 +5323,7 @@ def build_parser() -> argparse.ArgumentParser:
             "anchor",
             "seeds",
             "equilibrate",
+            "nve-stability",
             "production",
             "through-anchor",
             "through-seeds",
@@ -3073,11 +5333,30 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     run.add_argument("--trial", type=int, action="append")
+    run.add_argument(
+        "--seed-max-attempts",
+        type=int,
+        default=3,
+        help=(
+            "maximum deterministic Langevin attempts for a seed round whose "
+            "endpoint misses the unchanged acceptance thresholds; each "
+            "attempt uses the corresponding manifest-declared adaptive length"
+        ),
+    )
     run.add_argument("--smoke-window-count", type=int, default=2)
     run.add_argument(
         "--smoke-steps",
         type=int,
         help="diagnostic smoke length; defaults to the manifest smoke length",
+    )
+    run.add_argument(
+        "--nve-steps",
+        type=int,
+        default=5000,
+        help=(
+            "thermostat-free stability diagnostic length per representative "
+            "window; 5000 steps is 5 ps at the reviewed 1 fs timestep"
+        ),
     )
     return parser
 
@@ -3105,7 +5384,6 @@ def main() -> int:
                 allow_unqualified_dpa4c_models=(
                     arguments.allow_unqualified_dpa4c_models
                 ),
-                lammps_execution_backend=arguments.lammps_execution_backend,
             )
 
         output = arguments.output.resolve()
@@ -3127,6 +5405,8 @@ def main() -> int:
                     raise ValueError("--ranks-per-window must be positive")
                 if arguments.chunk_steps < 1:
                     raise ValueError("--chunk-steps must be positive")
+                if arguments.nve_steps < 1:
+                    raise ValueError("--nve-steps must be positive")
                 resolve_executable(arguments.mpiexec)
                 for path in arguments.library_dir:
                     if not path.is_dir():

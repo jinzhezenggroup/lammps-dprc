@@ -2,6 +2,10 @@
   "schema_version": 1,
   "id": "etpeth-gfn2-xtb-qmmm-umbrella-48",
   "description": "ETP/ETH 48-window xTBloom GFN2-xTB QM/MM umbrella workload",
+  "predeclared_claims": {
+    "correctness": "FP64 MM, QM/MM, and QM/MM plus DPA4c DPRc use the same 48-window, 1 fs umbrella protocol; only accepted seed, equilibration, stability, overlap, and PMF evidence is eligible for comparison.",
+    "performance": "Compare aggregate accepted production MD steps per second per GPU over all 48 windows for MM, QM/MM, and QM/MM plus DPA4c DPRc under the recorded runtime and correctness contract."
+  },
   "source": {
     "name": "dprc-tutorial",
     "upstream": "https://github.com/njzjz/dprc-tutorial",
@@ -23,7 +27,13 @@
       {
         "path": "lammps/ETP_ETH.data",
         "sha256": "930b43445009e8e2506308dbf87388a3d33358f72e07fb82eff3376e48e2280d",
-        "classification": "runtime input generated outside this repository",
+        "classification": "QM/MM runtime topology generated outside this repository",
+        "required_for_runtime": true
+      },
+      {
+        "path": "lammps/ETP_ETH.mm.data",
+        "sha256": "b17cf69d828c81f4a51ecf6c8a03e9a45bf73d5216e97195558da64d2d237d29",
+        "classification": "full-MM runtime topology generated outside this repository",
         "required_for_runtime": true
       },
       {
@@ -33,8 +43,14 @@
         "required_for_runtime": true
       },
       {
+        "path": "lammps/forcefield_mm_hybrid.inc",
+        "sha256": "0bb40a12922ebf1ab3ce7aef437a54d1d6aa0c080897891b8884c824c7d7bc7e",
+        "classification": "full-MM force-field input generated outside this repository",
+        "required_for_runtime": true
+      },
+      {
         "path": "lammps/metadata.json",
-        "sha256": "d46cab23443b0a1fea74821698f86c66269ba48d24566ed88963eb3922c32454",
+        "sha256": "fa4ca29dc9162557ec97781d3caa0c23462a020e1d46aee3c4e47f67adb130b6",
         "classification": "conversion metadata"
       },
       {
@@ -49,7 +65,7 @@
       },
       {
         "path": "lammps/convert_amber_to_lammps.py",
-        "sha256": "c97149f6bf7c53261cbb37c80d84e646f0f0bfcc68f5f1a64589cf552438ccb1",
+        "sha256": "704c0472d3a3a8a98e45bed39592880ab5f6eb4ba160db8a99d63726289dbbf3",
         "classification": "external deterministic conversion script"
       }
     ]
@@ -64,7 +80,25 @@
     "cutoff_angstrom": 9.0,
     "pppm_mesh": [50, 50, 50],
     "pppm_order": 4,
-    "pppm_gewald": 0.348831617901729
+    "pppm_gewald": 0.348831617901729,
+    "topologies": {
+      "qmmm": {
+        "data": "lammps/ETP_ETH.data",
+        "forcefield": "lammps/forcefield_qmmm_hybrid.inc",
+        "atoms": 8938,
+        "bonds": 8922,
+        "angles": 2974,
+        "dihedrals": 0
+      },
+      "classical": {
+        "data": "lammps/ETP_ETH.mm.data",
+        "forcefield": "lammps/forcefield_mm_hybrid.inc",
+        "atoms": 8938,
+        "bonds": 8937,
+        "angles": 3000,
+        "dihedrals": 34
+      }
+    }
   },
   "umbrella": {
     "start_tenths_angstrom": -31,
@@ -87,8 +121,9 @@
     "temperature_kelvin": 298.0,
     "langevin_damping_fs": 200.0,
     "base_seed": 4928459,
-    "neighbor_skin_angstrom": 0.05,
+    "neighbor_skin_angstrom": 4.0,
     "neighbor_every": 1,
+    "neighbor_check": false,
     "colvars_frequency_steps": 25,
     "colvars_checkpoint_boundary_tolerance": {
       "reaction_coordinate_angstrom": 1e-12,
@@ -117,7 +152,29 @@
     "smoke_steps": 5,
     "anchor_relaxation_steps": 20000,
     "seed_walk_steps_per_center": 3000,
-    "seed_walk_force_constant_kcal_mol_angstrom2": 1000.0,
+    "seed_walk_attempt_step_multipliers": [
+      1,
+      1,
+      2,
+      2,
+      4,
+      4,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8
+    ],
+    "seed_walk_force_constant_kcal_mol_angstrom2": 10000.0,
     "equilibration_steps_per_window": 100000,
     "production_steps_per_window": 250000,
     "production_trials": 3,

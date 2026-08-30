@@ -3,6 +3,7 @@
 #include "atom.h"
 #include "comm.h"
 #include "domain.h"
+#include "dprc_graph_policy.h"
 #include "error.h"
 #include "force.h"
 #include "group.h"
@@ -387,8 +388,17 @@ void PairDPRCDeepMDBatch::build_compact_graph(
   for (int index = 0; index < nlocal; ++index) {
     if (!selected[index])
       continue;
-    atom_to_node[index] = static_cast<int>(node_to_atom.size());
     node_to_atom.push_back(index);
+  }
+  // LAMMPS may reorder local atoms for spatial sorting. Atom IDs are the
+  // stable physical identity, so use them for the canonical node axis instead
+  // of inheriting an allocator- or timestep-dependent local index order.
+  std::sort(node_to_atom.begin(), node_to_atom.end(), [&](int left, int right) {
+    return atom->tag[left] < atom->tag[right];
+  });
+  for (std::size_t node = 0; node < node_to_atom.size(); ++node) {
+    const int index = node_to_atom[node];
+    atom_to_node[index] = static_cast<int>(node);
     graph.atom_types.push_back(type_index_map_[atom->type[index] - 1]);
   }
 
@@ -397,9 +407,14 @@ void PairDPRCDeepMDBatch::build_compact_graph(
   graph.destination_row_ptr.reserve(node_to_atom.size() + 1);
   graph.destination_row_ptr.push_back(0);
   for (std::size_t node = 0; node < node_to_atom.size(); ++node) {
+    struct PendingEdge {
+      DPRC::CanonicalEdgeOrderKey key;
+    };
+    std::vector<PendingEdge> pending;
     const int center = node_to_atom[node];
     const int neighbors = list->numneigh[center];
     int *neighbor_atoms = list->firstneigh[center];
+    pending.reserve(static_cast<std::size_t>(neighbors));
     for (int slot = 0; slot < neighbors; ++slot) {
       const int candidate = neighbor_atoms[slot] & NEIGHMASK;
       const int owner =
@@ -409,22 +424,40 @@ void PairDPRCDeepMDBatch::build_compact_graph(
       const int source_node = atom_to_node[owner];
       if (source_node < 0)
         continue;
+      const bool destination_is_center =
+          (atom->mask[center] & center_group_bit_) != 0;
+      const bool source_is_center =
+          (atom->mask[owner] & center_group_bit_) != 0;
+      if (!DPRC::keep_dprc_canonical_edge(destination_is_center,
+                                          source_is_center))
+        continue;
       const double dx = atom->x[candidate][0] - atom->x[center][0];
       const double dy = atom->x[candidate][1] - atom->x[center][1];
       const double dz = atom->x[candidate][2] - atom->x[center][2];
+      if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz))
+        throw std::invalid_argument(
+            "canonical DPA4c graph contains a non-finite displacement");
       if (dx * dx + dy * dy + dz * dz >= cutoff_sq)
         continue;
-      graph.sources.push_back(static_cast<std::uint32_t>(source_node));
-      graph.edge_vectors.push_back(
-          static_cast<float>(dx / distance_unit_factor_));
-      graph.edge_vectors.push_back(
-          static_cast<float>(dy / distance_unit_factor_));
-      graph.edge_vectors.push_back(
-          static_cast<float>(dz / distance_unit_factor_));
-      if (source_counts[static_cast<std::size_t>(source_node)] ==
+      pending.push_back({{static_cast<std::int64_t>(atom->tag[owner]),
+                          static_cast<std::uint32_t>(source_node),
+                          static_cast<float>(dx / distance_unit_factor_),
+                          static_cast<float>(dy / distance_unit_factor_),
+                          static_cast<float>(dz / distance_unit_factor_)}});
+    }
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingEdge &left, const PendingEdge &right) {
+                return DPRC::canonical_edge_order_less(left.key, right.key);
+              });
+    for (const PendingEdge &edge : pending) {
+      graph.sources.push_back(edge.key.source_node);
+      graph.edge_vectors.push_back(edge.key.dx);
+      graph.edge_vectors.push_back(edge.key.dy);
+      graph.edge_vectors.push_back(edge.key.dz);
+      if (source_counts[static_cast<std::size_t>(edge.key.source_node)] ==
           std::numeric_limits<std::uint32_t>::max())
         throw std::overflow_error("canonical source degree exceeds uint32");
-      ++source_counts[static_cast<std::size_t>(source_node)];
+      ++source_counts[static_cast<std::size_t>(edge.key.source_node)];
     }
     graph.destination_row_ptr.push_back(
         static_cast<std::int64_t>(graph.sources.size()));

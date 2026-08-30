@@ -288,17 +288,17 @@ def main() -> int:
             encoding="utf-8",
         )
         print(
-            "DeepMD overlay additivity residuals: "
+            "DeePMD overlay additivity residuals: "
             f"energy={residuals['energy']:.6e} "
             f"force_max={max(value for key, value in residuals.items() if key != 'energy'):.6e} "
             f"excluded_force={excluded_force:.6e}"
         )
         if failures:
-            print(f"DeepMD overlay check failed: {failures}", file=sys.stderr)
+            print(f"DeePMD overlay check failed: {failures}", file=sys.stderr)
             return 1
         return 0
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"DeepMD overlay check failed: {error}", file=sys.stderr)
+        print(f"DeePMD overlay check failed: {error}", file=sys.stderr)
         return 1
 
 

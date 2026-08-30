@@ -183,20 +183,27 @@ void PPPMTIP4PDPRCBatched::build_stable_atom_order() {
           stable_tags_.end())
     error->all(FLERR,
                "KSpace style pppm/tip4p/dprc/batch requires unique positive atom IDs");
-  refresh_stable_local_indices();
+  const bool mapping_ok = refresh_stable_local_indices();
+  // Keep setup failures collective: a rank-local mapping failure must not
+  // enter an error barrier while its peers are still entering a validation
+  // reduction below.
+  require_roots_collectively(
+      mapping_ok,
+      "KSpace style pppm/tip4p/dprc/batch could not map every stable atom ID to one owned atom");
 }
 
-void PPPMTIP4PDPRCBatched::refresh_stable_local_indices() const {
+bool PPPMTIP4PDPRCBatched::refresh_stable_local_indices() const {
   // LAMMPS's global atom map includes periodic ghosts.  Rebuild the stable
   // slot map from the owned prefix after atom sorting instead of relying on
   // which equal-tag image the global map currently exposes.
   auto rebuilt = DPRC::stable_local_indices(
       stable_tags_, atom->tag, static_cast<std::size_t>(atom->nlocal));
-  if (!rebuilt)
-    error->universe_all(
-        FLERR,
-        "KSpace style pppm/tip4p/dprc/batch could not map every stable atom ID to one owned atom");
+  if (!rebuilt) {
+    stable_local_indices_.clear();
+    return false;
+  }
   stable_local_indices_ = std::move(*rebuilt);
+  return true;
 }
 
 void PPPMTIP4PDPRCBatched::append_special_pairs(
@@ -365,12 +372,14 @@ void PPPMTIP4PDPRCBatched::validate_fixed_state() const {
   const bool audit_topology = neighbor->ago == 0;
   bool tags_and_types_match = true;
   if (audit_topology) {
-    refresh_stable_local_indices();
-    for (std::size_t slot = 0; slot < stable_tags_.size(); ++slot) {
-      const int index = atom_index_for_slot(slot);
-      if (atom->type[index] - 1 != stable_atom_types_[slot]) {
-        tags_and_types_match = false;
-        break;
+    tags_and_types_match = refresh_stable_local_indices();
+    if (tags_and_types_match) {
+      for (std::size_t slot = 0; slot < stable_tags_.size(); ++slot) {
+        const int index = atom_index_for_slot(slot);
+        if (atom->type[index] - 1 != stable_atom_types_[slot]) {
+          tags_and_types_match = false;
+          break;
+        }
       }
     }
   }
@@ -388,18 +397,26 @@ void PPPMTIP4PDPRCBatched::validate_fixed_state() const {
 
   bool special_pairs_match = true;
   if (audit_topology) {
-    DPRC::ClassicalTopology current;
-    append_special_pairs(current);
-    special_pairs_match =
-        current.special_pairs.size() == stable_special_pairs_.size();
-    for (std::size_t index = 0;
-         special_pairs_match && index < stable_special_pairs_.size(); ++index) {
-      const auto &expected = stable_special_pairs_[index];
-      const auto &actual = current.special_pairs[index];
+    // Do not dereference the cache after a local mapping failure.  Every rank
+    // must reach the validation reduction before the collective error path;
+    // otherwise one rank can enter LAMMPS's error barrier while its peers are
+    // still inside MPI_Allreduce, which manifests as a silent MPI hang.
+    if (!tags_and_types_match) {
+      special_pairs_match = false;
+    } else {
+      DPRC::ClassicalTopology current;
+      append_special_pairs(current);
       special_pairs_match =
-          actual.atom1 == expected.atom1 && actual.atom2 == expected.atom2 &&
-          actual.lj_scale == expected.lj_scale &&
-          actual.coulomb_scale == expected.coulomb_scale;
+          current.special_pairs.size() == stable_special_pairs_.size();
+      for (std::size_t index = 0;
+           special_pairs_match && index < stable_special_pairs_.size(); ++index) {
+        const auto &expected = stable_special_pairs_[index];
+        const auto &actual = current.special_pairs[index];
+        special_pairs_match =
+            actual.atom1 == expected.atom1 && actual.atom2 == expected.atom2 &&
+            actual.lj_scale == expected.lj_scale &&
+            actual.coulomb_scale == expected.coulomb_scale;
+      }
     }
   }
   local[3] = special_pairs_match ? 1 : 0;

@@ -31,7 +31,7 @@ get_filename_component(
 set(LAMMPS_SOURCE_DIR "${_dprc_default_lammps}" CACHE PATH "Path to the pinned LAMMPS src directory")
 set(XTBLOOM_SOURCE_DIR "${_dprc_default_xtbloom}" CACHE PATH "Path to the pinned xTBloom source tree")
 set(DEEPMD_SOURCE_DIR "${_dprc_default_deepmd}" CACHE PATH
-  "Path to the pinned DeePMD-kit checkout declared with the C API artifacts")
+  "Path to the pinned DeePMD-kit checkout that produced the C API library")
 set(XTBLOOM_GENERATED_INCLUDE_DIR "${_dprc_default_xtbloom_generated}" CACHE PATH
   "Path containing the generated xtbloom/version.h for the pinned source tree")
 set(DPRC_XTBLOOM_LIBRARY "" CACHE FILEPATH
@@ -42,7 +42,7 @@ set(DPRC_LAMMPS_EXECUTABLE "" CACHE FILEPATH "LAMMPS executable used for plugin 
 set(DPRC_REFERENCE_LAMMPS_EXECUTABLE "" CACHE FILEPATH
   "Optional QMMM-XTB-enabled LAMMPS executable used only for libxTB oracle calls")
 set(DPRC_DEEPMD_INCLUDE_DIR "" CACHE PATH
-  "Directory containing deepmd/c_api.h with canonical batch API version 31+")
+  "Directory containing deepmd/c_api.h with canonical graph API version 30+")
 set(DPRC_DEEPMD_C_LIBRARY "" CACHE FILEPATH
   "Runtime-provided DeePMD C API shared library linked by dprcplugin")
 set(DPRC_DEEPMD_ARTIFACT_MANIFEST "" CACHE FILEPATH
@@ -68,8 +68,8 @@ set(DPRC_EXPECTED_LAMMPS_REVISION
 set(DPRC_EXPECTED_XTBLOOM_REVISION
     "3c474e1c1b639098f72ae7523472bd5f65ad3ab5" CACHE STRING "Supported xTBloom revision")
 set(DPRC_EXPECTED_DEEPMD_REVISION
-    "835a42f001b41e1bee0646b7e1403855b7fe6340" CACHE STRING
-    "Reviewed DeePMD compact-evaluation revision")
+    "bdb40072d57109e25e17842d24e1f0a926c00632" CACHE STRING
+    "Reviewed DeePMD DPA4c compact-evaluation revision")
 option(DPRC_ALLOW_UNPINNED_DEPENDENCIES "Allow dependency revisions other than the reviewed pins" OFF)
 option(DPRC_REQUIRE_CLEAN_DEPENDENCIES "Reject dirty required dependency worktrees" ON)
 option(DPRC_BUILD_TESTING "Build and register scaffold tests" ON)
@@ -159,6 +159,61 @@ function(dprc_verify_git_dependency name source_path expected_revision)
       message(FATAL_ERROR "${name} checkout must be clean for this configuration: ${repository_path}")
     endif()
   endif()
+endfunction()
+
+function(dprc_verify_deepmd_source source_root expected_revision)
+  # A regular checkout is validated with Git. Compute-only deployments may
+  # instead provide a stripped source export with an explicit full revision
+  # marker; it is still bound to the artifact manifest below.
+  execute_process(
+    COMMAND git -C "${source_root}" rev-parse HEAD
+    OUTPUT_VARIABLE actual_revision
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE revision_status)
+  if(revision_status EQUAL 0)
+    dprc_verify_git_dependency("DeePMD-kit" "${source_root}/source"
+      "${expected_revision}")
+    set(manifest_revision "${expected_revision}")
+    if(DPRC_ALLOW_UNPINNED_DEPENDENCIES)
+      execute_process(
+        COMMAND git -C "${source_root}" rev-parse HEAD
+        OUTPUT_VARIABLE manifest_revision
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE manifest_revision_status)
+      if(NOT manifest_revision_status EQUAL 0)
+        message(FATAL_ERROR
+          "Could not determine the DeePMD revision for an unpinned diagnostic build")
+      endif()
+    endif()
+    set(DPRC_DEEPMD_MANIFEST_REVISION "${manifest_revision}" PARENT_SCOPE)
+    return()
+  endif()
+
+  set(revision_file "${source_root}/.source-revision")
+  if(NOT EXISTS "${revision_file}")
+    message(FATAL_ERROR
+      "DeePMD source export must contain .source-revision: ${source_root}")
+  endif()
+  file(READ "${revision_file}" actual_revision)
+  string(STRIP "${actual_revision}" actual_revision)
+  string(LENGTH "${actual_revision}" actual_revision_length)
+  if(NOT actual_revision_length EQUAL 40 OR
+     NOT actual_revision MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR
+      "DeePMD .source-revision must contain one full lowercase Git revision")
+  endif()
+  if(NOT actual_revision STREQUAL expected_revision)
+    if(DPRC_ALLOW_UNPINNED_DEPENDENCIES)
+      message(WARNING
+        "DeePMD source-export revision ${actual_revision} differs from reviewed pin ${expected_revision}")
+    else()
+      message(FATAL_ERROR
+        "DeePMD source-export revision ${actual_revision} differs from reviewed pin ${expected_revision}; "
+        "set DPRC_ALLOW_UNPINNED_DEPENDENCIES=ON only for diagnostic development")
+    endif()
+  endif()
+  set(DPRC_DEEPMD_MANIFEST_REVISION "${actual_revision}" PARENT_SCOPE)
 endfunction()
 
 if(NOT EXISTS "${LAMMPS_SOURCE_DIR}/lammpsplugin.h" OR
@@ -265,32 +320,17 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
   endif()
   if(NOT EXISTS "${DEEPMD_SOURCE_DIR}/source/api_c/include/c_api.h")
     message(FATAL_ERROR
-      "DEEPMD_SOURCE_DIR must point to the checkout declared in the artifact manifest")
+      "DEEPMD_SOURCE_DIR must point to a DeePMD checkout/export containing source/api_c/include/c_api.h")
   endif()
   file(READ "${DPRC_DEEPMD_INCLUDE_DIR}/deepmd/c_api.h"
     _dprc_deepmd_c_header LIMIT 4096)
   if(NOT _dprc_deepmd_c_header MATCHES "#define[ \t]+DP_C_API_VERSION[ \t]+([0-9]+)" OR
-     CMAKE_MATCH_1 LESS 31)
+     CMAKE_MATCH_1 LESS 30)
     message(FATAL_ERROR
-      "dprc/deepmd/batch requires DeePMD C API version 31 or newer")
+      "dprc/deepmd/batch requires DeePMD C API version 30 or newer")
   endif()
-  dprc_verify_git_dependency(
-    "DeePMD-kit" "${DEEPMD_SOURCE_DIR}/source" "${DPRC_EXPECTED_DEEPMD_REVISION}")
-  # When diagnostic development explicitly allows an unpinned checkout, bind
-  # the declared manifest and runtime-test metadata to the actual revision;
-  # publication configurations continue to use the reviewed cache pin.
-  set(_dprc_deepmd_manifest_revision "${DPRC_EXPECTED_DEEPMD_REVISION}")
-  if(DPRC_ALLOW_UNPINNED_DEPENDENCIES)
-    execute_process(
-      COMMAND git -C "${DEEPMD_SOURCE_DIR}" rev-parse HEAD
-      OUTPUT_VARIABLE _dprc_deepmd_manifest_revision
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      RESULT_VARIABLE _dprc_deepmd_revision_status)
-    if(NOT _dprc_deepmd_revision_status EQUAL 0)
-      message(FATAL_ERROR
-        "Could not determine the DeePMD revision for an unpinned diagnostic build")
-    endif()
-  endif()
+  dprc_verify_deepmd_source(
+    "${DEEPMD_SOURCE_DIR}" "${DPRC_EXPECTED_DEEPMD_REVISION}")
   file(REAL_PATH "${DPRC_DEEPMD_C_LIBRARY}" _dprc_deepmd_c_library_realpath)
   file(SHA256 "${_dprc_deepmd_c_library_realpath}"
     _dprc_deepmd_c_library_sha256)
@@ -309,7 +349,7 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
     --include-dir "${DPRC_DEEPMD_INCLUDE_DIR}"
     --library "${_dprc_deepmd_c_library_realpath}"
     --manifest "${_dprc_deepmd_artifact_manifest_realpath}"
-    --expected-revision "${_dprc_deepmd_manifest_revision}"
+    --expected-revision "${DPRC_DEEPMD_MANIFEST_REVISION}"
     --expected-library-sha256 "${DPRC_EXPECTED_DEEPMD_C_LIBRARY_SHA256}")
   if(NOT DPRC_REQUIRE_CLEAN_DEPENDENCIES)
     list(APPEND _dprc_deepmd_manifest_arguments --allow-dirty-source)
@@ -750,6 +790,11 @@ if(DPRC_BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   add_test(NAME dprc.stable_local_indices COMMAND stable_local_indices_test)
 
+  add_executable(dprc_graph_policy_test tests/dprc_graph_policy_test.cpp)
+  target_include_directories(dprc_graph_policy_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_test(NAME dprc.graph_policy COMMAND dprc_graph_policy_test)
+
   add_executable(classical_batch_test tests/classical_batch_test.cpp)
   target_link_libraries(classical_batch_test PRIVATE dprc_classical_batch)
   if(DPRC_ENABLE_CLASSICAL_CUDA)
@@ -927,7 +972,7 @@ if(DPRC_BUILD_TESTING)
             --lammps "${DPRC_LAMMPS_EXECUTABLE}"
             --dprc-plugin $<TARGET_FILE:dprcplugin>
             --model "${_dprc_deepmd_model_realpath}"
-            --deepmd-revision "${_dprc_deepmd_manifest_revision}"
+            --deepmd-revision "${DPRC_DEEPMD_MANIFEST_REVISION}"
             --evidence
               "${CMAKE_CURRENT_BINARY_DIR}/deepmd-overlay-evidence.json")
         set_tests_properties(lammps.deepmd_c_api.qmmm_overlay PROPERTIES
@@ -941,7 +986,7 @@ if(DPRC_BUILD_TESTING)
             --mpiexec "${MPIEXEC_EXECUTABLE}"
             --dprc-plugin $<TARGET_FILE:dprcplugin>
             --model "${_dprc_deepmd_model_realpath}"
-            --deepmd-revision "${_dprc_deepmd_manifest_revision}"
+            --deepmd-revision "${DPRC_DEEPMD_MANIFEST_REVISION}"
             --evidence
               "${CMAKE_CURRENT_BINARY_DIR}/deepmd-partition-batch-evidence.json")
         set_tests_properties(lammps.deepmd_c_api.partition_batch PROPERTIES
@@ -954,7 +999,7 @@ if(DPRC_BUILD_TESTING)
             --lammps "${DPRC_LAMMPS_EXECUTABLE}"
             --dprc-plugin $<TARGET_FILE:dprcplugin>
             --model "${_dprc_deepmd_model_realpath}"
-            --deepmd-revision "${_dprc_deepmd_manifest_revision}"
+            --deepmd-revision "${DPRC_DEEPMD_MANIFEST_REVISION}"
             --evidence
               "${CMAKE_CURRENT_BINARY_DIR}/deepmd-center-mask-evidence.json")
         set_tests_properties(lammps.deepmd_c_api.center_mask PROPERTIES
