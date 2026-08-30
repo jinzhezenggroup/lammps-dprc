@@ -93,11 +93,11 @@ build tree. Those bytes and their distribution boundary are recorded below.
 ## DeePMD-kit compact evaluation and C API runtime
 
 - Upstream: <https://github.com/deepmodeling/deepmd-kit>
-- Reference PR: <https://github.com/deepmodeling/deepmd-kit/pull/5943>
-- Pinned PR head: `835a42f001b41e1bee0646b7e1403855b7fe6340`
+- Reference PR: <https://github.com/deepmodeling/deepmd-kit/pull/5972>
+- Pinned PR head: `bdb40072d57109e25e17842d24e1f0a926c00632`
 - License: `LGPL-3.0-or-later`
 - Classification: compact-selection design reference plus a caller-supplied
-  public C API v31+ header, shared library, and frozen model. No DeePMD source,
+  public C API v30+ header, shared library, and frozen model. No DeePMD source,
   model, library, or license text is copied, installed, or bundled by this
   repository. The optional CMake path requires exact source revision, C API
   library SHA-256, and model SHA-256 values.
@@ -106,13 +106,10 @@ build tree. Those bytes and their distribution boundary are recorded below.
   rejects DeePMD C++ ABI symbols and standalone DeePMD LAMMPS-plugin
   dependencies. This C API boundary does not by itself decide derivative-work
   or redistribution questions.
-- Status at initial review: open and mergeable, but review is still required.
-  It must not be represented as an upstream release. DPA4C was merged
-  separately in PR #5972 at merge commit
-  `bdb40072d57109e25e17842d24e1f0a926c00632`; no reviewed upstream commit
-  currently combines that release line with the open compact-evaluation PR or
-  the C API v31 batch extension validated during development. That extension
-  must be published and pinned before public reproducibility is claimed.
+- Status at initial review: the DPA4c graph revision is pinned explicitly and
+  is not represented as a separately released LAMMPS plugin. The plugin uses
+  only the public C API; its artifact manifest binds the source, header, and
+  shared library before configuration succeeds.
 
 ## DPRc tutorial workload
 

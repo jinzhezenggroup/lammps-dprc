@@ -24,6 +24,22 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class BenchmarkRunnerTest(unittest.TestCase):
+    @staticmethod
+    def write_topology_fixture(
+        path: Path, manifest: dict[str, object], mode: str
+    ) -> None:
+        """Write a minimal data-file header matching one topology contract."""
+        contract = RUNNER.WORKLOAD.topology_contract(manifest, mode)
+        path.write_text(
+            "fixture\n\n"
+            f"{contract['atoms']} atoms\n"
+            f"{contract['bonds']} bonds\n"
+            f"{contract['angles']} angles\n"
+            f"{contract['dihedrals']} dihedrals\n"
+            "0 impropers\n\nMasses\n",
+            encoding="utf-8",
+        )
+
     def test_matrix_preserves_three_modes_and_batch_48(self) -> None:
         matrix = RUNNER.load_matrix(ROOT / "benchmarks/matrix.json")
         self.assertEqual(matrix["axes"]["mode"], list(RUNNER.MODES))
@@ -103,34 +119,55 @@ class BenchmarkRunnerTest(unittest.TestCase):
             (tutorial / "lammps/forcefield_qmmm_hybrid.inc").write_text(
                 "pair_coeff 1 1 lj/cut 0.1 3.0\n", encoding="utf-8"
             )
-            item = RUNNER.WORKLOAD.RunWindow(
-                windows[0], root / "start.data", root / "out", root, 1234
+            (tutorial / "lammps/forcefield_mm_hybrid.inc").write_text(
+                "pair_coeff 1 1 lj/cut 0.1 3.0\n", encoding="utf-8"
+            )
+            classical_start = root / "classical-start.data"
+            qmmm_start = root / "qmmm-start.data"
+            self.write_topology_fixture(classical_start, manifest, "classical")
+            self.write_topology_fixture(qmmm_start, manifest, "qmmm")
+            classical_item = RUNNER.WORKLOAD.RunWindow(
+                windows[0], classical_start, root / "classical-out", root, 1234
+            )
+            qmmm_item = RUNNER.WORKLOAD.RunWindow(
+                windows[0], qmmm_start, root / "out", root, 1234
             )
             common = {
                 "manifest": manifest,
                 "tutorial": tutorial,
-                "run_windows": [item],
                 "steps": 2,
                 "trajectory_frequency": 0,
                 "run_commands": ["timer full sync", "run 1", "run 1 pre no"],
             }
             classical = RUNNER.WORKLOAD.render_lammps_input(
-                plugin=root / "dprcplugin.so", mode="classical", **common
+                plugin=root / "dprcplugin.so",
+                mode="classical",
+                run_windows=[classical_item],
+                lammps_execution_backend="host",
+                **common,
             )
             classical_reference = RUNNER.WORKLOAD.render_lammps_input(
                 plugin=None,
                 mode="classical",
                 classical_backend="upstream-gpu",
+                run_windows=[classical_item],
+                lammps_execution_backend="host",
                 **common,
             )
             qmmm = RUNNER.WORKLOAD.render_lammps_input(
-                plugin=root / "dprcplugin.so", mode="qmmm", **common
+                plugin=root / "dprcplugin.so",
+                mode="qmmm",
+                run_windows=[qmmm_item],
+                lammps_execution_backend="host",
+                **common,
             )
             primary_model = root / "primary.pt2"
             dpa4c = RUNNER.WORKLOAD.render_lammps_input(
                 plugin=root / "dprcplugin.so",
                 mode="qmmm-dpa4c",
                 deepmd_models=[primary_model],
+                run_windows=[qmmm_item],
+                lammps_execution_backend="host",
                 **common,
             )
             kokkos_dpa4c = RUNNER.WORKLOAD.render_lammps_input(
@@ -138,6 +175,7 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 mode="qmmm-dpa4c",
                 deepmd_models=[primary_model],
                 lammps_execution_backend="kokkos",
+                run_windows=[qmmm_item],
                 **common,
             )
             self.assertIn("lj/cut/dprc/batch", classical)
@@ -196,6 +234,8 @@ class BenchmarkRunnerTest(unittest.TestCase):
                 plugin=root / "dprcplugin.so",
                 mode="qmmm",
                 execution_directory=root / "coordinate",
+                run_windows=[qmmm_item],
+                lammps_execution_backend="host",
                 **common,
             )
             self.assertIn("../out/m3p1", relative)

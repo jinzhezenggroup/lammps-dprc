@@ -73,7 +73,7 @@ class PPPMTIP4PDPRCBatched final : public PPPMTIP4PDPRC {
   [[nodiscard]] DPRC::ClassicalTopology build_topology() const;
   [[nodiscard]] std::vector<std::uint8_t> pair_mapping(class Pair *) const;
   void build_stable_atom_order();
-  void refresh_stable_local_indices() const;
+  [[nodiscard]] bool refresh_stable_local_indices() const;
   void append_special_pairs(DPRC::ClassicalTopology &) const;
   void validate_fixed_state() const;
   void pack_frame(std::vector<double> &positions,

@@ -49,7 +49,8 @@ struct DeepmdCanonicalBatchResult {
 
 // Single-device owner of a DeePMD compact canonical model.  The class uses
 // only source/api_c/include/c_api.h and the CUDA runtime needed to allocate the
-// raw device buffers required by DP_DeepPotComputeCanonicalGraphBatchGPU.
+// raw device buffers required by canonical-graph inference. API v31+ receives
+// the explicit frame axis; API v30 uses the qualified block-diagonal fallback.
 class DeepmdBatchExecutor {
  public:
   DeepmdBatchExecutor(const std::string &model_path, int gpu_rank);

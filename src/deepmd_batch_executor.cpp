@@ -10,8 +10,8 @@
 #include <stdexcept>
 #include <string>
 
-static_assert(DP_C_API_VERSION >= 31,
-              "LAMMPS-DPRC requires DeePMD C API version 31 or newer");
+static_assert(DP_C_API_VERSION >= 30,
+              "LAMMPS-DPRC requires DeePMD C API version 30 or newer");
 
 namespace DPRC {
 namespace {
@@ -112,10 +112,11 @@ DeepmdBatchExecutor::DeepmdBatchExecutor(const std::string &model_path,
     }
     if (metadata_.spin_type_count != 0 ||
         metadata_.frame_parameter_width != 0 ||
-        metadata_.atom_parameter_width != 0) {
+        metadata_.atom_parameter_width != 0 ||
+        metadata_.charge_spin_width != 0) {
       throw std::runtime_error(
-          "dprc/deepmd/batch requires a non-spin model without fparam or "
-          "aparam inputs");
+          "dprc/deepmd/batch requires an atomwise non-spin model without "
+          "fparam, aparam, or charge-state inputs");
     }
 
     const bool device_edges =
@@ -261,6 +262,13 @@ void DeepmdBatchExecutor::compute(const DeepmdCanonicalBatchView &batch,
         std::numeric_limits<std::size_t>::max() - frame_node_sum)
       throw std::overflow_error("DeePMD frame node sum overflows size_t");
     frame_node_sum += static_cast<std::size_t>(all);
+#if DP_C_API_VERSION == 30
+    if (local != all) {
+      throw std::invalid_argument(
+          "DeePMD C API v30 packed execution requires every compact node "
+          "to be local");
+    }
+#endif
   }
   if (frame_node_sum != batch.node_count)
     throw std::invalid_argument(
@@ -326,6 +334,7 @@ void DeepmdBatchExecutor::compute(const DeepmdCanonicalBatchView &batch,
                  static_cast<std::size_t>(batch.edge_storage),
                  "copy DeePMD source order");
 
+#if DP_C_API_VERSION >= 31
   DP_DeepPotComputeCanonicalGraphBatchGPU(
       model_, device_atom_energy_, device_force_, device_atom_virial_,
       device_atom_types_, device_sources_, device_edge_vectors_,
@@ -333,6 +342,25 @@ void DeepmdBatchExecutor::compute(const DeepmdCanonicalBatchView &batch,
       device_source_order_, batch.local_nodes_per_frame,
       batch.all_nodes_per_frame, batch.frame_count, batch.edge_storage);
   check_model("DP_DeepPotComputeCanonicalGraphBatchGPU");
+#else
+  if (batch.node_count >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "DeePMD C API v30 packed node count exceeds int");
+  }
+  const int packed_nodes = static_cast<int>(batch.node_count);
+  // C API v30 has no explicit frame axis.  For the supported atomwise DPA4c
+  // artifact, a block-diagonal graph is equivalent to independent frames:
+  // disconnected components cannot exchange messages or fitting outputs.
+  // The batch-2 runtime qualification test verifies this assumption against
+  // two independent calls before this fallback is used for trajectories.
+  DP_DeepPotComputeCanonicalGraphGPU(
+      model_, device_atom_energy_, device_force_, device_atom_virial_,
+      device_atom_types_, device_sources_, device_edge_vectors_,
+      device_destination_row_ptr_, device_source_row_ptr_,
+      device_source_order_, packed_nodes, packed_nodes, batch.edge_storage);
+  check_model("DP_DeepPotComputeCanonicalGraphGPU packed fallback");
+#endif
 
   // The public API does not currently expose the backend CUDA stream.  A
   // completion fence is therefore required before host publication; this is a

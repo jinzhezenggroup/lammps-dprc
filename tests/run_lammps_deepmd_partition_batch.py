@@ -350,14 +350,14 @@ def main() -> int:
             encoding="utf-8",
         )
         print(
-            "DeepMD partition batch: "
+            "DeePMD partition batch: "
             f"energy={maxima['energy_ev']:.6e} eV "
             f"atomic={maxima['atomic_energy_ev']:.6e} eV "
             f"force={maxima['force_ev_per_angstrom']:.6e} eV/A"
         )
         return 1 if failures else 0
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"DeepMD partition-batch check failed: {error}", file=sys.stderr)
+        print(f"DeePMD partition-batch check failed: {error}", file=sys.stderr)
         return 1
 
 

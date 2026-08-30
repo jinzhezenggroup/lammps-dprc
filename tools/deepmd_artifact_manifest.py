@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Create and verify a declared DeePMD C API artifact manifest.
 
-The manifest binds an exact source checkout, matching public header, and shared
-library by content. It deliberately does not claim that the shared library was
-built from the declared checkout; proving that relationship requires trusted
-build-system attestation outside this repository.
+The manifest binds an exact source checkout, matching public header, and
+shared library by content.  It deliberately does not claim that the shared
+library was built from the declared checkout; proving that relationship
+requires trusted build-system attestation outside this repository.
 """
 
 from __future__ import annotations
@@ -46,8 +46,46 @@ def git_output(source: Path, arguments: Sequence[str]) -> bytes:
     return process.stdout
 
 
+def snapshot_revision(source: Path) -> str:
+    """Read the full revision marker used by stripped source exports."""
+    marker = source / ".source-revision"
+    try:
+        revision = marker.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ManifestError(
+            "DeePMD source export is missing .source-revision"
+        ) from error
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ManifestError(
+            "DeePMD .source-revision must contain one full lowercase Git revision"
+        )
+    return revision
+
+
+def source_snapshot_state(source: Path) -> tuple[str, bool, str]:
+    """Return a revision and deterministic digest for a source export."""
+    revision = snapshot_revision(source)
+    digest = hashlib.sha256()
+    for path in sorted(source.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(source).as_posix().encode("utf-8")
+        digest.update(b"file\0")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(sha256(path)))
+    return revision, True, digest.hexdigest()
+
+
 def source_state(source: Path) -> tuple[str, bool, str]:
-    """Return revision, cleanliness, and a fingerprint of the complete state."""
+    """Return revision, cleanliness, and a fingerprint of the complete state.
+
+    A normal checkout uses Git's revision and worktree digest.  A stripped
+    source export is accepted only when it carries a full `.source-revision`
+    marker and is fingerprinted over every regular file.
+    """
+    if not (source / ".git").exists():
+        return source_snapshot_state(source)
     revision = git_output(source, ("rev-parse", "HEAD")).decode().strip()
     status = git_output(
         source, ("status", "--porcelain=v1", "--untracked-files=all", "-z")
@@ -56,7 +94,10 @@ def source_state(source: Path) -> tuple[str, bool, str]:
     for label, payload in (
         (b"status\0", status),
         (b"worktree-diff\0", git_output(source, ("diff", "--binary", "HEAD"))),
-        (b"index-diff\0", git_output(source, ("diff", "--cached", "--binary", "HEAD"))),
+        (
+            b"index-diff\0",
+            git_output(source, ("diff", "--cached", "--binary", "HEAD")),
+        ),
     ):
         digest.update(label)
         digest.update(payload)
@@ -114,8 +155,8 @@ def create_record(
             "installed deepmd/c_api.h does not match the declared source checkout"
         )
     version = c_api_version(installed_header)
-    if version < 31:
-        raise ManifestError("LAMMPS-DPRc requires DeePMD C API version 31 or newer")
+    if version < 30:
+        raise ManifestError("LAMMPS-DPRc requires DeePMD C API version 30 or newer")
 
     return {
         "schema_version": 1,

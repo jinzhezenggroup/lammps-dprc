@@ -423,7 +423,7 @@ def main() -> int:
             encoding="utf-8",
         )
         print(
-            "DeepMD center mask: "
+            "DeePMD center mask: "
             f"energy_diff={total_energy_difference:.6e} eV "
             f"atomic_diff={atomic_energy_difference:.6e} eV "
             f"force_diff={force_difference:.6e} eV/A "
@@ -431,11 +431,11 @@ def main() -> int:
             f"reaction_force_min={min(float(adapter_results[name]['environment_force_min_ev_per_angstrom']) for name in adapter_results):.6e} eV/A"
         )
         if failures:
-            print(f"DeepMD center-mask check failed: {failures}", file=sys.stderr)
+            print(f"DeePMD center-mask check failed: {failures}", file=sys.stderr)
             return 1
         return 0
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"DeepMD center-mask check failed: {error}", file=sys.stderr)
+        print(f"DeePMD center-mask check failed: {error}", file=sys.stderr)
         return 1
 
 

@@ -118,7 +118,7 @@ provides:
   cutoff-crossing test proving zero-charge shell equivalence plus FRESH-to-WARM
   reuse without a plan rebuild; and a two-partition ragged-topology rebuild
   test;
-- an optional DeePMD C API v31+ integration inside `dprcplugin.so`, with
+- an optional DeePMD C API v30+ integration inside `dprcplugin.so`, with
   center-mask, batch-2-versus-batch-1, symbol-boundary, and QM/MM overlay
   additivity tests;
 - a hash-verifying, resumable external ETP/ETH runner that generates the full
@@ -199,7 +199,7 @@ implementation from interposing on LAMMPS or another plugin under
 `RTLD_GLOBAL` loading.
 
 The DPRc runtime path is implemented inside `dprcplugin.so` through DeePMD's
-public C API v31+. It registers `dprc/deepmd/batch` and the `/kk` alias, uses
+public C API v30+. It registers `dprc/deepmd/batch` and the `/kk` alias, uses
 compact group-only input, and requires `partition_batch yes`. One GPU-local
 owner loads the model and evaluates a block-diagonal graph across synchronized
 windows. The plugin has a direct `libdeepmd_c` dependency but no DeePMD C++ or
@@ -293,7 +293,7 @@ tallies.  It rejects slab, staggered/ad PPPM, r-RESPA, per-atom tallies, and
 continuously changing cells rather than falling back to duplicate per-window
 work.
 
-To enable compact DeePMD batching, provide a DeePMD C API v31+ header and
+To enable compact DeePMD batching, provide a DeePMD C API v30+ header and
 shared library plus a declared, content-addressed artifact cohort:
 
 ```bash
@@ -306,7 +306,7 @@ python3 tools/deepmd_artifact_manifest.py write \
 cmake -S . -B build -G Ninja \
   <the xTBloom and LAMMPS options above> \
   -DDEEPMD_SOURCE_DIR="$PWD/../deepmd-kit" \
-  -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v31-revision> \
+  -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v30-revision> \
   -DDPRC_DEEPMD_INCLUDE_DIR=/path/to/deepmd/include \
   -DDPRC_DEEPMD_C_LIBRARY=/path/to/libdeepmd_c.so \
   -DDPRC_DEEPMD_ARTIFACT_MANIFEST=/path/to/deepmd-artifact-manifest.json \

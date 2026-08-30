@@ -264,6 +264,19 @@ struct StagedResult {
       slice_near(batch.full_virial, expected.full_virial, 6);
 }
 
+[[nodiscard]] bool pair_scalars_equal(const StagedResult &batch,
+                                      std::size_t frame,
+                                      const StagedResult &expected) {
+  if (batch.lj[frame] != expected.lj[0] ||
+      batch.coulomb[frame] != expected.coulomb[0])
+    return false;
+  for (int component = 0; component < 6; ++component)
+    if (batch.pair_virial[6 * frame + component] !=
+        expected.pair_virial[component])
+      return false;
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -390,7 +403,10 @@ int main() {
         DPRC::create_classical_batch_plan(make_topology(), cuda_options);
     const StagedResult cuda_first =
         run(*cuda_sequential, 1, frame0, mm_one, qm_one);
+    const StagedResult cuda_second =
+        run(*cuda_sequential, 1, frame1, mm_one, qm_one);
     CHECK(results_near(first, cuda_first));
+    CHECK(results_near(second, cuda_second));
 
     // Pure classical publication requests the three reciprocal force fields
     // without the scalar potential needed only by QM embedding.  It must
@@ -487,8 +503,14 @@ int main() {
       }
       const StagedResult scaling = run(*cuda_scaling, scaling_batch,
                                        scaling_positions, scaling_mm, scaling_qm);
-      for (std::size_t frame = 0; frame < scaling_batch; ++frame)
+      for (std::size_t frame = 0; frame < scaling_batch; ++frame) {
         CHECK(frame_near(scaling, frame, frame % 2 == 0 ? first : second));
+        // Publication gates compare one-window and batched global energies.
+        // Require exact pair scalar publication here so CUDA block scheduling
+        // cannot create a tolerance-dependent pass or fail.
+        CHECK(pair_scalars_equal(
+            scaling, frame, frame % 2 == 0 ? cuda_first : cuda_second));
+      }
     }
 
     // Reuse the cell list below skin/2, then force a rebuild above skin/2.
