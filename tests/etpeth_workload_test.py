@@ -1185,7 +1185,15 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 payload.update(
                     {
                         "name": name,
-                        "status": "passed",
+                        "status": "passed" if accepted else "failed",
+                        **(
+                            {
+                                "failure_classification": "expected-first-hit-no-hit",
+                                "error": "first-hit acceptance failed: no accepted Colvars sample",
+                            }
+                            if not accepted
+                            else {}
+                        ),
                         "steps_per_window": kwargs["steps"],
                         "timestep_offset": 0,
                         "restart_checkpoint_frequency_steps": 0,
@@ -1206,7 +1214,7 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 WORKLOAD.write_json_atomic(record_path, payload)
                 return record_path
 
-            def load_invocation_record(path, _common):
+            def load_invocation_record(path, _common, **_kwargs):
                 return json.loads(path.read_text(encoding="utf-8"))
 
             with (

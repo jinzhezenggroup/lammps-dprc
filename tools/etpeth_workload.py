@@ -2169,9 +2169,19 @@ def require_recorded_output(record_path: Path, tag: str, expected_path: Path) ->
 
 
 def validate_invocation_record_current(
-    record_path: Path, common: dict[str, Any]
+    record_path: Path,
+    common: dict[str, Any],
+    *,
+    allow_expected_first_hit_no_hit: bool = False,
 ) -> dict[str, Any]:
-    """Validate one accepted invocation against current bytes and loader state."""
+    """Validate one invocation against current bytes and loader state.
+
+    Normal callers accept only ``passed`` records.  The adaptive first-hit
+    seed search is the one deliberate exception: a clean LAMMPS run may reach
+    its reviewed pilot endpoint without finding the gate.  Such a record is
+    accepted only when the caller explicitly opts in and the record carries
+    the complete, fail-closed no-hit classification below.
+    """
     if not record_path.is_file():
         raise ValueError(f"accepted invocation record is missing: {record_path}")
     try:
@@ -2180,8 +2190,81 @@ def validate_invocation_record_current(
         raise ValueError(
             f"could not read invocation record {record_path}: {error}"
         ) from error
-    if record.get("status") != "passed":
+    expected_first_hit_no_hit = (
+        allow_expected_first_hit_no_hit
+        and record.get("status") == "failed"
+        and record.get("failure_classification") == "expected-first-hit-no-hit"
+    )
+    if record.get("status") != "passed" and not expected_first_hit_no_hit:
         raise ValueError(f"invocation did not pass: {record_path}")
+    if expected_first_hit_no_hit:
+        # A no-hit pilot is an expected scientific result, not a crashed or
+        # partially completed process.  Keep this classification narrow so a
+        # failed invocation cannot enter the seed ledger merely by changing a
+        # status string.  The later first-hit validator independently checks
+        # that the Colvars file contains no accepted row.
+        returncode = record.get("returncode")
+        if (
+            isinstance(returncode, bool)
+            or not isinstance(returncode, int)
+            or returncode != 0
+        ):
+            raise ValueError(
+                f"expected first-hit no-hit record did not exit cleanly: {record_path}"
+            )
+        if record.get("stop_on_seed_acceptance") is not True:
+            raise ValueError(
+                f"expected first-hit no-hit record was not a first-hit run: {record_path}"
+            )
+        error = record.get("error")
+        if not isinstance(error, str) or not error.startswith(
+            "first-hit acceptance failed:"
+        ):
+            raise ValueError(
+                f"expected first-hit no-hit record has invalid failure detail: {record_path}"
+            )
+        steps = record.get("steps_per_window")
+        if (
+            isinstance(steps, bool)
+            or not isinstance(steps, int)
+            or steps <= 0
+            or record.get("timestep_offset") != 0
+        ):
+            raise ValueError(
+                f"expected first-hit no-hit record has invalid timeline: {record_path}"
+            )
+        outputs = record.get("outputs")
+        completed_steps = record.get("completed_steps_by_window")
+        if (
+            not isinstance(outputs, dict)
+            or not outputs
+            or not isinstance(completed_steps, dict)
+            or set(completed_steps) != set(outputs)
+            or record.get("aggregate_window_steps")
+            != steps * len(outputs)
+        ):
+            raise ValueError(
+                f"expected first-hit no-hit record has incomplete progress: {record_path}"
+            )
+        for tag, output in outputs.items():
+            first_hit = output.get("first_hit") if isinstance(output, dict) else None
+            if (
+                not isinstance(output, dict)
+                or output.get("seed_acceptance") is not False
+                or not isinstance(first_hit, dict)
+                or first_hit.get("accepted_sample_found") is not False
+                or isinstance(first_hit.get("scheduled_steps"), bool)
+                or first_hit.get("scheduled_steps") != steps
+                or isinstance(first_hit.get("completed_steps"), bool)
+                or first_hit.get("completed_steps") != steps
+                or first_hit.get("halted_early") is not False
+                or isinstance(completed_steps.get(tag), bool)
+                or completed_steps.get(tag) != steps
+            ):
+                raise ValueError(
+                    f"expected first-hit no-hit record has inconsistent output: "
+                    f"{record_path} ({tag})"
+                )
     restart_checkpoint_frequency = record.get(
         "restart_checkpoint_frequency_steps", 0
     )
@@ -2944,7 +3027,11 @@ def validate_first_hit_seed_round_record(
             invocation_path = Path(identity["path"])
             if not artifact_matches(identity, invocation_path):
                 raise ValueError(f"seed first-hit record changed for {tag}")
-            invocation = validate_invocation_record_current(invocation_path, common)
+            invocation = validate_invocation_record_current(
+                invocation_path,
+                common,
+                allow_expected_first_hit_no_hit=True,
+            )
             expected_attempt = seed_attempt_metadata(
                 manifest,
                 [window],
@@ -4187,6 +4274,7 @@ def run_invocation(
             # record (never ``passed``/resumable), but return the record so the
             # caller can advance to the next reviewed pilot duration.
             record["status"] = "failed"
+            record["failure_classification"] = "expected-first-hit-no-hit"
             record["error"] = (
                 "first-hit acceptance failed: " + "; ".join(rejected_first_hits)
             )

@@ -24,17 +24,21 @@ git clone https://github.com/jinzhezenggroup/lammps-dprc.git
 ```
 
 For QM/MM plus DPA4c, also obtain a clean DeePMD-kit revision that provides
-public C API version 31 or newer and the canonical batch symbols used here:
+public C API version 30 or newer. API v30 supplies the canonical-graph entry
+point used by the packed fallback; API v31 or newer additionally supplies the
+explicit frame-axis batch entry point:
 
 ```bash
 git clone https://github.com/<publisher>/deepmd-kit.git deepmd-kit
-git -C deepmd-kit checkout <reviewed-api-v31-revision>
+git -C deepmd-kit checkout <reviewed-api-v30-or-newer-revision>
 ```
 
-The currently recorded DeePMD design-reference pin predates C API version 31.
-Replace the placeholder only with a clean, immutable revision after that API
-has been published and reviewed. A dirty local API implementation is suitable
-for development tests, not a public reproducibility or performance claim.
+The currently recorded DeePMD design-reference pin provides the v30
+canonical-graph entry point but predates the v31 explicit frame-axis
+extension. Replace the placeholder only with a clean, immutable revision after
+that API has been published and reviewed. A dirty local API implementation is
+suitable for development tests, not a public reproducibility or performance
+claim.
 
 Verify the required public pins:
 
@@ -174,7 +178,7 @@ add `-DXTBLOOM_CPU_LINALG_LIBRARY=/path/to/lp64/lapacke-cblas.so`.
 ## 6. Build the DeePMD C API
 
 This step is required only for QM/MM plus DPA4c. Build the public C API and a
-CUDA-capable PyTorch backend from the reviewed API-v31 revision. The exact
+CUDA-capable PyTorch backend from the reviewed API-v30-or-newer revision. The exact
 PyTorch prefix is installation-specific.
 
 ```bash
@@ -213,10 +217,13 @@ python3 "$DPRC_WORKSPACE/lammps-dprc/tools/deepmd_artifact_manifest.py" write \
 rg -n '^#define[[:space:]]+DP_C_API_VERSION' \
   "$DPRC_DEEPMD_INCLUDE_DIR/deepmd/c_api.h"
 nm -D "$DPRC_DEEPMD_C_LIBRARY" | \
-  rg 'DP_DeepPotComputeCanonicalGraphBatchGPU'
+  rg 'DP_DeepPotComputeCanonicalGraph(GPU|BatchGPU)'
 ```
 
-Stop if the C API version is below 31 or the batch symbol is absent.
+Stop if the C API version is below 30 or neither canonical-graph symbol is
+present. With API v30, the plugin validates and evaluates a packed
+block-diagonal graph through `DP_DeepPotComputeCanonicalGraphGPU`; with API v31
+or newer it selects the explicit frame-axis batch entry point.
 
 ## 7. Build LAMMPS-DPRc
 
@@ -251,7 +258,7 @@ cmake -S lammps-dprc -B lammps-dprc/build/cuda -G Ninja \
   -DDPRC_XTBLOOM_BACKEND=CUDA \
   -DDPRC_XTBLOOM_DEVICE_ID=0 \
   -DDEEPMD_SOURCE_DIR="$DPRC_WORKSPACE/deepmd-kit" \
-  -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v31-revision> \
+  -DDPRC_EXPECTED_DEEPMD_REVISION=<reviewed-api-v30-or-newer-revision> \
   -DDPRC_DEEPMD_INCLUDE_DIR="$DPRC_DEEPMD_INCLUDE_DIR" \
   -DDPRC_DEEPMD_C_LIBRARY="$DPRC_DEEPMD_C_LIBRARY" \
   -DDPRC_DEEPMD_ARTIFACT_MANIFEST="$DPRC_DEEPMD_ARTIFACT_MANIFEST" \
