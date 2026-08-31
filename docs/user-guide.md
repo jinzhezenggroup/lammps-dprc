@@ -64,6 +64,11 @@ standalone DeePMD LAMMPS plugin or expose DeePMD C++ implementation symbols.
 The plugin binary is specific to the exact LAMMPS, MPI, compiler ABI, and
 integer-size configuration used to build it.
 
+For a configured LAMMPS executable, the default CMake policy fingerprints its
+resolved MPI shared object and rejects a plugin build linked against a
+different object. Keep `DPRC_REQUIRE_MATCHING_LAMMPS_MPI=ON` for production;
+do not bypass this check to work around a scheduler or loader failure.
+
 Production workflow and benchmark records include the resolved `libdeepmd_c`
 path, SONAME, and SHA-256. This loader identity is checked again before a saved
 workflow invocation is reused. CMake separately rejects a DeePMD header or

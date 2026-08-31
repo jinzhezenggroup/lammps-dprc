@@ -81,6 +81,9 @@ option(DPRC_REQUIRE_XTBLOOM_LIBRARY
   "Fail configuration unless the xTBloom integration library is available" OFF)
 option(DPRC_REQUIRE_DEEPMD_C_API
   "Fail configuration unless the DeePMD C API library is available" OFF)
+option(DPRC_REQUIRE_MATCHING_LAMMPS_MPI
+  "When a LAMMPS executable is supplied, require its resolved MPI library to match the plugin link input"
+  ON)
 set(DPRC_CUFFT_INCLUDE_DIR "" CACHE PATH
   "Directory containing cufft.h for the classical CUDA backend")
 set(DPRC_CUFFT_LIBRARY "" CACHE FILEPATH
@@ -261,6 +264,103 @@ endif()
 
 set(MPI_CXX_SKIP_MPICXX TRUE)
 find_package(MPI REQUIRED COMPONENTS CXX)
+
+# A plugin and its host executable share one MPI process image.  Matching only
+# the MPI SONAME is insufficient: independent MPICH builds can export the same
+# SONAME while carrying incompatible ABI and UCX/OFI internals.  When the
+# selected LAMMPS executable is available, compare the actual resolved MPI
+# object with the object selected by FindMPI before compiling any plugin code.
+function(dprc_resolve_mpi_from_executable executable output_path)
+  if(NOT UNIX OR APPLE)
+    set(${output_path} "" PARENT_SCOPE)
+    return()
+  endif()
+
+  find_program(_dprc_ldd_EXECUTABLE ldd)
+  if(NOT _dprc_ldd_EXECUTABLE)
+    message(FATAL_ERROR
+      "DPRC_REQUIRE_MATCHING_LAMMPS_MPI=ON requires ldd to inspect ${executable}")
+  endif()
+  execute_process(
+    COMMAND "${_dprc_ldd_EXECUTABLE}" "${executable}"
+    OUTPUT_VARIABLE _dprc_ldd_output
+    ERROR_VARIABLE _dprc_ldd_error
+    RESULT_VARIABLE _dprc_ldd_status)
+  if(NOT _dprc_ldd_status EQUAL 0)
+    message(FATAL_ERROR
+      "Could not inspect the LAMMPS executable with ldd: ${_dprc_ldd_error}")
+  endif()
+
+  string(REPLACE "\n" ";" _dprc_ldd_lines "${_dprc_ldd_output}")
+  set(_dprc_mpi_path "")
+  foreach(_dprc_ldd_line IN LISTS _dprc_ldd_lines)
+    if(_dprc_ldd_line MATCHES "libmpi[^ \t]*[ \t]*=>[ \t]*([^ \t(]+)")
+      set(_dprc_mpi_path "${CMAKE_MATCH_1}")
+      break()
+    endif()
+  endforeach()
+  if(NOT _dprc_mpi_path OR NOT EXISTS "${_dprc_mpi_path}")
+    message(FATAL_ERROR
+      "ldd could not resolve a libmpi dependency for ${executable}; refusing to "
+      "build a plugin with an unknown MPI runtime")
+  endif()
+
+  file(REAL_PATH "${_dprc_mpi_path}" _dprc_mpi_realpath)
+  set(${output_path} "${_dprc_mpi_realpath}" PARENT_SCOPE)
+endfunction()
+
+function(dprc_resolve_mpi_link_input link_input output_path)
+  # FindMPI commonly returns a GNU ld linker script (libmpi.so) rather than
+  # the ELF SONAME object (libmpi.so.12).  Resolve the INPUT() member so the
+  # comparison below fingerprints the library loaded at runtime.
+  file(READ "${link_input}" _dprc_mpi_link_contents LIMIT 4096)
+  if(_dprc_mpi_link_contents MATCHES
+     "INPUT\\([^)]*([A-Za-z0-9_./+-]*libmpi\\.so[^) \t]*)")
+    get_filename_component(_dprc_mpi_link_dir "${link_input}" DIRECTORY)
+    set(_dprc_mpi_candidate "${CMAKE_MATCH_1}")
+    if(NOT IS_ABSOLUTE "${_dprc_mpi_candidate}")
+      set(_dprc_mpi_candidate "${_dprc_mpi_link_dir}/${_dprc_mpi_candidate}")
+    endif()
+  else()
+    set(_dprc_mpi_candidate "${link_input}")
+  endif()
+  if(NOT EXISTS "${_dprc_mpi_candidate}")
+    message(FATAL_ERROR
+      "FindMPI selected ${link_input}, but its runtime MPI object could not be resolved")
+  endif()
+  file(REAL_PATH "${_dprc_mpi_candidate}" _dprc_mpi_realpath)
+  set(${output_path} "${_dprc_mpi_realpath}" PARENT_SCOPE)
+endfunction()
+
+if(DPRC_REQUIRE_MATCHING_LAMMPS_MPI AND DPRC_LAMMPS_EXECUTABLE)
+  if(NOT EXISTS "${DPRC_LAMMPS_EXECUTABLE}")
+    message(FATAL_ERROR
+      "DPRC_LAMMPS_EXECUTABLE does not exist: ${DPRC_LAMMPS_EXECUTABLE}")
+  endif()
+  if(NOT MPI_mpi_LIBRARY OR NOT EXISTS "${MPI_mpi_LIBRARY}")
+    message(FATAL_ERROR
+      "FindMPI did not expose a concrete MPI_mpi_LIBRARY; cannot verify MPI "
+      "compatibility with ${DPRC_LAMMPS_EXECUTABLE}")
+  endif()
+
+  dprc_resolve_mpi_link_input(
+    "${MPI_mpi_LIBRARY}" _dprc_plugin_mpi_realpath)
+  dprc_resolve_mpi_from_executable(
+    "${DPRC_LAMMPS_EXECUTABLE}" _dprc_lammps_mpi_realpath)
+  file(SHA256 "${_dprc_plugin_mpi_realpath}" _dprc_plugin_mpi_sha256)
+  file(SHA256 "${_dprc_lammps_mpi_realpath}" _dprc_lammps_mpi_sha256)
+  message(STATUS
+    "DPRc MPI link: ${_dprc_plugin_mpi_realpath} "
+    "(SHA-256 ${_dprc_plugin_mpi_sha256})")
+  message(STATUS
+    "LAMMPS MPI runtime: ${_dprc_lammps_mpi_realpath} "
+    "(SHA-256 ${_dprc_lammps_mpi_sha256})")
+  if(NOT _dprc_plugin_mpi_sha256 STREQUAL _dprc_lammps_mpi_sha256)
+    message(FATAL_ERROR
+      "LAMMPS and dprcplugin use different MPI libraries. Reconfigure with "
+      "the exact MPI wrapper used to build LAMMPS (MPI_CXX_COMPILER=${MPI_CXX_COMPILER}).")
+  endif()
+endif()
 
 if(DPRC_XTBLOOM_LIBRARY AND NOT EXISTS "${DPRC_XTBLOOM_LIBRARY}")
   message(FATAL_ERROR "DPRC_XTBLOOM_LIBRARY does not exist: ${DPRC_XTBLOOM_LIBRARY}")
