@@ -3,9 +3,11 @@
 LAMMPS-DPRc provides one source-built LAMMPS plugin for batched xTB QM/MM and
 an optional compact DPA4c DPRc correction. The intended production layout is
 one MPI rank per independent LAMMPS partition, with all partitions on one
-GPU-local shared-memory node. The MPI implementation must provide MPI-3 shared
-windows with the unified memory model (`MPI_WIN_UNIFIED`); the plugin rejects a
-separate-model window before publishing any graph or force data.
+GPU-local shared-memory node. The MPI implementation must provide an MPI-3
+shared-memory communicator. The DeePMD path uses host `MPI_Gatherv`/
+`MPI_Scatterv` staging and does not require an MPI unified shared-data window;
+the xTBloom and classical CUDA brokers retain their own shared-window
+requirements.
 
 The plugin contains both the xTB QM/MM styles and the DeePMD C API adapter.
 Users load only `dprcplugin.so`; a separate DeePMD LAMMPS plugin is neither

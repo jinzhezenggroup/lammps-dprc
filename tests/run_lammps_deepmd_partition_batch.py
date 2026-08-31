@@ -2,13 +2,13 @@
 """Compare repeated two-frame DeePMD batching with independent B1 calls.
 
 The test expands the compact DPA4c center-mask system with enough environment
-atoms to exceed the broker's allocation slack. Each process first evaluates a
-four-center graph, then moves 76 environment atoms inside the cutoff and
-evaluates an 80-node graph. At B=2 this grows from 8 required nodes (capacity
-73) to 160 required nodes, forcing shared-window release and reallocation.
-Each independent calculation and the two-partition calculation use
+atoms to exercise repeated host staging and device-buffer growth. Each process
+first evaluates a four-center graph, then moves 76 environment atoms inside the
+cutoff and evaluates an 80-node graph. At B=2 this grows from 8 required nodes
+to 160 required nodes, forcing the executor's reusable device capacities to
+grow. Each independent calculation and the two-partition calculation use
 ``dprc/deepmd/batch partition_batch yes``; therefore the comparison covers
-repeated publication, shared-window capacity growth, block-diagonal assembly,
+repeated publication, host Gatherv/Scatterv staging, block-diagonal assembly,
 frame ordering, and result slicing.
 """
 
@@ -40,7 +40,7 @@ ATOMIC_ENERGY_TOLERANCE_EV = 2.0e-5
 FORCE_TOLERANCE_EV_PER_ANGSTROM = 2.0e-4
 PARTITION_ATOM_COUNT = 80
 INITIAL_TOTAL_NODES = 2 * len(CENTER.CENTER_ATOMS)
-INITIAL_NODE_CAPACITY = INITIAL_TOTAL_NODES + INITIAL_TOTAL_NODES // 8 + 64
+INITIAL_NODE_CAPACITY = INITIAL_TOTAL_NODES + INITIAL_TOTAL_NODES // 50 + 64
 FINAL_TOTAL_NODES = 2 * PARTITION_ATOM_COUNT
 
 
@@ -54,7 +54,7 @@ def sha256(path: Path) -> str:
 
 
 def frame_data(index: int) -> str:
-    """Return a nondegenerate configuration that forces capacity growth."""
+    """Return a nondegenerate configuration that exercises capacity growth."""
     text = CENTER.render_data()
     if index == 1:
         text = text.replace(
@@ -228,7 +228,7 @@ def main() -> int:
                 serial_results.append(
                     (
                         CENTER.parse_energy(energy_file),
-                        CENTER.parse_atoms(atom_file, PARTITION_ATOM_COUNT),
+                        CENTER.parse_atoms(atom_file, atom_count=PARTITION_ATOM_COUNT),
                     )
                 )
 
@@ -287,7 +287,9 @@ def main() -> int:
             batch_results = [
                 (
                     CENTER.parse_energy(batch_energy[frame]),
-                    CENTER.parse_atoms(batch_atoms[frame], PARTITION_ATOM_COUNT),
+                    CENTER.parse_atoms(
+                        batch_atoms[frame], atom_count=PARTITION_ATOM_COUNT
+                    ),
                 )
                 for frame in range(2)
             ]
@@ -324,14 +326,13 @@ def main() -> int:
                 "independent B1 calls"
             ),
             "deepmd_revision": arguments.deepmd_revision,
-            "shared_window_contract": {
-                "memory_model": "MPI_WIN_UNIFIED required by broker",
+            "transport_contract": {
+                "memory_model": "MPI-3 shared communicator; host Gatherv/Scatterv",
                 "compute_calls_per_process": 2,
                 "graph_sequence": "4-node center-only then 80-node expanded graph",
                 "initial_total_nodes": INITIAL_TOTAL_NODES,
-                "initial_node_capacity": INITIAL_NODE_CAPACITY,
                 "final_total_nodes": FINAL_TOTAL_NODES,
-                "node_capacity_growth_forced": (
+                "device_capacity_growth_forced": (
                     FINAL_TOTAL_NODES > INITIAL_NODE_CAPACITY
                 ),
             },

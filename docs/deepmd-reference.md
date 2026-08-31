@@ -39,8 +39,10 @@ CUDA through the public C API.
 One partition-root communicator is created across independent LAMMPS worlds.
 Rank zero alone loads the model and owns the CUDA context. Every rank contributes
 one compact canonical graph; the owner assembles one block-diagonal batch,
-executes a single C API call, and scatters complete result slices only after the
-whole call succeeds.
+exchanges it through host `MPI_Gatherv` staging, executes a single C API call,
+and scatters complete result slices only after the whole call succeeds. The
+communicator must be MPI-3 and GPU-local; this DeePMD transport does not depend
+on the MPI unified shared-window memory model.
 
 ```lammps
 plugin load /path/to/dprcplugin.so
