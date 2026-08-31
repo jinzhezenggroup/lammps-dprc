@@ -65,7 +65,8 @@ enum class SccStartPolicy { Fresh, Warm };
 // StableBatch owns the allocation-stable ragged input image used by one
 // fixed-topology xTBloom plan. It also mirrors xTBloom's whole-batch strict
 // WARM contract: one failed peer invalidates readiness for the complete next
-// batch, while successful peer outputs remain independently publishable.
+// batch.  The corresponding output transaction must also be all-or-nothing;
+// successful peer slices are not independently publishable.
 class StableBatch {
 public:
   explicit StableBatch(std::vector<WindowTopology> topologies);
@@ -132,6 +133,11 @@ public:
   // any failed system revokes the whole plan checkpoint, matching xTBloom.
   void complete_compute(bool call_succeeded, const std::int32_t *statuses,
                         std::size_t status_count, std::int32_t success_status);
+
+  // Revoke a checkpoint after a post-native publication validation failure.
+  // This is noexcept because it is used on an error path that must remain
+  // recoverable without reopening a compute transaction.
+  void invalidate_warm_checkpoint() noexcept { warm_ready_ = false; }
 
 private:
   void clear_staging() noexcept;

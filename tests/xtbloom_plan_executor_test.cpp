@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -187,7 +188,7 @@ int test_pinned_xtb_water_point_charge_oracle() {
   return 0;
 }
 
-int test_native_failure_isolation_and_fresh_recovery() {
+int test_native_failure_is_atomic_and_fresh_recovery() {
   DPRC::XtbloomExecutorOptions options;
   options.backend = XTBLOOM_BACKEND_CPU;
   options.cpu_threads = 2;
@@ -205,20 +206,20 @@ int test_native_failure_isolation_and_fresh_recovery() {
   executor.stage(make_gas_frame(1, 1, 1.1e-6));
   const DPRC::XtbloomComputeOutcome peer_failure = executor.compute();
   CHECK(peer_failure.call_status == XTBLOOM_STATUS_SUCCESS);
+  CHECK(!peer_failure.all_systems_succeeded);
   CHECK(peer_failure.start_policy == DPRC::SccStartPolicy::Warm);
-  const DPRC::WindowResultView successful_peer = executor.result_for_window(0);
-  const DPRC::WindowResultView failed_peer = executor.result_for_window(1);
-  CHECK(successful_peer.status == XTBLOOM_STATUS_SUCCESS);
-  CHECK(successful_peer.scc_converged);
-  CHECK(std::isfinite(successful_peer.energy));
-  CHECK(failed_peer.status == XTBLOOM_STATUS_EIGENSOLVER_FAILED ||
-        failed_peer.status == XTBLOOM_STATUS_SCC_NOT_CONVERGED);
-  CHECK(!failed_peer.scc_converged);
-  CHECK(std::isnan(failed_peer.energy));
-  for (std::size_t coordinate = 0; coordinate < 6u; ++coordinate)
-    CHECK(std::isnan(failed_peer.forces[coordinate]));
-  for (std::size_t atom = 0; atom < 2u; ++atom)
-    CHECK(std::isnan(failed_peer.atomic_charges[atom]));
+  CHECK(!executor.has_result());
+  CHECK(!executor.last_error().empty());
+  CHECK(executor.last_error().find("window 1") != std::string::npos);
+  for (const int window : {0, 1}) {
+    bool rejected_result = false;
+    try {
+      static_cast<void>(executor.result_for_window(window));
+    } catch (const std::logic_error &) {
+      rejected_result = true;
+    }
+    CHECK(rejected_result);
+  }
   CHECK(!executor.batch().warm_ready());
 
   executor.stage(make_gas_frame(0, 2));
@@ -259,7 +260,7 @@ int test_native_failure_isolation_and_fresh_recovery() {
 int main() {
   if (const int result = test_pinned_xtb_water_point_charge_oracle())
     return result;
-  if (const int result = test_native_failure_isolation_and_fresh_recovery())
+  if (const int result = test_native_failure_is_atomic_and_fresh_recovery())
     return result;
 
   DPRC::XtbloomExecutorOptions incomplete_options;

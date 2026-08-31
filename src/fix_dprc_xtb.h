@@ -26,8 +26,14 @@ public:
       FixDPRCXtbReference(lmp, narg, arg) {}
   ~FixDPRCXtb() override;
 
+  // The Kokkos Verlet loop builds legacy host neighbor lists before
+  // PRE_FORCE.  Publish the device-integrated coordinates at that boundary
+  // so the legacy QMMM pair/neighbor path never observes stale positions.
+  int setmask() override;
   void init() override;
+  void pre_neighbor() override;
   void pre_force(int vflag) override;
+  void post_force(int vflag) override;
 
 #ifdef DPRC_ENABLE_TEST_HOOKS
   // Arm the test-only one-shot exception used to prove that a prepared fused

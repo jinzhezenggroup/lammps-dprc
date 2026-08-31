@@ -77,10 +77,19 @@ option(DPRC_ENABLE_CLASSICAL_CUDA
   "Build the single-context batched CUDA LJ/TIP4P/PPPM backend" OFF)
 option(DPRC_ENABLE_KOKKOS_RUNTIME_TESTS
   "Run GPU tests that require a Kokkos-enabled LAMMPS executable" OFF)
+option(DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE
+  "Synchronize legacy atom arrays around the non-KOKKOS QM/MM fix" OFF)
+set(DPRC_LAMMPS_KOKKOS_INCLUDE_DIR "" CACHE PATH
+  "Directory containing the Kokkos core headers (Kokkos_Core.hpp)")
+set(DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR "" CACHE PATH
+  "Directory containing the generated KokkosCore_config.h for the host LAMMPS build")
 option(DPRC_REQUIRE_XTBLOOM_LIBRARY
   "Fail configuration unless the xTBloom integration library is available" OFF)
 option(DPRC_REQUIRE_DEEPMD_C_API
   "Fail configuration unless the DeePMD C API library is available" OFF)
+option(DPRC_REQUIRE_MATCHING_LAMMPS_MPI
+  "When a LAMMPS executable is supplied, require its resolved MPI library to match the plugin link input"
+  ON)
 set(DPRC_CUFFT_INCLUDE_DIR "" CACHE PATH
   "Directory containing cufft.h for the classical CUDA backend")
 set(DPRC_CUFFT_LIBRARY "" CACHE FILEPATH
@@ -262,6 +271,186 @@ endif()
 set(MPI_CXX_SKIP_MPICXX TRUE)
 find_package(MPI REQUIRED COMPONENTS CXX)
 
+# A plugin and its host executable share one MPI process image.  Matching only
+# the MPI SONAME is insufficient: independent MPICH builds can export the same
+# SONAME while carrying incompatible ABI and UCX/OFI internals.  When the
+# selected LAMMPS executable is available, compare the actual resolved MPI
+# object with the object selected by FindMPI before compiling any plugin code.
+function(dprc_resolve_mpi_from_executable executable output_path)
+  if(NOT UNIX OR APPLE)
+    set(${output_path} "" PARENT_SCOPE)
+    return()
+  endif()
+
+  find_program(_dprc_ldd_EXECUTABLE ldd)
+  if(NOT _dprc_ldd_EXECUTABLE)
+    message(FATAL_ERROR
+      "DPRC_REQUIRE_MATCHING_LAMMPS_MPI=ON requires ldd to inspect ${executable}")
+  endif()
+  execute_process(
+    COMMAND "${_dprc_ldd_EXECUTABLE}" "${executable}"
+    OUTPUT_VARIABLE _dprc_ldd_output
+    ERROR_VARIABLE _dprc_ldd_error
+    RESULT_VARIABLE _dprc_ldd_status)
+  if(NOT _dprc_ldd_status EQUAL 0)
+    message(FATAL_ERROR
+      "Could not inspect the LAMMPS executable with ldd: ${_dprc_ldd_error}")
+  endif()
+
+  string(REPLACE "\n" ";" _dprc_ldd_lines "${_dprc_ldd_output}")
+  set(_dprc_mpi_path "")
+  foreach(_dprc_ldd_line IN LISTS _dprc_ldd_lines)
+    if(_dprc_ldd_line MATCHES "libmpi[^ \t]*[ \t]*=>[ \t]*([^ \t(]+)")
+      set(_dprc_mpi_path "${CMAKE_MATCH_1}")
+      break()
+    endif()
+  endforeach()
+  if(NOT _dprc_mpi_path OR NOT EXISTS "${_dprc_mpi_path}")
+    message(FATAL_ERROR
+      "ldd could not resolve a libmpi dependency for ${executable}; refusing to "
+      "build a plugin with an unknown MPI runtime")
+  endif()
+
+  file(REAL_PATH "${_dprc_mpi_path}" _dprc_mpi_realpath)
+  set(${output_path} "${_dprc_mpi_realpath}" PARENT_SCOPE)
+endfunction()
+
+function(dprc_resolve_mpi_link_input link_input output_path)
+  # FindMPI commonly returns a GNU ld linker script (libmpi.so) rather than
+  # the ELF SONAME object (libmpi.so.12).  Resolve the INPUT() member so the
+  # comparison below fingerprints the library loaded at runtime.
+  file(READ "${link_input}" _dprc_mpi_link_contents LIMIT 4096)
+  if(_dprc_mpi_link_contents MATCHES
+     "INPUT\\([^)]*([A-Za-z0-9_./+-]*libmpi\\.so[^) \t]*)")
+    get_filename_component(_dprc_mpi_link_dir "${link_input}" DIRECTORY)
+    set(_dprc_mpi_candidate "${CMAKE_MATCH_1}")
+    if(NOT IS_ABSOLUTE "${_dprc_mpi_candidate}")
+      set(_dprc_mpi_candidate "${_dprc_mpi_link_dir}/${_dprc_mpi_candidate}")
+    endif()
+  else()
+    set(_dprc_mpi_candidate "${link_input}")
+  endif()
+  if(NOT EXISTS "${_dprc_mpi_candidate}")
+    message(FATAL_ERROR
+      "FindMPI selected ${link_input}, but its runtime MPI object could not be resolved")
+  endif()
+  file(REAL_PATH "${_dprc_mpi_candidate}" _dprc_mpi_realpath)
+  set(${output_path} "${_dprc_mpi_realpath}" PARENT_SCOPE)
+endfunction()
+
+function(dprc_find_mpi_link_input output_path)
+  # FindMPI may intentionally leave MPI_mpi_LIBRARY unset when the selected
+  # compiler wrapper supplies MPI through its implicit link line (the common
+  # Open MPI configuration on hosted runners).  Prefer an explicit library
+  # selected by FindMPI, then an absolute MPI_CXX library, and finally the
+  # compiler's implicit link directories.  The resulting object is still
+  # fingerprinted against the host executable below.
+  set(_dprc_mpi_input "")
+  if(MPI_mpi_LIBRARY AND EXISTS "${MPI_mpi_LIBRARY}")
+    set(_dprc_mpi_input "${MPI_mpi_LIBRARY}")
+  endif()
+
+  if(NOT _dprc_mpi_input)
+    foreach(_dprc_mpi_library IN LISTS MPI_CXX_LIBRARIES)
+      if(IS_ABSOLUTE "${_dprc_mpi_library}" AND
+         EXISTS "${_dprc_mpi_library}" AND
+         "${_dprc_mpi_library}" MATCHES "(^|/)libmpi([^/]*)(\\.so|\\.dylib|\\.a)(\\..*)?$")
+        set(_dprc_mpi_input "${_dprc_mpi_library}")
+        break()
+      endif()
+    endforeach()
+  endif()
+
+  if(NOT _dprc_mpi_input)
+    find_library(_dprc_mpi_implicit_library NAMES mpi
+      HINTS ${CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES}
+      NO_DEFAULT_PATH)
+    if(_dprc_mpi_implicit_library)
+      set(_dprc_mpi_input "${_dprc_mpi_implicit_library}")
+    endif()
+  endif()
+
+  if(NOT _dprc_mpi_input)
+    find_library(_dprc_mpi_default_library NAMES mpi)
+    if(_dprc_mpi_default_library)
+      set(_dprc_mpi_input "${_dprc_mpi_default_library}")
+    endif()
+  endif()
+
+  set(${output_path} "${_dprc_mpi_input}" PARENT_SCOPE)
+endfunction()
+
+function(dprc_reject_deepmd_mpi_dependencies deepmd_library lammps_mpi_object)
+  if(NOT UNIX OR APPLE)
+    return()
+  endif()
+  find_program(_dprc_readelf_EXECUTABLE readelf)
+  if(NOT _dprc_readelf_EXECUTABLE)
+    message(FATAL_ERROR
+      "DPRC_REQUIRE_MATCHING_LAMMPS_MPI=ON requires readelf to inspect DeePMD dependencies")
+  endif()
+
+  get_filename_component(_dprc_deepmd_api_dir "${deepmd_library}" DIRECTORY)
+  get_filename_component(_dprc_deepmd_runtime_root "${_dprc_deepmd_api_dir}" DIRECTORY)
+  file(GLOB_RECURSE _dprc_deepmd_shared_libraries
+    "${_dprc_deepmd_runtime_root}/*.so"
+    "${_dprc_deepmd_runtime_root}/*.so.*")
+  get_filename_component(_dprc_expected_mpi_soname "${lammps_mpi_object}" NAME)
+  foreach(_dprc_deepmd_shared_library IN LISTS _dprc_deepmd_shared_libraries)
+    execute_process(
+      COMMAND "${_dprc_readelf_EXECUTABLE}" -d "${_dprc_deepmd_shared_library}"
+      OUTPUT_VARIABLE _dprc_deepmd_dynamic_section
+      ERROR_QUIET
+      RESULT_VARIABLE _dprc_readelf_status)
+    if(NOT _dprc_readelf_status EQUAL 0)
+      continue()
+    endif()
+    string(REGEX MATCHALL "\\[libmpi[^]]+\\]" _dprc_mpi_needed_entries
+      "${_dprc_deepmd_dynamic_section}")
+    foreach(_dprc_mpi_needed_entry IN LISTS _dprc_mpi_needed_entries)
+      string(REGEX REPLACE "^\\[|\\]$" "" _dprc_mpi_needed_soname
+        "${_dprc_mpi_needed_entry}")
+      if(NOT _dprc_mpi_needed_soname STREQUAL _dprc_expected_mpi_soname)
+        message(FATAL_ERROR
+          "DeePMD runtime ${_dprc_deepmd_shared_library} requires "
+          "${_dprc_mpi_needed_soname}, but LAMMPS uses ${_dprc_expected_mpi_soname}. "
+          "Rebuild the DeePMD C API operator with the same MPI runtime or with MPI disabled.")
+      endif()
+    endforeach()
+  endforeach()
+endfunction()
+
+if(DPRC_REQUIRE_MATCHING_LAMMPS_MPI AND DPRC_LAMMPS_EXECUTABLE)
+  if(NOT EXISTS "${DPRC_LAMMPS_EXECUTABLE}")
+    message(FATAL_ERROR
+      "DPRC_LAMMPS_EXECUTABLE does not exist: ${DPRC_LAMMPS_EXECUTABLE}")
+  endif()
+  dprc_find_mpi_link_input(_dprc_mpi_link_input)
+  if(NOT _dprc_mpi_link_input OR NOT EXISTS "${_dprc_mpi_link_input}")
+    message(FATAL_ERROR
+      "Could not resolve the MPI library selected by FindMPI; cannot verify MPI "
+      "compatibility with ${DPRC_LAMMPS_EXECUTABLE}")
+  endif()
+
+  dprc_resolve_mpi_link_input(
+    "${_dprc_mpi_link_input}" _dprc_plugin_mpi_realpath)
+  dprc_resolve_mpi_from_executable(
+    "${DPRC_LAMMPS_EXECUTABLE}" _dprc_lammps_mpi_realpath)
+  file(SHA256 "${_dprc_plugin_mpi_realpath}" _dprc_plugin_mpi_sha256)
+  file(SHA256 "${_dprc_lammps_mpi_realpath}" _dprc_lammps_mpi_sha256)
+  message(STATUS
+    "DPRc MPI link: ${_dprc_plugin_mpi_realpath} "
+    "(SHA-256 ${_dprc_plugin_mpi_sha256})")
+  message(STATUS
+    "LAMMPS MPI runtime: ${_dprc_lammps_mpi_realpath} "
+    "(SHA-256 ${_dprc_lammps_mpi_sha256})")
+  if(NOT _dprc_plugin_mpi_sha256 STREQUAL _dprc_lammps_mpi_sha256)
+    message(FATAL_ERROR
+      "LAMMPS and dprcplugin use different MPI libraries. Reconfigure with "
+      "the exact MPI wrapper used to build LAMMPS (MPI_CXX_COMPILER=${MPI_CXX_COMPILER}).")
+  endif()
+endif()
+
 if(DPRC_XTBLOOM_LIBRARY AND NOT EXISTS "${DPRC_XTBLOOM_LIBRARY}")
   message(FATAL_ERROR "DPRC_XTBLOOM_LIBRARY does not exist: ${DPRC_XTBLOOM_LIBRARY}")
 endif()
@@ -380,6 +569,10 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
     IMPORTED_LOCATION "${_dprc_deepmd_c_library_realpath}"
     INTERFACE_INCLUDE_DIRECTORIES "${DPRC_DEEPMD_INCLUDE_DIR}")
   set(_dprc_deepmd_enabled ON)
+  if(DPRC_REQUIRE_MATCHING_LAMMPS_MPI AND DPRC_LAMMPS_EXECUTABLE)
+    dprc_reject_deepmd_mpi_dependencies(
+      "${_dprc_deepmd_c_library_realpath}" "${_dprc_lammps_mpi_realpath}")
+  endif()
   message(STATUS
     "DeePMD C API runtime: ${_dprc_deepmd_c_library_realpath} "
     "(SHA-256 ${_dprc_deepmd_c_library_sha256}; declared artifact manifest "
@@ -678,6 +871,83 @@ if(DPRC_XTBLOOM_LIBRARY)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${_dprc_fused_source_dir}"
     "${LAMMPS_SOURCE_DIR}/QMMM-XTB")
+  if(DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE)
+    if(NOT EXISTS "${LAMMPS_SOURCE_DIR}/KOKKOS/atom_kokkos.h" OR
+       NOT EXISTS "${LAMMPS_SOURCE_DIR}/atom_masks.h")
+      message(FATAL_ERROR
+        "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires LAMMPS KOKKOS headers")
+    endif()
+    set(_dprc_kokkos_include "${DPRC_LAMMPS_KOKKOS_INCLUDE_DIR}")
+    if(NOT _dprc_kokkos_include AND
+       EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/core/src/Kokkos_Core.hpp")
+      set(_dprc_kokkos_include "${LAMMPS_SOURCE_DIR}/../lib/kokkos/core/src")
+    endif()
+    if(NOT _dprc_kokkos_include OR
+       NOT EXISTS "${_dprc_kokkos_include}/Kokkos_Core.hpp")
+      message(FATAL_ERROR
+        "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires DPRC_LAMMPS_KOKKOS_INCLUDE_DIR containing Kokkos_Core.hpp")
+    endif()
+    set(_dprc_kokkos_config_include "${DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR}")
+    if(NOT _dprc_kokkos_config_include AND
+       EXISTS "${_dprc_kokkos_include}/KokkosCore_config.h")
+      set(_dprc_kokkos_config_include "${_dprc_kokkos_include}")
+    endif()
+    if(NOT _dprc_kokkos_config_include OR
+       NOT EXISTS "${_dprc_kokkos_config_include}/KokkosCore_config.h")
+      message(FATAL_ERROR
+        "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR containing KokkosCore_config.h")
+    endif()
+    foreach(_dprc_kokkos_generated_header
+        KokkosCore_Config_FwdBackend.hpp
+        KokkosCore_Config_SetupBackend.hpp
+        KokkosCore_Config_DeclareBackend.hpp)
+      if(NOT EXISTS
+         "${_dprc_kokkos_config_include}/${_dprc_kokkos_generated_header}")
+        message(FATAL_ERROR
+          "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires ${_dprc_kokkos_generated_header} in DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR")
+      endif()
+    endforeach()
+    target_include_directories(dprc_lammps_xtb_fix PUBLIC
+      "${LAMMPS_SOURCE_DIR}/KOKKOS"
+      "${_dprc_kokkos_include}"
+      "${_dprc_kokkos_config_include}")
+    # Kokkos' public CUDA declarations include the bundled mdspan headers;
+    # when consuming an in-tree LAMMPS/Kokkos checkout those TPL headers are
+    # not necessarily on the ordinary Kokkos core include path.
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/mdspan/include")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/mdspan/include")
+    endif()
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/desul/include")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/desul/include")
+    endif()
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/containers/src")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/containers/src")
+    endif()
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/algorithms/src")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/algorithms/src")
+    endif()
+    # Keep the legacy QMMM implementation on its original preprocessor path.
+    # Only the small wrapper translation unit includes AtomKokkos; applying
+    # LMP_KOKKOS to the fused reference sources changes their ABI-sensitive
+    # LAMMPS types and can multiply their runtime memory footprint.
+    set_source_files_properties(
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/fix_dprc_xtb.cpp"
+      PROPERTIES COMPILE_DEFINITIONS
+        "DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE=1;LMP_KOKKOS=1")
+    # Kokkos 5 uses C++20 concepts and type traits in its public headers.  Set
+    # the language mode on the whole plugin target: several nvcc_wrapper
+    # versions ignore per-source CXX_STANDARD properties, and compiling only
+    # the bridge translation unit in C++20 can leave inline Kokkos templates
+    # with mixed language-mode instantiations across the plugin boundary.
+    set_target_properties(dprc_lammps_xtb_fix PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+  endif()
   target_include_directories(dprc_lammps_xtb_fix PRIVATE
     "${LAMMPS_SOURCE_DIR}/KSPACE"
     "${LAMMPS_SOURCE_DIR}/MOLECULE"

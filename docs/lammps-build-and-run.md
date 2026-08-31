@@ -199,6 +199,7 @@ cmake -S deepmd-kit/source -B deepmd-build -G Ninja \
   -DBUILD_PY_IF=OFF \
   -DBUILD_TESTING=OFF \
   -DDP_USING_C_API=ON \
+  -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
   -DUSE_CUDA_TOOLKIT=TRUE \
   -DUSE_PT_PYTHON_LIBS=ON
 
@@ -226,6 +227,12 @@ Stop if the C API version is below 30 or neither canonical-graph symbol is
 present. With API v30, the plugin validates and evaluates a packed
 block-diagonal graph through `DP_DeepPotComputeCanonicalGraphGPU`; with API v31
 or newer it selects the explicit frame-axis batch entry point.
+
+The DeePMD C API operator is built without its optional internal MPI support
+because LAMMPS-DPRc already owns the MPI process topology. This prevents a
+PyTorch operator from loading a second MPI implementation into the LAMMPS
+process. If internal DeePMD MPI is required for another application, it must
+be built against the exact same MPI shared object as LAMMPS instead.
 
 ## 7. Build LAMMPS-DPRc
 
@@ -269,6 +276,7 @@ cmake -S lammps-dprc -B lammps-dprc/build/cuda -G Ninja \
   -DDPRC_DEEPMD_MODEL="$DPRC_DEEPMD_MODEL" \
   -DDPRC_EXPECTED_DEEPMD_MODEL_SHA256="$DPRC_DEEPMD_MODEL_SHA256" \
   -DDPRC_LAMMPS_EXECUTABLE="$DPRC_WORKSPACE/lammps-build/lmp" \
+  -DDPRC_REQUIRE_MATCHING_LAMMPS_MPI=ON \
   -DDPRC_LAMMPS_SIZES=smallbig \
   -DDPRC_BUILD_TESTING=ON \
   -DDPRC_ENABLE_KOKKOS_RUNTIME_TESTS=ON \
@@ -282,6 +290,13 @@ cmake --build lammps-dprc/build/cuda --parallel
 ctest --test-dir lammps-dprc/build/cuda --output-on-failure
 python3 lammps-dprc/tools/check_dependency_pins.py --required-only
 ```
+
+When `DPRC_LAMMPS_EXECUTABLE` is supplied, configuration fingerprints the
+resolved `libmpi` object from that executable and compares it with the MPI
+object selected for the plugin. A mismatch is a hard configuration error;
+reconfigure with the exact `mpicxx` wrapper used for the LAMMPS build. This
+check prevents two MPICH builds with the same SONAME but different UCX/OFI
+internals from entering one process image.
 
 The plugin is `lammps-dprc/build/cuda/dprcplugin.so`. To build xTB QM/MM
 without DPRc, omit all `DEEPMD` options. To compile the DeePMD styles without

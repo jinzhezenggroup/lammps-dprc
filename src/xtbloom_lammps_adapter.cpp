@@ -415,8 +415,10 @@ extern "C" int dprc_lammps_xtb_calculate(
       return 1;
     }
     if (!outcome.all_systems_succeeded) {
-      state.last_error =
-          "one or more xTBloom QM/MM systems did not converge";
+      state.last_error = state.broker->last_error();
+      if (state.last_error.empty())
+        state.last_error =
+            "one or more xTBloom QM/MM systems did not converge";
       return 1;
     }
 
