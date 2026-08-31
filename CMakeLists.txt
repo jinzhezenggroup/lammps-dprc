@@ -338,6 +338,48 @@ function(dprc_resolve_mpi_link_input link_input output_path)
   set(${output_path} "${_dprc_mpi_realpath}" PARENT_SCOPE)
 endfunction()
 
+function(dprc_find_mpi_link_input output_path)
+  # FindMPI may intentionally leave MPI_mpi_LIBRARY unset when the selected
+  # compiler wrapper supplies MPI through its implicit link line (the common
+  # Open MPI configuration on hosted runners).  Prefer an explicit library
+  # selected by FindMPI, then an absolute MPI_CXX library, and finally the
+  # compiler's implicit link directories.  The resulting object is still
+  # fingerprinted against the host executable below.
+  set(_dprc_mpi_input "")
+  if(MPI_mpi_LIBRARY AND EXISTS "${MPI_mpi_LIBRARY}")
+    set(_dprc_mpi_input "${MPI_mpi_LIBRARY}")
+  endif()
+
+  if(NOT _dprc_mpi_input)
+    foreach(_dprc_mpi_library IN LISTS MPI_CXX_LIBRARIES)
+      if(IS_ABSOLUTE "${_dprc_mpi_library}" AND
+         EXISTS "${_dprc_mpi_library}" AND
+         "${_dprc_mpi_library}" MATCHES "(^|/)libmpi([^/]*)(\\.so|\\.dylib|\\.a)(\\..*)?$")
+        set(_dprc_mpi_input "${_dprc_mpi_library}")
+        break()
+      endif()
+    endforeach()
+  endif()
+
+  if(NOT _dprc_mpi_input)
+    find_library(_dprc_mpi_implicit_library NAMES mpi
+      HINTS ${CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES}
+      NO_DEFAULT_PATH)
+    if(_dprc_mpi_implicit_library)
+      set(_dprc_mpi_input "${_dprc_mpi_implicit_library}")
+    endif()
+  endif()
+
+  if(NOT _dprc_mpi_input)
+    find_library(_dprc_mpi_default_library NAMES mpi)
+    if(_dprc_mpi_default_library)
+      set(_dprc_mpi_input "${_dprc_mpi_default_library}")
+    endif()
+  endif()
+
+  set(${output_path} "${_dprc_mpi_input}" PARENT_SCOPE)
+endfunction()
+
 function(dprc_reject_deepmd_mpi_dependencies deepmd_library lammps_mpi_object)
   if(NOT UNIX OR APPLE)
     return()
@@ -383,14 +425,15 @@ if(DPRC_REQUIRE_MATCHING_LAMMPS_MPI AND DPRC_LAMMPS_EXECUTABLE)
     message(FATAL_ERROR
       "DPRC_LAMMPS_EXECUTABLE does not exist: ${DPRC_LAMMPS_EXECUTABLE}")
   endif()
-  if(NOT MPI_mpi_LIBRARY OR NOT EXISTS "${MPI_mpi_LIBRARY}")
+  dprc_find_mpi_link_input(_dprc_mpi_link_input)
+  if(NOT _dprc_mpi_link_input OR NOT EXISTS "${_dprc_mpi_link_input}")
     message(FATAL_ERROR
-      "FindMPI did not expose a concrete MPI_mpi_LIBRARY; cannot verify MPI "
+      "Could not resolve the MPI library selected by FindMPI; cannot verify MPI "
       "compatibility with ${DPRC_LAMMPS_EXECUTABLE}")
   endif()
 
   dprc_resolve_mpi_link_input(
-    "${MPI_mpi_LIBRARY}" _dprc_plugin_mpi_realpath)
+    "${_dprc_mpi_link_input}" _dprc_plugin_mpi_realpath)
   dprc_resolve_mpi_from_executable(
     "${DPRC_LAMMPS_EXECUTABLE}" _dprc_lammps_mpi_realpath)
   file(SHA256 "${_dprc_plugin_mpi_realpath}" _dprc_plugin_mpi_sha256)
