@@ -77,6 +77,12 @@ option(DPRC_ENABLE_CLASSICAL_CUDA
   "Build the single-context batched CUDA LJ/TIP4P/PPPM backend" OFF)
 option(DPRC_ENABLE_KOKKOS_RUNTIME_TESTS
   "Run GPU tests that require a Kokkos-enabled LAMMPS executable" OFF)
+option(DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE
+  "Synchronize legacy atom arrays around the non-KOKKOS QM/MM fix" OFF)
+set(DPRC_LAMMPS_KOKKOS_INCLUDE_DIR "" CACHE PATH
+  "Directory containing the Kokkos core headers (Kokkos_Core.hpp)")
+set(DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR "" CACHE PATH
+  "Directory containing the generated KokkosCore_config.h for the host LAMMPS build")
 option(DPRC_REQUIRE_XTBLOOM_LIBRARY
   "Fail configuration unless the xTBloom integration library is available" OFF)
 option(DPRC_REQUIRE_DEEPMD_C_API
@@ -822,6 +828,83 @@ if(DPRC_XTBLOOM_LIBRARY)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${_dprc_fused_source_dir}"
     "${LAMMPS_SOURCE_DIR}/QMMM-XTB")
+  if(DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE)
+    if(NOT EXISTS "${LAMMPS_SOURCE_DIR}/KOKKOS/atom_kokkos.h" OR
+       NOT EXISTS "${LAMMPS_SOURCE_DIR}/atom_masks.h")
+      message(FATAL_ERROR
+        "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires LAMMPS KOKKOS headers")
+    endif()
+    set(_dprc_kokkos_include "${DPRC_LAMMPS_KOKKOS_INCLUDE_DIR}")
+    if(NOT _dprc_kokkos_include AND
+       EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/core/src/Kokkos_Core.hpp")
+      set(_dprc_kokkos_include "${LAMMPS_SOURCE_DIR}/../lib/kokkos/core/src")
+    endif()
+    if(NOT _dprc_kokkos_include OR
+       NOT EXISTS "${_dprc_kokkos_include}/Kokkos_Core.hpp")
+      message(FATAL_ERROR
+        "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires DPRC_LAMMPS_KOKKOS_INCLUDE_DIR containing Kokkos_Core.hpp")
+    endif()
+    set(_dprc_kokkos_config_include "${DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR}")
+    if(NOT _dprc_kokkos_config_include AND
+       EXISTS "${_dprc_kokkos_include}/KokkosCore_config.h")
+      set(_dprc_kokkos_config_include "${_dprc_kokkos_include}")
+    endif()
+    if(NOT _dprc_kokkos_config_include OR
+       NOT EXISTS "${_dprc_kokkos_config_include}/KokkosCore_config.h")
+      message(FATAL_ERROR
+        "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR containing KokkosCore_config.h")
+    endif()
+    foreach(_dprc_kokkos_generated_header
+        KokkosCore_Config_FwdBackend.hpp
+        KokkosCore_Config_SetupBackend.hpp
+        KokkosCore_Config_DeclareBackend.hpp)
+      if(NOT EXISTS
+         "${_dprc_kokkos_config_include}/${_dprc_kokkos_generated_header}")
+        message(FATAL_ERROR
+          "DPRC_ENABLE_LAMMPS_KOKKOS_BRIDGE requires ${_dprc_kokkos_generated_header} in DPRC_LAMMPS_KOKKOS_CONFIG_INCLUDE_DIR")
+      endif()
+    endforeach()
+    target_include_directories(dprc_lammps_xtb_fix PUBLIC
+      "${LAMMPS_SOURCE_DIR}/KOKKOS"
+      "${_dprc_kokkos_include}"
+      "${_dprc_kokkos_config_include}")
+    # Kokkos' public CUDA declarations include the bundled mdspan headers;
+    # when consuming an in-tree LAMMPS/Kokkos checkout those TPL headers are
+    # not necessarily on the ordinary Kokkos core include path.
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/mdspan/include")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/mdspan/include")
+    endif()
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/desul/include")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/tpls/desul/include")
+    endif()
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/containers/src")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/containers/src")
+    endif()
+    if(EXISTS "${LAMMPS_SOURCE_DIR}/../lib/kokkos/algorithms/src")
+      target_include_directories(dprc_lammps_xtb_fix PUBLIC
+        "${LAMMPS_SOURCE_DIR}/../lib/kokkos/algorithms/src")
+    endif()
+    # Keep the legacy QMMM implementation on its original preprocessor path.
+    # Only the small wrapper translation unit includes AtomKokkos; applying
+    # LMP_KOKKOS to the fused reference sources changes their ABI-sensitive
+    # LAMMPS types and can multiply their runtime memory footprint.
+    set_source_files_properties(
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/fix_dprc_xtb.cpp"
+      PROPERTIES COMPILE_DEFINITIONS
+        "DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE=1;LMP_KOKKOS=1")
+    # Kokkos 5 uses C++20 concepts and type traits in its public headers.  Set
+    # the language mode on the whole plugin target: several nvcc_wrapper
+    # versions ignore per-source CXX_STANDARD properties, and compiling only
+    # the bridge translation unit in C++20 can leave inline Kokkos templates
+    # with mixed language-mode instantiations across the plugin boundary.
+    set_target_properties(dprc_lammps_xtb_fix PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+  endif()
   target_include_directories(dprc_lammps_xtb_fix PRIVATE
     "${LAMMPS_SOURCE_DIR}/KSPACE"
     "${LAMMPS_SOURCE_DIR}/MOLECULE"

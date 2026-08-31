@@ -28,6 +28,7 @@ public:
 
   void init() override;
   void pre_force(int vflag) override;
+  void post_force(int vflag) override;
 
 #ifdef DPRC_ENABLE_TEST_HOOKS
   // Arm the test-only one-shot exception used to prove that a prepared fused

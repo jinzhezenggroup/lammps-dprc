@@ -12,9 +12,56 @@
 #include "universe.h"
 
 #include <exception>
+#include <cstdint>
 #include <memory>
 
+#ifdef DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE
+#include "atom_kokkos.h"
+#include "atom_masks.h"
+#endif
+
 using namespace LAMMPS_NS;
+
+namespace {
+
+// The reference QMMM-XTB implementation is intentionally a legacy LAMMPS
+// fix: it uses atom->x/q/f pointers and calls the legacy PPPM routines.  A
+// KOKKOS Verlet loop keeps the authoritative integration state in dual views,
+// so the wrapper must make that boundary explicit.  This bridge is optional
+// because a host-only LAMMPS build does not provide AtomKokkos.
+void sync_legacy_atom_views(LAMMPS *lmp, std::uint64_t mask) {
+#ifdef DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE
+  if (lmp && lmp->atomKK)
+    lmp->atomKK->sync(Host, mask);
+#else
+  (void)lmp;
+  (void)mask;
+#endif
+}
+
+void publish_legacy_atom_views(LAMMPS *lmp, std::uint64_t mask) {
+#ifdef DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE
+  if (lmp && lmp->atomKK)
+    lmp->atomKK->modified(Host, mask);
+#else
+  (void)lmp;
+  (void)mask;
+#endif
+}
+
+#ifdef DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE
+// The legacy QMMM fix reads coordinates, charges, and forces before its
+// pre-force calculation.  It publishes only charges and forces; narrowing the
+// masks avoids needlessly invalidating velocities, topology, and custom data
+// on every timestep.
+constexpr std::uint64_t kLegacyReadMask = X_MASK | Q_MASK | F_MASK;
+constexpr std::uint64_t kLegacyPublicationMask = Q_MASK | F_MASK;
+#else
+constexpr std::uint64_t kLegacyReadMask = 0;
+constexpr std::uint64_t kLegacyPublicationMask = 0;
+#endif
+
+} // namespace
 
 FixDPRCXtb::~FixDPRCXtb() {
   // The renamed reference base destructor calls the same function again. The
@@ -55,6 +102,10 @@ void FixDPRCXtb::init() {
 }
 
 void FixDPRCXtb::pre_force(int vflag) {
+  // VerletKokkos has just integrated on the device.  Pull the current state
+  // into the legacy arrays before the reference fix reads or modifies them.
+  sync_legacy_atom_views(lmp, kLegacyReadMask);
+
   // A later PRE_FORCE/pair/bond failure can abandon a token after this fix
   // has committed it but before the production KSpace call consumes it. A
   // same-timestep library retry enters here first; clear that stale token so
@@ -110,11 +161,16 @@ void FixDPRCXtb::pre_force(int vflag) {
       force->pair->virial[component] = pair_virial[component];
       force->kspace->virial[component] = kspace_virial[component];
     }
+    publish_legacy_atom_views(lmp, kLegacyPublicationMask);
     // Do not call a world collective while unwinding: rank-local LAMMPS
     // exceptions (for example error->one()) must escape immediately instead
     // of leaving the failing rank stuck in a rollback collective.
     throw;
   }
+
+  // Make qmmm's legacy force/charge publication visible to the next KOKKOS
+  // pair, KSpace, reverse-communication, and integration phases.
+  publish_legacy_atom_views(lmp, kLegacyPublicationMask);
 
 #ifdef DPRC_ENABLE_TEST_HOOKS
   // Deliberately throw outside the transaction catch to emulate a later
@@ -125,6 +181,20 @@ void FixDPRCXtb::pre_force(int vflag) {
                "DPRC test hook: failure after fused full-solve commit");
   }
 #endif
+}
+
+void FixDPRCXtb::post_force(int vflag) {
+  // Pair/KSpace and reverse communication have completed on the device by
+  // this point; the reference post_force routine consumes and modifies the
+  // legacy force array.
+  sync_legacy_atom_views(lmp, kLegacyReadMask);
+  try {
+    FixDPRCXtbReference::post_force(vflag);
+  } catch (...) {
+    publish_legacy_atom_views(lmp, kLegacyPublicationMask);
+    throw;
+  }
+  publish_legacy_atom_views(lmp, kLegacyPublicationMask);
 }
 
 #ifdef DPRC_ENABLE_TEST_HOOKS
