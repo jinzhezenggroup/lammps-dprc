@@ -332,6 +332,46 @@ function(dprc_resolve_mpi_link_input link_input output_path)
   set(${output_path} "${_dprc_mpi_realpath}" PARENT_SCOPE)
 endfunction()
 
+function(dprc_reject_deepmd_mpi_dependencies deepmd_library lammps_mpi_object)
+  if(NOT UNIX OR APPLE)
+    return()
+  endif()
+  find_program(_dprc_readelf_EXECUTABLE readelf)
+  if(NOT _dprc_readelf_EXECUTABLE)
+    message(FATAL_ERROR
+      "DPRC_REQUIRE_MATCHING_LAMMPS_MPI=ON requires readelf to inspect DeePMD dependencies")
+  endif()
+
+  get_filename_component(_dprc_deepmd_api_dir "${deepmd_library}" DIRECTORY)
+  get_filename_component(_dprc_deepmd_runtime_root "${_dprc_deepmd_api_dir}" DIRECTORY)
+  file(GLOB_RECURSE _dprc_deepmd_shared_libraries
+    "${_dprc_deepmd_runtime_root}/*.so"
+    "${_dprc_deepmd_runtime_root}/*.so.*")
+  get_filename_component(_dprc_expected_mpi_soname "${lammps_mpi_object}" NAME)
+  foreach(_dprc_deepmd_shared_library IN LISTS _dprc_deepmd_shared_libraries)
+    execute_process(
+      COMMAND "${_dprc_readelf_EXECUTABLE}" -d "${_dprc_deepmd_shared_library}"
+      OUTPUT_VARIABLE _dprc_deepmd_dynamic_section
+      ERROR_QUIET
+      RESULT_VARIABLE _dprc_readelf_status)
+    if(NOT _dprc_readelf_status EQUAL 0)
+      continue()
+    endif()
+    string(REGEX MATCHALL "\\[libmpi[^]]+\\]" _dprc_mpi_needed_entries
+      "${_dprc_deepmd_dynamic_section}")
+    foreach(_dprc_mpi_needed_entry IN LISTS _dprc_mpi_needed_entries)
+      string(REGEX REPLACE "^\\[|\\]$" "" _dprc_mpi_needed_soname
+        "${_dprc_mpi_needed_entry}")
+      if(NOT _dprc_mpi_needed_soname STREQUAL _dprc_expected_mpi_soname)
+        message(FATAL_ERROR
+          "DeePMD runtime ${_dprc_deepmd_shared_library} requires "
+          "${_dprc_mpi_needed_soname}, but LAMMPS uses ${_dprc_expected_mpi_soname}. "
+          "Rebuild the DeePMD C API operator with the same MPI runtime or with MPI disabled.")
+      endif()
+    endforeach()
+  endforeach()
+endfunction()
+
 if(DPRC_REQUIRE_MATCHING_LAMMPS_MPI AND DPRC_LAMMPS_EXECUTABLE)
   if(NOT EXISTS "${DPRC_LAMMPS_EXECUTABLE}")
     message(FATAL_ERROR
@@ -480,6 +520,10 @@ if(DPRC_DEEPMD_C_LIBRARY OR DPRC_DEEPMD_INCLUDE_DIR)
     IMPORTED_LOCATION "${_dprc_deepmd_c_library_realpath}"
     INTERFACE_INCLUDE_DIRECTORIES "${DPRC_DEEPMD_INCLUDE_DIR}")
   set(_dprc_deepmd_enabled ON)
+  if(DPRC_REQUIRE_MATCHING_LAMMPS_MPI AND DPRC_LAMMPS_EXECUTABLE)
+    dprc_reject_deepmd_mpi_dependencies(
+      "${_dprc_deepmd_c_library_realpath}" "${_dprc_lammps_mpi_realpath}")
+  endif()
   message(STATUS
     "DeePMD C API runtime: ${_dprc_deepmd_c_library_realpath} "
     "(SHA-256 ${_dprc_deepmd_c_library_sha256}; declared artifact manifest "

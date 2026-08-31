@@ -199,6 +199,7 @@ cmake -S deepmd-kit/source -B deepmd-build -G Ninja \
   -DBUILD_PY_IF=OFF \
   -DBUILD_TESTING=OFF \
   -DDP_USING_C_API=ON \
+  -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
   -DUSE_CUDA_TOOLKIT=TRUE \
   -DUSE_PT_PYTHON_LIBS=ON
 
@@ -226,6 +227,12 @@ Stop if the C API version is below 30 or neither canonical-graph symbol is
 present. With API v30, the plugin validates and evaluates a packed
 block-diagonal graph through `DP_DeepPotComputeCanonicalGraphGPU`; with API v31
 or newer it selects the explicit frame-axis batch entry point.
+
+The DeePMD C API operator is built without its optional internal MPI support
+because LAMMPS-DPRc already owns the MPI process topology. This prevents a
+PyTorch operator from loading a second MPI implementation into the LAMMPS
+process. If internal DeePMD MPI is required for another application, it must
+be built against the exact same MPI shared object as LAMMPS instead.
 
 ## 7. Build LAMMPS-DPRc
 
