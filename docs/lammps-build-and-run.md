@@ -68,8 +68,10 @@ export PATH="$DPRC_CUDA_ROOT/bin:$PATH"
 Change both architecture values for another GPU. LAMMPS and the plugin must
 use the same MPI implementation, compiler ABI, and `LAMMPS_SIZES` mode. Do not
 mix Open MPI and MPICH artifacts or reuse a plugin built for another LAMMPS
-revision. The partition-batched DeePMD transport also requires MPI-3 shared
-windows with the unified memory model (`MPI_WIN_UNIFIED`).
+revision. The partition-batched DeePMD transport requires an MPI-3
+shared-memory communicator because all partition roots must be GPU-local. Its
+graph and result staging uses host `MPI_Gatherv`/`MPI_Scatterv` and does not
+require `MPI_WIN_UNIFIED`.
 
 ## 3. Build a shared Kokkos runtime
 

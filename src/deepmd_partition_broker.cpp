@@ -19,10 +19,33 @@ void check_mpi(int status, const char *operation) {
     throw std::runtime_error(std::string(operation) + " failed");
 }
 
+// MPI_ERRORS_RETURN reports a failed collective only to the rank that
+// observed it. Reduce the status before any rank can advance to the next
+// collective, otherwise one rank can throw while its peers continue with a
+// different operation and deadlock.
+void check_collective_mpi(int status, MPI_Comm communicator,
+                          const char *operation) {
+  const int local_failed = status == MPI_SUCCESS ? 0 : 1;
+  int any_failed = 0;
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_MAX,
+                    communicator) != MPI_SUCCESS)
+    throw std::runtime_error(std::string(operation) +
+                             " status reduction failed");
+  if (any_failed != 0)
+    throw std::runtime_error(std::string(operation) + " failed");
+}
+
 int checked_count(std::size_t count, const char *label) {
   if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::overflow_error(std::string(label) + " exceeds MPI int count");
   return static_cast<int>(count);
+}
+
+int checked_scale(int count, int factor, const char *label) {
+  if (count < 0 || factor < 0 ||
+      (factor != 0 && count > std::numeric_limits<int>::max() / factor))
+    throw std::overflow_error(std::string(label) + " exceeds MPI int count");
+  return count * factor;
 }
 
 void build_displacements(const std::vector<int> &counts,
@@ -48,91 +71,86 @@ std::size_t total_count(const std::vector<int> &counts,
          static_cast<std::size_t>(counts.back());
 }
 
-std::size_t grown_capacity(std::size_t required, const char *label) {
-  const std::size_t slack = required / 8 + 64;
-  if (required > std::numeric_limits<std::size_t>::max() - slack)
-    throw std::overflow_error(std::string(label) + " capacity overflows");
-  return required + slack;
-}
+void broadcast_string_from(MPI_Comm communicator, int rank, int root,
+                           std::string &value) {
+  int length = 0;
+  int root_failed = 0;
+  if (rank == root) {
+    try {
+      length = checked_count(value.size(), "string length");
+    } catch (...) {
+      // The diagnostic itself is not allowed to break the status rendezvous.
+      // All ranks receive the failure flag and unwind together.
+      root_failed = 1;
+    }
+  }
+  check_mpi(MPI_Bcast(&root_failed, 1, MPI_INT, root, communicator),
+            "MPI_Bcast string status");
+  if (root_failed != 0)
+    throw std::runtime_error("diagnostic string exceeds MPI int count");
+  check_mpi(MPI_Bcast(&length, 1, MPI_INT, root, communicator),
+            "MPI_Bcast string length");
 
-std::size_t checked_product(std::size_t left, std::size_t right,
-                            const char *label) {
-  if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right)
-    throw std::overflow_error(std::string(label) + " byte size overflows");
-  return left * right;
-}
+  int local_resize_failed = 0;
+  if (rank != root) {
+    try {
+      value.resize(static_cast<std::size_t>(length));
+    } catch (...) {
+      local_resize_failed = 1;
+    }
+  }
+  int any_resize_failed = 0;
+  if (MPI_Allreduce(&local_resize_failed, &any_resize_failed, 1, MPI_INT,
+                    MPI_MAX, communicator) != MPI_SUCCESS)
+    throw std::runtime_error("MPI_Allreduce diagnostic allocation status "
+                             "failed");
+  if (any_resize_failed != 0)
+    throw std::runtime_error("could not allocate a diagnostic string on all "
+                             "MPI ranks");
 
-std::size_t align_offset(std::size_t offset, std::size_t alignment,
-                         const char *label) {
-  const std::size_t remainder = offset % alignment;
-  const std::size_t padding = remainder == 0 ? 0 : alignment - remainder;
-  if (offset > std::numeric_limits<std::size_t>::max() - padding)
-    throw std::overflow_error(std::string(label) + " alignment overflows");
-  return offset + padding;
-}
-
-struct SharedDataLayout {
-  std::size_t bytes = 0;
-  std::size_t atom_types = 0;
-  std::size_t sources = 0;
-  std::size_t edge_vectors = 0;
-  std::size_t destination_row_ptr = 0;
-  std::size_t source_row_ptr = 0;
-  std::size_t source_order = 0;
-  std::size_t atom_energy = 0;
-  std::size_t force = 0;
-  std::size_t atom_virial = 0;
-};
-
-template <typename T>
-std::size_t reserve_array(std::size_t &offset, std::size_t count,
-                          const char *label) {
-  offset = align_offset(offset, alignof(T), label);
-  const std::size_t begin = offset;
-  const std::size_t bytes = checked_product(count, sizeof(T), label);
-  if (offset > std::numeric_limits<std::size_t>::max() - bytes)
-    throw std::overflow_error(std::string(label) + " storage overflows");
-  offset += bytes;
-  return begin;
-}
-
-SharedDataLayout build_shared_layout(std::size_t node_capacity,
-                                     std::size_t edge_capacity) {
-  SharedDataLayout layout;
-  std::size_t offset = 0;
-  layout.atom_types =
-      reserve_array<std::int64_t>(offset, node_capacity, "atom types");
-  layout.sources =
-      reserve_array<std::uint32_t>(offset, edge_capacity, "edge sources");
-  layout.edge_vectors = reserve_array<float>(
-      offset, checked_product(edge_capacity, 3, "edge vectors"),
-      "edge vectors");
-  layout.destination_row_ptr = reserve_array<std::int64_t>(
-      offset, node_capacity + 1, "destination CSR");
-  layout.source_row_ptr =
-      reserve_array<std::int64_t>(offset, node_capacity + 1, "source CSR");
-  layout.source_order =
-      reserve_array<std::uint32_t>(offset, edge_capacity, "source order");
-  layout.atom_energy =
-      reserve_array<double>(offset, node_capacity, "atomic energy");
-  layout.force = reserve_array<double>(
-      offset, checked_product(node_capacity, 3, "force"), "force");
-  layout.atom_virial = reserve_array<double>(
-      offset, checked_product(node_capacity, 9, "atomic virial"),
-      "atomic virial");
-  layout.bytes = offset;
-  return layout;
+  check_mpi(MPI_Bcast(value.empty() ? nullptr : value.data(), length, MPI_CHAR,
+                      root, communicator),
+            "MPI_Bcast string payload");
 }
 
 void broadcast_string(MPI_Comm communicator, int rank, std::string &value) {
-  int length = rank == kOwner ? checked_count(value.size(), "string length") : 0;
-  check_mpi(MPI_Bcast(&length, 1, MPI_INT, kOwner, communicator),
-            "MPI_Bcast string length");
-  if (rank != kOwner)
-    value.resize(static_cast<std::size_t>(length));
-  check_mpi(MPI_Bcast(value.empty() ? nullptr : value.data(), length, MPI_CHAR,
-                      kOwner, communicator),
-            "MPI_Bcast string payload");
+  broadcast_string_from(communicator, rank, kOwner, value);
+}
+
+// Synchronize local preparation failures before entering the next collective.
+// This covers host-vector allocation and result-buffer allocation, both of
+// which can otherwise make only one rank leave the broker call.
+void throw_if_collective_failure(MPI_Comm communicator, int rank, int size,
+                                 int local_failed, std::string diagnostic,
+                                 const char *operation) {
+  int any_failed = 0;
+  check_mpi(MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_MAX,
+                          communicator),
+            operation);
+  if (any_failed == 0)
+    return;
+
+  const int candidate = local_failed != 0 ? rank : size;
+  int diagnostic_rank = size;
+  check_mpi(MPI_Allreduce(&candidate, &diagnostic_rank, 1, MPI_INT, MPI_MIN,
+                          communicator),
+            "MPI_Allreduce collective diagnostic rank");
+  if (rank != diagnostic_rank)
+    diagnostic.clear();
+  broadcast_string_from(communicator, rank, diagnostic_rank, diagnostic);
+  if (diagnostic.empty())
+    diagnostic = std::string(operation) + " failed";
+  throw std::runtime_error(diagnostic);
+}
+
+template <typename T>
+T *data_or_null(std::vector<T> &values) {
+  return values.empty() ? nullptr : values.data();
+}
+
+template <typename T>
+const T *data_or_null(const std::vector<T> &values) {
+  return values.empty() ? nullptr : values.data();
 }
 
 }  // namespace
@@ -156,15 +174,10 @@ DeepmdPartitionBroker::DeepmdPartitionBroker(MPI_Comm roots,
     check_mpi(MPI_Comm_split_type(communicator_, MPI_COMM_TYPE_SHARED, rank_,
                                   MPI_INFO_NULL, &shared_communicator_),
               "MPI_Comm_split_type");
-    check_mpi(MPI_Comm_set_errhandler(shared_communicator_, MPI_ERRORS_RETURN),
-              "MPI_Comm_set_errhandler shared");
-    int shared_rank = -1;
     int shared_size = 0;
-    check_mpi(MPI_Comm_rank(shared_communicator_, &shared_rank),
-              "MPI_Comm_rank shared");
     check_mpi(MPI_Comm_size(shared_communicator_, &shared_size),
               "MPI_Comm_size shared");
-    if (shared_rank != rank_ || shared_size != size_)
+    if (shared_size != size_)
       throw std::invalid_argument(
           "dprc/deepmd/batch requires all partition roots on one GPU-local "
           "shared-memory node");
@@ -191,7 +204,6 @@ DeepmdPartitionBroker::~DeepmdPartitionBroker() {
   int finalized = 0;
   MPI_Finalized(&finalized);
   if (!finalized) {
-    release_shared_storage();
     if (shared_communicator_ != MPI_COMM_NULL)
       MPI_Comm_free(&shared_communicator_);
     if (communicator_ != MPI_COMM_NULL)
@@ -259,6 +271,14 @@ bool DeepmdPartitionBroker::local_graph_valid(
     diagnostic = "canonical graph array extents are inconsistent";
     return false;
   }
+  for (std::size_t node = 1; node <= nodes; ++node) {
+    if (graph.destination_row_ptr[node] <
+            graph.destination_row_ptr[node - 1] ||
+        graph.source_row_ptr[node] < graph.source_row_ptr[node - 1]) {
+      diagnostic = "canonical graph CSR row pointers are not monotonic";
+      return false;
+    }
+  }
   if (graph.destination_row_ptr.front() != 0 ||
       graph.source_row_ptr.front() != 0 ||
       graph.destination_row_ptr.back() != static_cast<std::int64_t>(edges) ||
@@ -297,7 +317,8 @@ bool DeepmdPartitionBroker::local_graph_valid(
          slot < graph.source_row_ptr[source + 1]; ++slot) {
       const std::uint32_t edge =
           graph.source_order[static_cast<std::size_t>(slot)];
-      if (source_order_seen[edge] || graph.sources[edge] != source) {
+      if (edge >= edges || source_order_seen[edge] ||
+          graph.sources[edge] != source) {
         diagnostic =
             "canonical source order is not a source-grouped permutation";
         return false;
@@ -305,165 +326,38 @@ bool DeepmdPartitionBroker::local_graph_valid(
       source_order_seen[edge] = 1;
     }
   }
+  if (std::find(source_order_seen.begin(), source_order_seen.end(), 0) !=
+      source_order_seen.end()) {
+    diagnostic = "canonical source order is not a complete permutation";
+    return false;
+  }
   return true;
 }
 
-void DeepmdPartitionBroker::release_shared_storage() noexcept {
-  if (shared_data_locked_ && shared_data_window_ != MPI_WIN_NULL)
-    MPI_Win_unlock_all(shared_data_window_);
-  shared_data_locked_ = false;
-  if (shared_data_window_ != MPI_WIN_NULL)
-    MPI_Win_free(&shared_data_window_);
-  shared_node_capacity_ = 0;
-  shared_edge_capacity_ = 0;
-  shared_atom_types_ = nullptr;
-  shared_sources_ = nullptr;
-  shared_edge_vectors_ = nullptr;
-  shared_destination_row_ptr_ = nullptr;
-  shared_source_row_ptr_ = nullptr;
-  shared_source_order_ = nullptr;
-  shared_atom_energy_ = nullptr;
-  shared_force_ = nullptr;
-  shared_atom_virial_ = nullptr;
-}
-
-void DeepmdPartitionBroker::ensure_shared_capacity(
-    std::size_t nodes, std::size_t edge_storage) {
-  if (nodes <= shared_node_capacity_ &&
-      edge_storage <= shared_edge_capacity_)
+void DeepmdPartitionBroker::ensure_host_capacity(std::size_t nodes,
+                                                 std::size_t edge_storage) {
+  if (rank_ != kOwner)
     return;
-
-  const std::size_t node_capacity =
-      nodes > shared_node_capacity_
-          ? grown_capacity(nodes, "shared DeePMD node")
-          : shared_node_capacity_;
-  const std::size_t edge_capacity =
-      edge_storage > shared_edge_capacity_
-          ? grown_capacity(edge_storage, "shared DeePMD edge")
-          : shared_edge_capacity_;
-  const SharedDataLayout layout =
-      build_shared_layout(node_capacity, edge_capacity);
-  if (layout.bytes > static_cast<std::size_t>(
-                         std::numeric_limits<MPI_Aint>::max()))
-    throw std::overflow_error("shared DeePMD storage exceeds MPI_Aint");
-
-  // Window allocation and release are collective. All ranks derive identical
-  // capacities from the all-gathered graph extents before entering here.
-  release_shared_storage();
-  void *local_base = nullptr;
-  const MPI_Aint root_bytes = static_cast<MPI_Aint>(layout.bytes);
-  check_mpi(MPI_Win_allocate_shared(rank_ == kOwner ? root_bytes : 0, 1,
-                                    MPI_INFO_NULL, shared_communicator_,
-                                    &local_base, &shared_data_window_),
-            "MPI_Win_allocate_shared DeePMD data");
-  int setup_valid = 1;
-  std::string setup_diagnostic;
-  const auto record_setup_status = [&](int status, const char *operation) {
-    if (status != MPI_SUCCESS && setup_valid) {
-      setup_valid = 0;
-      setup_diagnostic = std::string(operation) + " failed";
-    }
-  };
-  record_setup_status(
-      MPI_Win_set_errhandler(shared_data_window_, MPI_ERRORS_RETURN),
-      "MPI_Win_set_errhandler DeePMD data");
-
-  // Direct C++ loads and stores through another rank's shared mapping are
-  // portable only when MPI exposes one coherent public/private copy. Reject a
-  // separate-model implementation collectively before publishing pointers.
-  int *window_model = nullptr;
-  int model_available = 0;
-  record_setup_status(
-      MPI_Win_get_attr(shared_data_window_, MPI_WIN_MODEL, &window_model,
-                       &model_available),
-      "MPI_Win_get_attr DeePMD memory model");
-  const bool local_unified =
-      (model_available && window_model != nullptr &&
-       *window_model == MPI_WIN_UNIFIED);
-  if (!local_unified && setup_valid) {
-    setup_valid = 0;
-    setup_diagnostic =
-        "dprc/deepmd/batch requires the MPI unified shared-window memory "
-        "model";
-  }
-
-  MPI_Aint queried_bytes = 0;
-  int displacement_unit = 0;
-  void *root_base = nullptr;
-  record_setup_status(
-      MPI_Win_shared_query(shared_data_window_, kOwner, &queried_bytes,
-                           &displacement_unit, &root_base),
-      "MPI_Win_shared_query DeePMD data");
-  if (root_base == nullptr || queried_bytes != root_bytes ||
-      displacement_unit != 1) {
-    if (setup_valid) {
-      setup_valid = 0;
-      setup_diagnostic = "shared DeePMD data mapping is inconsistent";
-    }
-  }
-  const int lock_status =
-      MPI_Win_lock_all(MPI_MODE_NOCHECK, shared_data_window_);
-  record_setup_status(lock_status, "MPI_Win_lock_all DeePMD data");
-  shared_data_locked_ = lock_status == MPI_SUCCESS;
-
-  int all_setup_valid = 0;
-  check_mpi(MPI_Allreduce(&setup_valid, &all_setup_valid, 1, MPI_INT, MPI_MIN,
-                          shared_communicator_),
-            "MPI_Allreduce DeePMD shared-window setup");
-  if (!all_setup_valid) {
-    const int candidate = setup_valid ? size_ : rank_;
-    int diagnostic_rank = size_;
-    check_mpi(MPI_Allreduce(&candidate, &diagnostic_rank, 1, MPI_INT, MPI_MIN,
-                            shared_communicator_),
-              "MPI_Allreduce DeePMD setup diagnostic rank");
-    if (rank_ != diagnostic_rank)
-      setup_diagnostic.clear();
-    int diagnostic_length =
-        rank_ == diagnostic_rank
-            ? checked_count(setup_diagnostic.size(), "setup diagnostic")
-            : 0;
-    check_mpi(MPI_Bcast(&diagnostic_length, 1, MPI_INT, diagnostic_rank,
-                        shared_communicator_),
-              "MPI_Bcast DeePMD setup diagnostic length");
-    if (rank_ != diagnostic_rank)
-      setup_diagnostic.resize(static_cast<std::size_t>(diagnostic_length));
-    check_mpi(MPI_Bcast(setup_diagnostic.empty()
-                            ? nullptr
-                            : setup_diagnostic.data(),
-                        diagnostic_length, MPI_CHAR, diagnostic_rank,
-                        shared_communicator_),
-              "MPI_Bcast DeePMD setup diagnostic");
-    release_shared_storage();
-    throw std::runtime_error(setup_diagnostic);
-  }
-
-  auto *bytes = static_cast<unsigned char *>(root_base);
-  shared_atom_types_ =
-      reinterpret_cast<std::int64_t *>(bytes + layout.atom_types);
-  shared_sources_ =
-      reinterpret_cast<std::uint32_t *>(bytes + layout.sources);
-  shared_edge_vectors_ =
-      reinterpret_cast<float *>(bytes + layout.edge_vectors);
-  shared_destination_row_ptr_ =
-      reinterpret_cast<std::int64_t *>(bytes + layout.destination_row_ptr);
-  shared_source_row_ptr_ =
-      reinterpret_cast<std::int64_t *>(bytes + layout.source_row_ptr);
-  shared_source_order_ =
-      reinterpret_cast<std::uint32_t *>(bytes + layout.source_order);
-  shared_atom_energy_ =
-      reinterpret_cast<double *>(bytes + layout.atom_energy);
-  shared_force_ = reinterpret_cast<double *>(bytes + layout.force);
-  shared_atom_virial_ =
-      reinterpret_cast<double *>(bytes + layout.atom_virial);
-  shared_node_capacity_ = node_capacity;
-  shared_edge_capacity_ = edge_capacity;
+  batch_atom_types_.resize(nodes);
+  batch_sources_.resize(edge_storage);
+  batch_edge_vectors_.resize(3 * edge_storage);
+  batch_destination_row_ptr_.resize(nodes + 1);
+  batch_source_row_ptr_.resize(nodes + 1);
+  batch_source_order_.resize(edge_storage);
 }
 
 void DeepmdPartitionBroker::compute(
     const DeepmdCanonicalGraph &local_graph) {
   result_valid_ = false;
   std::string local_diagnostic;
-  const int local_valid = local_graph_valid(local_graph, local_diagnostic) ? 1 : 0;
+  int local_valid = 0;
+  try {
+    local_valid = local_graph_valid(local_graph, local_diagnostic) ? 1 : 0;
+  } catch (const std::exception &exception) {
+    local_diagnostic = exception.what();
+  } catch (...) {
+    local_diagnostic = "unknown exception while validating canonical graph";
+  }
   int all_valid = 0;
   check_mpi(MPI_Allreduce(&local_valid, &all_valid, 1, MPI_INT, MPI_MIN,
                           communicator_),
@@ -476,17 +370,8 @@ void DeepmdPartitionBroker::compute(
               "MPI_Allreduce canonical diagnostic rank");
     if (rank_ != diagnostic_rank)
       local_diagnostic.clear();
-    int length = rank_ == diagnostic_rank
-                     ? checked_count(local_diagnostic.size(), "diagnostic")
-                     : 0;
-    check_mpi(MPI_Bcast(&length, 1, MPI_INT, diagnostic_rank, communicator_),
-              "MPI_Bcast canonical diagnostic length");
-    if (rank_ != diagnostic_rank)
-      local_diagnostic.resize(static_cast<std::size_t>(length));
-    check_mpi(MPI_Bcast(local_diagnostic.empty() ? nullptr
-                                                 : local_diagnostic.data(),
-                        length, MPI_CHAR, diagnostic_rank, communicator_),
-              "MPI_Bcast canonical diagnostic");
+    broadcast_string_from(communicator_, rank_, diagnostic_rank,
+                          local_diagnostic);
     throw std::invalid_argument(local_diagnostic);
   }
 
@@ -494,16 +379,31 @@ void DeepmdPartitionBroker::compute(
       static_cast<std::int64_t>(local_graph.atom_types.size()),
       static_cast<std::int64_t>(local_graph.sources.size()),
       local_graph.timestep};
-  metadata_records_.resize(static_cast<std::size_t>(size_) * 3);
+  int metadata_storage_failed = 0;
+  std::string metadata_storage_diagnostic;
+  try {
+    metadata_records_.resize(static_cast<std::size_t>(size_) * 3);
+    node_counts_.resize(size_);
+    edge_counts_.resize(size_);
+    local_nodes_per_frame_.resize(size_);
+    all_nodes_per_frame_.resize(size_);
+  } catch (const std::exception &exception) {
+    metadata_storage_failed = 1;
+    metadata_storage_diagnostic = exception.what();
+  } catch (...) {
+    metadata_storage_failed = 1;
+    metadata_storage_diagnostic =
+        "unknown exception while allocating DeePMD metadata";
+  }
+  throw_if_collective_failure(
+      communicator_, rank_, size_, metadata_storage_failed,
+      std::move(metadata_storage_diagnostic),
+      "DeePMD metadata allocation status");
   check_mpi(MPI_Allgather(local_metadata, 3, MPI_INT64_T,
                           metadata_records_.data(), 3, MPI_INT64_T,
                           communicator_),
             "MPI_Allgather canonical graph metadata");
 
-  node_counts_.resize(size_);
-  edge_counts_.resize(size_);
-  local_nodes_per_frame_.resize(size_);
-  all_nodes_per_frame_.resize(size_);
   int metadata_failed = 0;
   std::string metadata_diagnostic;
   try {
@@ -528,6 +428,10 @@ void DeepmdPartitionBroker::compute(
   } catch (const std::exception &exception) {
     metadata_failed = 1;
     metadata_diagnostic = exception.what();
+  } catch (...) {
+    metadata_failed = 1;
+    metadata_diagnostic =
+        "unknown exception while validating DeePMD graph metadata";
   }
   int any_metadata_failed = 0;
   check_mpi(MPI_Allreduce(&metadata_failed, &any_metadata_failed, 1, MPI_INT,
@@ -543,18 +447,8 @@ void DeepmdPartitionBroker::compute(
               "MPI_Allreduce metadata diagnostic rank");
     if (rank_ != diagnostic_rank)
       metadata_diagnostic.clear();
-    int length = rank_ == diagnostic_rank
-                     ? checked_count(metadata_diagnostic.size(), "diagnostic")
-                     : 0;
-    check_mpi(MPI_Bcast(&length, 1, MPI_INT, diagnostic_rank, communicator_),
-              "MPI_Bcast metadata diagnostic length");
-    if (rank_ != diagnostic_rank)
-      metadata_diagnostic.resize(static_cast<std::size_t>(length));
-    check_mpi(MPI_Bcast(metadata_diagnostic.empty()
-                            ? nullptr
-                            : metadata_diagnostic.data(),
-                        length, MPI_CHAR, diagnostic_rank, communicator_),
-              "MPI_Bcast metadata diagnostic");
+    broadcast_string_from(communicator_, rank_, diagnostic_rank,
+                          metadata_diagnostic);
     throw std::invalid_argument(metadata_diagnostic);
   }
 
@@ -566,37 +460,70 @@ void DeepmdPartitionBroker::compute(
       total_edges > std::numeric_limits<std::uint32_t>::max())
     throw std::overflow_error("DeePMD batch exceeds uint32 graph index range");
   const std::size_t edge_storage = std::max<std::size_t>(total_edges, 2);
-  ensure_shared_capacity(total_nodes, edge_storage);
+  std::vector<int> edge_vector_counts;
+  std::vector<int> edge_vector_displacements;
+  int staging_failed = 0;
+  std::string staging_diagnostic;
+  try {
+    ensure_host_capacity(total_nodes, edge_storage);
+    edge_vector_counts.resize(size_);
+    edge_vector_displacements.resize(size_);
+    for (int frame = 0; frame < size_; ++frame)
+      edge_vector_counts[frame] =
+          checked_scale(edge_counts_[frame], 3, "edge vector count");
+    build_displacements(edge_vector_counts, edge_vector_displacements,
+                        "edge vector");
+  } catch (const std::exception &exception) {
+    staging_failed = 1;
+    staging_diagnostic = exception.what();
+  } catch (...) {
+    staging_failed = 1;
+    staging_diagnostic =
+        "unknown exception while allocating DeePMD batch staging";
+  }
+  throw_if_collective_failure(
+      communicator_, rank_, size_, staging_failed, std::move(staging_diagnostic),
+      "DeePMD batch staging allocation status");
 
-  const std::size_t local_node_offset =
-      static_cast<std::size_t>(node_displacements_[rank_]);
-  const std::size_t local_edge_offset =
-      static_cast<std::size_t>(edge_displacements_[rank_]);
-  const std::size_t local_nodes =
-      static_cast<std::size_t>(node_counts_[rank_]);
-  std::copy(local_graph.atom_types.begin(), local_graph.atom_types.end(),
-            shared_atom_types_ + local_node_offset);
-  std::copy(local_graph.sources.begin(), local_graph.sources.end(),
-            shared_sources_ + local_edge_offset);
-  std::copy(local_graph.edge_vectors.begin(), local_graph.edge_vectors.end(),
-            shared_edge_vectors_ + 3 * local_edge_offset);
-  // The terminal CSR entry for the concatenated graph is written once by the
-  // owner. Each rank publishes only its node rows into its disjoint slot.
-  std::copy_n(local_graph.destination_row_ptr.begin(), local_nodes,
-              shared_destination_row_ptr_ + local_node_offset);
-  std::copy_n(local_graph.source_row_ptr.begin(), local_nodes,
-              shared_source_row_ptr_ + local_node_offset);
-  std::copy(local_graph.source_order.begin(), local_graph.source_order.end(),
-            shared_source_order_ + local_edge_offset);
-
-  // Direct stores into an MPI shared window require a local sync before the
-  // rendezvous and another sync before rank zero observes peer mappings.
-  check_mpi(MPI_Win_sync(shared_data_window_),
-            "MPI_Win_sync DeePMD input publication");
-  check_mpi(MPI_Barrier(shared_communicator_),
-            "MPI_Barrier DeePMD input publication");
-  check_mpi(MPI_Win_sync(shared_data_window_),
-            "MPI_Win_sync DeePMD input observation");
+  check_collective_mpi(
+      MPI_Gatherv(data_or_null(local_graph.atom_types), node_counts_[rank_],
+                  MPI_INT64_T, data_or_null(batch_atom_types_),
+                  node_counts_.data(), node_displacements_.data(), MPI_INT64_T,
+                  kOwner, communicator_),
+      communicator_, "MPI_Gatherv DeePMD atom types");
+  check_collective_mpi(
+      MPI_Gatherv(data_or_null(local_graph.sources), edge_counts_[rank_],
+                  MPI_UINT32_T, data_or_null(batch_sources_),
+                  edge_counts_.data(), edge_displacements_.data(),
+                  MPI_UINT32_T, kOwner, communicator_),
+      communicator_, "MPI_Gatherv DeePMD sources");
+  check_collective_mpi(
+      MPI_Gatherv(data_or_null(local_graph.edge_vectors),
+                  edge_vector_counts[rank_], MPI_FLOAT,
+                  data_or_null(batch_edge_vectors_),
+                  edge_vector_counts.data(), edge_vector_displacements.data(),
+                  MPI_FLOAT, kOwner, communicator_),
+      communicator_, "MPI_Gatherv DeePMD edge vectors");
+  check_collective_mpi(
+      MPI_Gatherv(data_or_null(local_graph.destination_row_ptr),
+                  node_counts_[rank_], MPI_INT64_T,
+                  data_or_null(batch_destination_row_ptr_),
+                  node_counts_.data(), node_displacements_.data(), MPI_INT64_T,
+                  kOwner, communicator_),
+      communicator_, "MPI_Gatherv DeePMD destination CSR");
+  check_collective_mpi(
+      MPI_Gatherv(data_or_null(local_graph.source_row_ptr),
+                  node_counts_[rank_], MPI_INT64_T,
+                  data_or_null(batch_source_row_ptr_), node_counts_.data(),
+                  node_displacements_.data(), MPI_INT64_T, kOwner,
+                  communicator_),
+      communicator_, "MPI_Gatherv DeePMD source CSR");
+  check_collective_mpi(
+      MPI_Gatherv(data_or_null(local_graph.source_order), edge_counts_[rank_],
+                  MPI_UINT32_T, data_or_null(batch_source_order_),
+                  edge_counts_.data(), edge_displacements_.data(),
+                  MPI_UINT32_T, kOwner, communicator_),
+      communicator_, "MPI_Gatherv DeePMD source order");
 
   int owner_failed = 0;
   std::string owner_diagnostic;
@@ -610,36 +537,36 @@ void DeepmdPartitionBroker::compute(
         for (std::int64_t node = 0; node < nodes; ++node) {
           const std::size_t index =
               static_cast<std::size_t>(node_offset + node);
-          shared_destination_row_ptr_[index] += edge_offset;
-          shared_source_row_ptr_[index] += edge_offset;
+          batch_destination_row_ptr_[index] += edge_offset;
+          batch_source_row_ptr_[index] += edge_offset;
         }
         for (std::int64_t edge = 0; edge < edges; ++edge) {
           const std::size_t index =
               static_cast<std::size_t>(edge_offset + edge);
-          shared_sources_[index] += static_cast<std::uint32_t>(node_offset);
-          shared_source_order_[index] +=
+          batch_sources_[index] += static_cast<std::uint32_t>(node_offset);
+          batch_source_order_[index] +=
               static_cast<std::uint32_t>(edge_offset);
         }
       }
-      shared_destination_row_ptr_[total_nodes] =
+      batch_destination_row_ptr_[total_nodes] =
           static_cast<std::int64_t>(total_edges);
-      shared_source_row_ptr_[total_nodes] =
+      batch_source_row_ptr_[total_nodes] =
           static_cast<std::int64_t>(total_edges);
       for (std::size_t edge = total_edges; edge < edge_storage; ++edge) {
-        shared_sources_[edge] = 0;
-        shared_edge_vectors_[3 * edge + 0] = 0.0f;
-        shared_edge_vectors_[3 * edge + 1] = 0.0f;
-        shared_edge_vectors_[3 * edge + 2] = 0.0f;
-        shared_source_order_[edge] = static_cast<std::uint32_t>(edge);
+        batch_sources_[edge] = 0;
+        batch_edge_vectors_[3 * edge + 0] = 0.0f;
+        batch_edge_vectors_[3 * edge + 1] = 0.0f;
+        batch_edge_vectors_[3 * edge + 2] = 0.0f;
+        batch_source_order_[edge] = static_cast<std::uint32_t>(edge);
       }
 
       const DeepmdCanonicalBatchView batch{
-          shared_atom_types_,
-          shared_sources_,
-          shared_edge_vectors_,
-          shared_destination_row_ptr_,
-          shared_source_row_ptr_,
-          shared_source_order_,
+          batch_atom_types_.data(),
+          batch_sources_.data(),
+          batch_edge_vectors_.data(),
+          batch_destination_row_ptr_.data(),
+          batch_source_row_ptr_.data(),
+          batch_source_order_.data(),
           local_nodes_per_frame_.data(),
           all_nodes_per_frame_.data(),
           total_nodes,
@@ -653,28 +580,77 @@ void DeepmdPartitionBroker::compute(
         throw std::runtime_error(
             "DeePMD batch returned inconsistent result extents");
       }
-      std::copy(batch_result_.atom_energy.begin(),
-                batch_result_.atom_energy.end(), shared_atom_energy_);
-      std::copy(batch_result_.force.begin(), batch_result_.force.end(),
-                shared_force_);
-      std::copy(batch_result_.atom_virial.begin(),
-                batch_result_.atom_virial.end(), shared_atom_virial_);
     } catch (const std::exception &exception) {
       owner_failed = 1;
       owner_diagnostic = exception.what();
+    } catch (...) {
+      owner_failed = 1;
+      owner_diagnostic = "unknown exception during DeePMD batch execution";
     }
   }
-  check_mpi(MPI_Win_sync(shared_data_window_),
-            "MPI_Win_sync DeePMD output publication");
   check_mpi(MPI_Bcast(&owner_failed, 1, MPI_INT, kOwner, communicator_),
             "MPI_Bcast DeePMD batch status");
-  check_mpi(MPI_Win_sync(shared_data_window_),
-            "MPI_Win_sync DeePMD output observation");
   if (owner_failed) {
     broadcast_string(communicator_, rank_, owner_diagnostic);
     throw std::runtime_error(owner_diagnostic);
   }
 
+  int result_storage_failed = 0;
+  std::string result_storage_diagnostic;
+  try {
+    force_counts_.resize(size_);
+    virial_counts_.resize(size_);
+    for (int frame = 0; frame < size_; ++frame) {
+      force_counts_[frame] =
+          checked_scale(node_counts_[frame], 3, "force count");
+      virial_counts_[frame] =
+          checked_scale(node_counts_[frame], 9, "virial count");
+    }
+    build_displacements(force_counts_, force_displacements_, "force");
+    build_displacements(virial_counts_, virial_displacements_, "virial");
+    local_atom_energy_.resize(static_cast<std::size_t>(node_counts_[rank_]));
+    local_force_.resize(static_cast<std::size_t>(force_counts_[rank_]));
+    local_atom_virial_.resize(
+        static_cast<std::size_t>(virial_counts_[rank_]));
+  } catch (const std::exception &exception) {
+    result_storage_failed = 1;
+    result_storage_diagnostic = exception.what();
+  } catch (...) {
+    result_storage_failed = 1;
+    result_storage_diagnostic =
+        "unknown exception while allocating DeePMD result buffers";
+  }
+  if (rank_ == kOwner && !result_storage_failed &&
+      (batch_result_.atom_energy.size() != total_nodes ||
+       batch_result_.force.size() != 3 * total_nodes ||
+       batch_result_.atom_virial.size() != 9 * total_nodes)) {
+    result_storage_failed = 1;
+    result_storage_diagnostic =
+        "DeePMD batch returned inconsistent result extents";
+  }
+  throw_if_collective_failure(
+      communicator_, rank_, size_, result_storage_failed,
+      std::move(result_storage_diagnostic),
+      "DeePMD result allocation status");
+
+  check_collective_mpi(
+      MPI_Scatterv(data_or_null(batch_result_.atom_energy),
+                   node_counts_.data(), node_displacements_.data(), MPI_DOUBLE,
+                   data_or_null(local_atom_energy_), node_counts_[rank_],
+                   MPI_DOUBLE, kOwner, communicator_),
+      communicator_, "MPI_Scatterv DeePMD atomic energy");
+  check_collective_mpi(
+      MPI_Scatterv(data_or_null(batch_result_.force), force_counts_.data(),
+                   force_displacements_.data(), MPI_DOUBLE,
+                   data_or_null(local_force_), force_counts_[rank_], MPI_DOUBLE,
+                   kOwner, communicator_),
+      communicator_, "MPI_Scatterv DeePMD force");
+  check_collective_mpi(
+      MPI_Scatterv(data_or_null(batch_result_.atom_virial),
+                   virial_counts_.data(), virial_displacements_.data(),
+                   MPI_DOUBLE, data_or_null(local_atom_virial_),
+                   virial_counts_[rank_], MPI_DOUBLE, kOwner, communicator_),
+      communicator_, "MPI_Scatterv DeePMD atomic virial");
   result_valid_ = true;
 }
 
@@ -682,12 +658,8 @@ DeepmdWindowResultView
 DeepmdPartitionBroker::result_for_local_window() const {
   if (!result_valid_)
     throw std::logic_error("DeePMD broker result is not available");
-  const std::size_t node_offset =
-      static_cast<std::size_t>(node_displacements_[rank_]);
-  const std::size_t nodes = static_cast<std::size_t>(node_counts_[rank_]);
-  return {shared_atom_energy_ + node_offset,
-          shared_force_ + 3 * node_offset,
-          shared_atom_virial_ + 9 * node_offset, nodes};
+  return {data_or_null(local_atom_energy_), data_or_null(local_force_),
+          data_or_null(local_atom_virial_), local_atom_energy_.size()};
 }
 
 }  // namespace DPRC
