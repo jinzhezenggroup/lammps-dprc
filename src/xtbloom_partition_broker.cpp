@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -572,11 +573,11 @@ XtbloomPartitionBroker::compute(const WindowFrame &local_frame) {
         last_error_ = executor_->last_error();
     } catch (const std::exception &exception) {
       native_outcome = {XTBLOOM_STATUS_INTERNAL_ERROR, timestep,
-                        SccStartPolicy::Fresh, 0u};
+                        SccStartPolicy::Fresh, 0u, false};
       last_error_ = exception.what();
     } catch (...) {
       native_outcome = {XTBLOOM_STATUS_INTERNAL_ERROR, timestep,
-                        SccStartPolicy::Fresh, 0u};
+                        SccStartPolicy::Fresh, 0u, false};
       last_error_ = "unknown exception during xTBloom broker compute";
     }
   }
@@ -619,7 +620,8 @@ XtbloomPartitionBroker::compute(const WindowFrame &local_frame) {
       timestep,
       publication[1] == 0 ? SccStartPolicy::Fresh : SccStartPolicy::Warm,
       static_cast<std::uint32_t>(publication[2]), publication[3] != 0u};
-  if (outcome.call_status == XTBLOOM_STATUS_SUCCESS) {
+  if (outcome.call_status == XTBLOOM_STATUS_SUCCESS &&
+      outcome.all_systems_succeeded) {
     result_timestep_ = outcome.timestep;
     result_valid_ = true;
   } else {
@@ -629,32 +631,79 @@ XtbloomPartitionBroker::compute(const WindowFrame &local_frame) {
 }
 
 bool XtbloomPartitionBroker::publish_success(
-    const XtbloomComputeOutcome &) {
-  bool all_systems_succeeded = true;
-  if (rank_ == kBrokerRoot) {
+    const XtbloomComputeOutcome &outcome) {
+  if (rank_ != kBrokerRoot)
+    return false;
+  if (!outcome.all_systems_succeeded || !executor_->has_result()) {
+    if (last_error_.empty())
+      last_error_ = executor_->last_error();
+    return false;
+  }
+
+  try {
+    // First pass: validate every extent and pointer without touching shared
+    // output.  A malformed native view therefore cannot leave a partial batch
+    // in the shared mapping.  Keep this inside the root-side try block so an
+    // unexpected executor state is converted into a collective failure rather
+    // than throwing before peers reach the metadata broadcast.
     for (int slot = 0; slot < size_; ++slot) {
-      const WindowResultView view = executor_->result_for_window(slot);
-      all_systems_succeeded = all_systems_succeeded &&
-          view.status == XTBLOOM_STATUS_SUCCESS && view.scc_converged;
       const std::size_t index = static_cast<std::size_t>(slot);
+      const WindowResultView view = executor_->result_for_window(slot);
+      const bool valid =
+          view.window_index == slot &&
+          view.status == XTBLOOM_STATUS_SUCCESS && view.scc_converged &&
+          view.atom_count == static_cast<std::size_t>(atom_counts_[index]) &&
+          view.point_charge_count ==
+              static_cast<std::size_t>(point_counts_[index]) &&
+          (position_counts_[index] == 0 || view.forces != nullptr) &&
+          (atom_counts_[index] == 0 || view.atomic_charges != nullptr) &&
+          (point_position_counts_[index] == 0 ||
+           view.point_charge_forces != nullptr);
+      if (!valid) {
+        executor_->invalidate_result();
+        std::ostringstream message;
+        message << "xTBloom result validation failed for window " << slot
+                << ": status=" << view.status
+                << " scc_converged="
+                << (view.scc_converged ? "true" : "false")
+                << " atom_count=" << view.atom_count << "/"
+                << atom_counts_[index] << " point_charge_count="
+                << view.point_charge_count << "/" << point_counts_[index];
+        last_error_ = message.str();
+        return false;
+      }
+    }
+
+    // Second pass: publication is now all-or-nothing with respect to the
+    // validation above.  No allocation occurs in this steady-state path.
+    for (int slot = 0; slot < size_; ++slot) {
+      const std::size_t index = static_cast<std::size_t>(slot);
+      const WindowResultView view = executor_->result_for_window(slot);
       shared_metadata_[index].energy = view.energy;
       shared_metadata_[index].status = view.status;
       shared_metadata_[index].scc_iterations = view.scc_iterations;
-      shared_metadata_[index].scc_converged =
-          view.scc_converged ? 1u : 0u;
+      shared_metadata_[index].scc_converged = view.scc_converged ? 1u : 0u;
       std::copy_n(view.forces, position_counts_[index],
                   shared_forces_ + position_displacements_[index]);
       std::copy_n(view.atomic_charges, atom_counts_[index],
                   shared_atomic_charges_ + atom_displacements_[index]);
       if (point_position_counts_[index] != 0) {
-        std::copy_n(
-            view.point_charge_forces, point_position_counts_[index],
-            shared_point_charge_forces_ +
-                point_position_displacements_[index]);
+        std::copy_n(view.point_charge_forces, point_position_counts_[index],
+                    shared_point_charge_forces_ +
+                        point_position_displacements_[index]);
       }
     }
+  } catch (const std::exception &exception) {
+    executor_->invalidate_result();
+    last_error_ = std::string("xTBloom result publication failed: ") +
+                  exception.what();
+    return false;
+  } catch (...) {
+    executor_->invalidate_result();
+    last_error_ = "xTBloom result publication failed: unknown exception";
+    return false;
   }
-  return all_systems_succeeded;
+  return true;
 }
 
 void XtbloomPartitionBroker::broadcast_error() {

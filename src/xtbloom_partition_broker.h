@@ -14,8 +14,9 @@
 namespace DPRC {
 
 // Outcome shared by every partition root after one collective broker call.
-// A SUCCESS call may still contain a peer-local numerical failure, exposed by
-// result_for_local_window().status without invalidating successful peers.
+// A SUCCESS call may still contain a peer-local numerical failure.  The broker
+// treats that outcome as a failed transaction: no window may consume a partial
+// result, and the next accepted timestep starts from a fresh SCC checkpoint.
 struct PartitionBrokerOutcome {
   xtbloom_status_t call_status = XTBLOOM_STATUS_INTERNAL_ERROR;
   std::int64_t timestep = -1;
@@ -58,6 +59,8 @@ private:
   void release_shared_storage() noexcept;
   bool local_frame_is_valid(const WindowFrame &frame) const noexcept;
   void stage_shared_frame(const WindowFrame &frame);
+  // Validate the complete native result before publishing any shared slice.
+  // This two-pass transaction is intentionally allocation-free in steady state.
   bool publish_success(const XtbloomComputeOutcome &outcome);
   void broadcast_error();
 

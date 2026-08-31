@@ -38,6 +38,10 @@ struct XtbloomComputeOutcome {
   std::int64_t timestep = -1;
   SccStartPolicy start_policy = SccStartPolicy::Fresh;
   std::uint32_t result_flags = 0;
+  // A SUCCESS call may contain per-system SCC/eigensolver failures.  Such a
+  // batch is deliberately not publishable to callers, because all windows
+  // must advance from one consistent xTBloom checkpoint.
+  bool all_systems_succeeded = false;
 };
 
 struct WindowResultView {
@@ -80,6 +84,14 @@ public:
   XtbloomComputeOutcome compute();
   WindowResultView result_for_window(std::int32_t window_index) const;
   XtbloomWorkspaceInfo workspace() const;
+
+  // Invalidate a successfully computed native result when a downstream
+  // publication validator rejects its shape or ownership.  This also forces
+  // the next compute to use FRESH SCC state.
+  void invalidate_result() noexcept {
+    result_valid_ = false;
+    batch_.invalidate_warm_checkpoint();
+  }
 
   bool has_result() const noexcept { return result_valid_; }
   const std::string &last_error() const noexcept { return last_error_; }

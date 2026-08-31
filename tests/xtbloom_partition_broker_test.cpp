@@ -246,6 +246,11 @@ int run_test() {
         broker.compute(make_frame(rank, 20, 0.0));
     CHECK(initial.call_status == XTBLOOM_STATUS_SUCCESS);
     CHECK(initial.start_policy == DPRC::SccStartPolicy::Fresh);
+    const DPRC::WindowResultView initial_result =
+        broker.result_for_local_window();
+    const double initial_force = initial_result.forces[0];
+    const double initial_charge = initial_result.atomic_charges[0];
+    const double initial_point_force = initial_result.point_charge_forces[0];
 
     DPRC::WindowFrame peer_frame = make_frame(rank, 21, 0.0);
     if (rank == 1)
@@ -255,27 +260,20 @@ int run_test() {
     CHECK(peer_failure.call_status == XTBLOOM_STATUS_SUCCESS);
     CHECK(!peer_failure.all_systems_succeeded);
     CHECK(peer_failure.start_policy == DPRC::SccStartPolicy::Warm);
-    CHECK(broker.has_result());
-    const DPRC::WindowResultView local_result =
-        broker.result_for_local_window();
-    if (rank == 0) {
-      CHECK(local_result.status == XTBLOOM_STATUS_SUCCESS);
-      CHECK(local_result.scc_converged);
-      CHECK(std::isfinite(local_result.energy));
-      CHECK(all_finite(local_result.forces, 3u * local_result.atom_count));
-      CHECK(all_finite(local_result.atomic_charges, local_result.atom_count));
-      CHECK(all_finite(local_result.point_charge_forces,
-                       3u * local_result.point_charge_count));
-    } else {
-      CHECK(local_result.status == XTBLOOM_STATUS_EIGENSOLVER_FAILED ||
-            local_result.status == XTBLOOM_STATUS_SCC_NOT_CONVERGED);
-      CHECK(!local_result.scc_converged);
-      CHECK(std::isnan(local_result.energy));
-      CHECK(all_nan(local_result.forces, 3u * local_result.atom_count));
-      CHECK(all_nan(local_result.atomic_charges, local_result.atom_count));
-      CHECK(all_nan(local_result.point_charge_forces,
-                    3u * local_result.point_charge_count));
+    CHECK(!broker.has_result());
+    CHECK(!broker.last_error().empty());
+    bool rejected_result = false;
+    try {
+      static_cast<void>(broker.result_for_local_window());
+    } catch (const std::logic_error &) {
+      rejected_result = true;
     }
+    CHECK(rejected_result);
+    // The failed transaction must not overwrite the previous shared payload;
+    // the saved views remain valid because the mapping is allocation-stable.
+    CHECK(initial_result.forces[0] == initial_force);
+    CHECK(initial_result.atomic_charges[0] == initial_charge);
+    CHECK(initial_result.point_charge_forces[0] == initial_point_force);
 
     const DPRC::PartitionBrokerOutcome recovered =
         broker.compute(make_frame(rank, 22, 0.0));
@@ -303,7 +301,7 @@ int run_test() {
 
   if (rank == 0)
     std::cout << "partition broker: one native owner, shared ragged QM/MM staging, "
-                 "peer-local failure isolation, WARM recovery, and collective "
+                 "failure-atomic publication, FRESH recovery, and collective "
                  "rejection passed\n";
   return 0;
 }

@@ -1,6 +1,7 @@
 #include "xtbloom_plan_executor.h"
 
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -32,6 +33,30 @@ std::size_t range_size(std::int64_t begin, std::int64_t end) {
     throw std::overflow_error("xTBloom result range does not fit size_t");
   }
   return static_cast<std::size_t>(end - begin);
+}
+
+const char *status_name(xtbloom_status_t status) {
+  const char *name = xtbloom_status_string(status);
+  return name == nullptr ? "UNKNOWN_STATUS" : name;
+}
+
+std::string per_system_failure_diagnostic(const StableBatch &batch,
+                                         const std::vector<std::int32_t> &statuses,
+                                         const std::vector<std::uint8_t> &converged,
+                                         const std::vector<std::int32_t> &iterations) {
+  std::ostringstream message;
+  message << "xTBloom batch rejected because one or more systems failed";
+  for (std::size_t slot = 0; slot < batch.size(); ++slot) {
+    const auto status = static_cast<xtbloom_status_t>(statuses[slot]);
+    if (status == XTBLOOM_STATUS_SUCCESS && converged[slot] != 0u)
+      continue;
+    message << "; window " << batch.topology(slot).window_index
+            << " status=" << status_name(status) << " ("
+            << statuses[slot] << ")"
+            << " scc_converged=" << (converged[slot] != 0u ? "true" : "false")
+            << " scc_iterations=" << iterations[slot];
+  }
+  return message.str();
 }
 
 } // namespace
@@ -166,13 +191,34 @@ XtbloomComputeOutcome XtbloomPlanExecutor::compute() {
                                         : XTBLOOM_SCC_START_FRESH;
   result_valid_ = false;
   last_error_.clear();
+  bool all_systems_succeeded = false;
   const xtbloom_status_t status =
       xtbloom_plan_compute(plan_, &descriptor_, &compute_options_, &result_);
   if (status == XTBLOOM_STATUS_SUCCESS) {
-    batch_.complete_compute(true, per_system_status_.data(),
-                            per_system_status_.size(), XTBLOOM_STATUS_SUCCESS);
+    all_systems_succeeded = true;
+    for (std::size_t slot = 0; slot < batch_.size(); ++slot) {
+      all_systems_succeeded =
+          all_systems_succeeded &&
+          per_system_status_[slot] == XTBLOOM_STATUS_SUCCESS &&
+          scc_converged_[slot] != 0u;
+    }
+    // A data-level failure is still a failed transaction for the strict WARM
+    // contract.  Passing call_succeeded=false revokes the checkpoint while
+    // retaining the native status arrays for the diagnostic below.
+    if (all_systems_succeeded) {
+      batch_.complete_compute(true, per_system_status_.data(),
+                              per_system_status_.size(),
+                              XTBLOOM_STATUS_SUCCESS);
+    } else {
+      batch_.complete_compute(false, nullptr, 0u, XTBLOOM_STATUS_SUCCESS);
+      last_error_ = per_system_failure_diagnostic(
+          batch_, per_system_status_, scc_converged_, scc_iterations_);
+    }
     result_timestep_ = timestep;
-    result_valid_ = true;
+    // Keep failed native buffers private.  In particular, xTBloom intentionally
+    // fills failed slices with NaNs; exposing them to the broker would permit a
+    // partial force publication and could make a later LAMMPS callback unsafe.
+    result_valid_ = all_systems_succeeded;
   } else {
     const char *diagnostic = xtbloom_get_last_error();
     if (diagnostic != nullptr)
@@ -180,7 +226,8 @@ XtbloomComputeOutcome XtbloomPlanExecutor::compute() {
     batch_.complete_compute(false, nullptr, 0u, XTBLOOM_STATUS_SUCCESS);
   }
   return {status, timestep, start_policy,
-          status == XTBLOOM_STATUS_SUCCESS ? result_.flags : 0u};
+          status == XTBLOOM_STATUS_SUCCESS ? result_.flags : 0u,
+          all_systems_succeeded};
 }
 
 WindowResultView
