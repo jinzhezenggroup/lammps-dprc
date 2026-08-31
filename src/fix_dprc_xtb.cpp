@@ -21,6 +21,7 @@
 #endif
 
 using namespace LAMMPS_NS;
+using namespace FixConst;
 
 namespace {
 
@@ -56,12 +57,28 @@ void publish_legacy_atom_views(LAMMPS *lmp, std::uint64_t mask) {
 // on every timestep.
 constexpr std::uint64_t kLegacyReadMask = X_MASK | Q_MASK | F_MASK;
 constexpr std::uint64_t kLegacyPublicationMask = Q_MASK | F_MASK;
+// Neighbor construction runs before PRE_FORCE in a Kokkos Verlet step.  The
+// legacy neighbor builder only needs current coordinates at this boundary;
+// keeping this mask narrow avoids synchronizing charge/force views twice.
+constexpr std::uint64_t kLegacyNeighborMask = X_MASK;
 #else
 constexpr std::uint64_t kLegacyReadMask = 0;
 constexpr std::uint64_t kLegacyPublicationMask = 0;
+constexpr std::uint64_t kLegacyNeighborMask = 0;
 #endif
 
 } // namespace
+
+int FixDPRCXtb::setmask() {
+  int mask = FixDPRCXtbReference::setmask();
+#ifdef DPRC_HAVE_LAMMPS_KOKKOS_BRIDGE
+  // ModifyKokkos invokes PRE_NEIGHBOR immediately before the legacy neighbor
+  // builder.  This is the earliest safe point at which device coordinates can
+  // be made visible through atom->x.
+  mask |= PRE_NEIGHBOR;
+#endif
+  return mask;
+}
 
 FixDPRCXtb::~FixDPRCXtb() {
   // The renamed reference base destructor calls the same function again. The
@@ -69,6 +86,10 @@ FixDPRCXtb::~FixDPRCXtb() {
   // before roots_ frees its communicator.
   if (adapter_bound_ && roots_ && roots_->is_root())
     dprc_lammps_xtb_destroy();
+}
+
+void FixDPRCXtb::pre_neighbor() {
+  sync_legacy_atom_views(lmp, kLegacyNeighborMask);
 }
 
 void FixDPRCXtb::init() {
