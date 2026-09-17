@@ -105,9 +105,9 @@
     "stop_tenths_angstrom": 16,
     "step_tenths_angstrom": 1,
     "count": 48,
-    "available_initial_center_tenths_angstrom": -15,
+    "available_initial_center_tenths_angstrom": 15,
     "reaction_coordinate": {
-      "expression": "distance(5,1)-distance(1,12)",
+      "expression": "distance(1,12)-distance(5,1)",
       "force_constant_kcal_mol_angstrom2": 200.0
     },
     "attack_angle": {
