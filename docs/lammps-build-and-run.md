@@ -424,11 +424,13 @@ fix qmmm qm qmmm/xtb/dprc &
   mmhardness 0.0 kmax 8 8 8 ksqmax 100
 fix_modify qmmm energy yes
 
-fix water_shake water shake 1.0e-6 200 0 b 1 a 1
 fix integrate all nve
 fix thermostat all langevin 300.0 300.0 100.0 12345
+# Constrain after all fixes that add forces, including the thermostat.
+fix water_shake water shake 1.0e-6 200 0 b 1 a 1
 
-timestep 0.001
+# With units real, time is in femtoseconds: this is a 1 fs step.
+timestep 1.0
 neighbor 2.0 bin
 neigh_modify every 1 delay 0 check yes
 thermo 100
@@ -439,6 +441,12 @@ run 1000
 distance units. `include_molecule yes` requires positive molecule IDs for
 selected environment atoms. The style requires atom IDs, an atom map, one MPI
 rank per partition, synchronized timesteps, and no `neigh_modify exclude`.
+
+Keep SHAKE after Langevin and any other force-modifying fix that acts on
+constrained atoms. SHAKE predicts the next constrained positions from the
+forces present when its callback runs; adding thermostat forces afterwards
+violates the water constraints. See the ordering note in the
+[LAMMPS SHAKE documentation](https://docs.lammps.org/fix_shake.html).
 
 For xTB QM/MM without DPA4c, remove the `dprc/deepmd/batch` sub-style and
 its `pair_coeff`; keep `dprcplugin.so`, the batched classical styles, KSpace,

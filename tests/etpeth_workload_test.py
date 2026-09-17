@@ -50,6 +50,37 @@ class ETPETHWorkloadTest(unittest.TestCase):
         self.assertEqual((windows[16].tag, windows[16].center), ("m1p5", -1.5))
         self.assertEqual((windows[-1].tag, windows[-1].center), ("p1p6", 1.6))
 
+    def test_user_example_constrains_after_thermostat_at_one_fs(self) -> None:
+        """The copyable input must not reintroduce either MD setup defect."""
+        document = (ROOT / "docs/lammps-build-and-run.md").read_text(encoding="utf-8")
+        examples = [block for block in document.split("```")
+                    if "fix thermostat all langevin" in block]
+        self.assertEqual(len(examples), 1)
+        example = examples[0]
+        self.assertLess(example.index("fix thermostat all langevin"),
+                        example.index("fix water_shake water shake"))
+        self.assertIn("timestep 1.0\n", example)
+        self.assertNotIn("timestep 0.001", example)
+
+    def test_paper_coordinate_is_rendered_and_legacy_sign_is_explicit(self) -> None:
+        """The paper subtracts the chain P--O5(topology) bond from P--O12."""
+        reaction = self.manifest["umbrella"]["reaction_coordinate"]
+        self.assertEqual(reaction["expression"], "distance(1,12)-distance(5,1)")
+        self.assertEqual(self.manifest["umbrella"]["available_initial_center_tenths_angstrom"], 15)
+        window = WORKLOAD.windows_from_manifest(self.manifest)[0]
+        text = WORKLOAD.render_colvars(self.manifest, window)
+        first, second = text.split("componentCoeff -1.0")
+        self.assertIn("group2 { atomNumbers 12 }", first)
+        self.assertIn("group1 { atomNumbers 5 }", second)
+        reaction["expression"] = "distance(5,1)-distance(1,12)"
+        legacy = WORKLOAD.render_colvars(self.manifest, window)
+        first, second = legacy.split("componentCoeff -1.0")
+        self.assertIn("group1 { atomNumbers 5 }", first)
+        self.assertIn("group2 { atomNumbers 12 }", second)
+        reaction["expression"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "unsupported.*expression"):
+            WORKLOAD.render_colvars(self.manifest, window)
+
     def test_representative_nve_windows_are_fixed_before_results(self) -> None:
         windows = WORKLOAD.windows_from_manifest(self.manifest)
         selected = WORKLOAD.representative_nve_windows(windows)
@@ -554,6 +585,28 @@ class ETPETHWorkloadTest(unittest.TestCase):
             self.assertIn("fix integrate all nve/kk", nve)
             self.assertIn("fix restraints all colvars/kk", nve)
 
+            # A thermostat after SHAKE adds forces not used in the constraint
+            # prediction. Guard the ordering across every supported force and
+            # integration backend, including the thermostat-free diagnostic.
+            for name, rendered in (
+                ("qmmm-kokkos", text),
+                ("qmmm-host", host_qmmm),
+                ("classical-kokkos", classical),
+                ("classical-host", host_classical),
+                ("dpa4c-kokkos", dpa4c),
+                ("dpa4c-host", host_dpa4c),
+                ("nve-kokkos", nve),
+            ):
+                with self.subTest(shake_order=name):
+                    self.assertEqual(rendered.count("fix water_shake "), 1)
+                    shake_index = rendered.index("fix water_shake ")
+                    for prefix in (
+                        "fix integrate ", "fix thermostat ",
+                        "fix restraints ", "fix qmmm ", "fix classical ",
+                    ):
+                        if prefix in rendered:
+                            self.assertLess(rendered.index(prefix), shake_index)
+
     def test_nve_execution_record_is_explicit_without_changing_nvt_ledger(self) -> None:
         arguments = {
             "mode": "qmmm",
@@ -653,6 +706,34 @@ class ETPETHWorkloadTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different DPA4c model bytes"):
                 WORKLOAD.require_nve_stability_qualification(
                     root, manifest, [model]
+                )
+
+            # An uncorrected Hamiltonian needs its own explicit qualification;
+            # the DPRc gate and model identities must not be silently reused.
+            result["scope"] = "three-window-qmmm-nve-stability"
+            result["inputs"]["models"] = []
+            qualification.write_text(json.dumps(result), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "scope"):
+                WORKLOAD.require_nve_stability_qualification(root, manifest, [])
+            accepted = WORKLOAD.require_nve_stability_qualification(
+                root, manifest, [], mode="qmmm"
+            )
+            self.assertEqual(accepted["thresholds"], result["thresholds"])
+            result["analysis_protocol"] = {"transient_steps": 500}
+            qualification.write_text(json.dumps(result), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "full-start"):
+                WORKLOAD.require_nve_stability_qualification(root, manifest, [], mode="qmmm")
+            result.pop("analysis_protocol")
+            qualification.write_text(json.dumps(result), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Hamiltonian/models"):
+                WORKLOAD.require_nve_stability_qualification(
+                    root, manifest, [model], mode="qmmm"
+                )
+            result["thresholds"]["maximum_absolute_net_drift_kcal_mol_atom"] *= 2
+            qualification.write_text(json.dumps(result), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "thresholds"):
+                WORKLOAD.require_nve_stability_qualification(
+                    root, manifest, [], mode="qmmm"
                 )
 
     def test_topology_guard_rejects_qmmm_data_for_classical_mode(self) -> None:
@@ -2212,6 +2293,31 @@ class ETPETHWorkloadTest(unittest.TestCase):
                 self.fail("a second launcher acquired the same workspace")
             self.assertFalse((root / ".etpeth-run.lock").exists())
 
+    def test_private_source_relocation_preserves_artifact_identity(self) -> None:
+        snapshot = {
+            "qualification": "private-diagnostic",
+            "identity_kind": "artifact-verified-source-snapshot",
+            "revision": None,
+            "expected_revision": "reviewed",
+            "artifacts": [{"path": "/fixture/input", "sha256": "original"}],
+            "dirty": False,
+            "dirty_entries": [],
+            "qualification_reasons": ["no Git metadata"],
+        }
+        checkout = copy.deepcopy(snapshot)
+        checkout.update(identity_kind="git-checkout", revision="reviewed",
+                        dirty=True, dirty_entries=["?? unrelated"],
+                        qualification_reasons=["dirty checkout"])
+        self.assertTrue(WORKLOAD.source_provenance_matches(snapshot, checkout))
+        for field, value in (("revision", "wrong"), ("qualification", "final"),
+                             ("expected_revision", "wrong")):
+            changed = copy.deepcopy(checkout)
+            changed[field] = value
+            self.assertFalse(WORKLOAD.source_provenance_matches(snapshot, changed))
+        changed = copy.deepcopy(checkout)
+        changed["artifacts"][0]["sha256"] = "modified"
+        self.assertFalse(WORKLOAD.source_provenance_matches(snapshot, changed))
+
     def test_workspace_lock_recovers_only_proven_stale_owner(self) -> None:
         with tempfile.TemporaryDirectory(prefix="dprc-etpeth-stale-") as temporary:
             root = Path(temporary)
@@ -2230,6 +2336,66 @@ class ETPETHWorkloadTest(unittest.TestCase):
             with WORKLOAD.WorkspaceLock(root, recover_stale=True):
                 self.assertTrue(lock.exists())
             self.assertEqual(len(list(root.glob(".etpeth-run.lock.stale-*"))), 1)
+
+    def test_production_trials_can_use_disjoint_lock_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-etpeth-trial-lock-") as temporary:
+            output = Path(temporary)
+            first = Namespace(
+                command="run",
+                stage="production",
+                trial=[0],
+                trial_scoped_lock=True,
+            )
+            second = Namespace(
+                command="run",
+                stage="production",
+                trial=[1],
+                trial_scoped_lock=True,
+            )
+            first_root = WORKLOAD.workspace_lock_root(first, output)
+            second_root = WORKLOAD.workspace_lock_root(second, output)
+            first_root.mkdir(parents=True)
+            second_root.mkdir(parents=True)
+            with (
+                WORKLOAD.WorkspaceLock(first_root),
+                WORKLOAD.WorkspaceLock(second_root),
+            ):
+                self.assertTrue((first_root / ".etpeth-run.lock").is_file())
+                self.assertTrue((second_root / ".etpeth-run.lock").is_file())
+
+    def test_workflow_access_excludes_shared_stage_writers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dprc-access-") as temporary:
+            root = Path(temporary)
+            with WORKLOAD.WorkflowAccess(root, shared=True):
+                with WORKLOAD.WorkflowAccess(root, shared=True):
+                    pass
+                with self.assertRaisesRegex(ValueError, "incompatible"):
+                    with WORKLOAD.WorkflowAccess(root, shared=False):
+                        self.fail("exclusive writer overlapped a production trial")
+            with WORKLOAD.WorkflowAccess(root, shared=False):
+                with self.assertRaisesRegex(ValueError, "incompatible"):
+                    with WORKLOAD.WorkflowAccess(root, shared=True):
+                        self.fail("production trial overlapped an exclusive writer")
+            self.assertTrue((root / ".workflow-access.lock").is_file())
+
+    def test_trial_scoped_lock_rejects_shared_or_multi_trial_stages(self) -> None:
+        output = Path("/tmp/unused-etpeth-output")
+        for arguments in (
+            Namespace(
+                command="run",
+                stage="through-production",
+                trial=[0],
+                trial_scoped_lock=True,
+            ),
+            Namespace(
+                command="run",
+                stage="production",
+                trial=[0, 1],
+                trial_scoped_lock=True,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "exactly one --trial"):
+                WORKLOAD.workspace_lock_root(arguments, output)
 
 
 if __name__ == "__main__":

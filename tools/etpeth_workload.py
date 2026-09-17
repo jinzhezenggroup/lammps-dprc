@@ -213,6 +213,63 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class WorkflowAccess:
+    """Exclude shared-stage writers while independent production trials run.
+
+    Trial-local PID locks alone cannot conflict with a workspace-wide lock.
+    A persistent POSIX flock inode supplies that missing hierarchy: production
+    peers take shared access, whereas initialization and multi-stage runs take
+    exclusive access. Never unlink the guard file, which would split lock owners
+    across different inodes. Process exit releases the OS lock automatically.
+    """
+
+    def __init__(self, output: Path, *, shared: bool):
+        self.path = output / ".workflow-access.lock"
+        self.shared = shared
+        self.handle = None
+
+    def __enter__(self):
+        import fcntl
+
+        self.handle = self.path.open("a")
+        try:
+            fcntl.flock(self.handle, (fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            self.handle.close()
+            self.handle = None
+            raise ValueError("another workflow owns incompatible workspace access") from error
+        return self
+
+    def __exit__(self, *unused):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+def workspace_lock_root(arguments: argparse.Namespace, output: Path) -> Path:
+    """Return an isolated lock root for one explicitly selected trial.
+
+    Production trials write disjoint record, log, checkpoint, and trajectory
+    trees, so they may run concurrently after shared equilibration and NVE
+    qualification have completed. Other stages retain the workspace-wide lock
+    because they publish shared initialization state or may select many trials.
+    """
+    if not getattr(arguments, "trial_scoped_lock", False):
+        return output
+    trials = getattr(arguments, "trial", None)
+    if (
+        getattr(arguments, "command", None) != "run"
+        or getattr(arguments, "stage", None) != "production"
+        or not isinstance(trials, list)
+        or len(trials) != 1
+    ):
+        raise ValueError(
+            "--trial-scoped-lock requires --stage production and exactly one --trial"
+        )
+    trial = int(trials[0])
+    return output / "production" / f"trial-{trial}"
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     """Load the workload contract and reject an unsupported schema."""
     manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -519,6 +576,16 @@ def render_colvars(
     """Render a window restraint for sampling or transient seed generation."""
     umbrella = manifest["umbrella"]
     reaction = umbrella["reaction_coordinate"]
+    # Topology atom names are misleading here: atom 5 is the chain oxygen
+    # (paper O2'), and atom 12 is the methoxy leaving oxygen (paper O5').
+    # Honor the declared expression, including archived legacy-sign manifests.
+    expression = reaction["expression"]
+    if expression == "distance(1,12)-distance(5,1)":
+        first_pair, second_pair = (1, 12), (5, 1)
+    elif expression == "distance(5,1)-distance(1,12)":
+        first_pair, second_pair = (5, 1), (1, 12)
+    else:
+        raise ValueError(f"unsupported ETP/ETH reaction-coordinate expression: {expression}")
     angle = umbrella["attack_angle"]
     frequency = int(manifest["dynamics"]["colvars_frequency_steps"])
     a1, a2, a3 = angle["atom_ids"]
@@ -549,13 +616,13 @@ colvar {{
   name reaction_coordinate
   width 1.0
   distance {{
-    group1 {{ atomNumbers 5 }}
-    group2 {{ atomNumbers 1 }}
+    group1 {{ atomNumbers {first_pair[0]} }}
+    group2 {{ atomNumbers {first_pair[1]} }}
   }}
   distance {{
     componentCoeff -1.0
-    group1 {{ atomNumbers 1 }}
-    group2 {{ atomNumbers 12 }}
+    group1 {{ atomNumbers {second_pair[0]} }}
+    group2 {{ atomNumbers {second_pair[1]} }}
   }}
 }}
 
@@ -610,6 +677,38 @@ def generated_lammps_input_path(output: Path, name: str, content: str) -> Path:
     return output / "generated/inputs" / f"{name}-{digest}.in"
 
 
+
+def source_provenance_matches(previous: dict, current: dict) -> bool:
+    """Accept Git/snapshot relocation only for identical private input artifacts.
+
+    Git metadata describes the checkout, not the scientific input bytes.
+    Keep historical provenance intact; verify_source has already rehashed all
+    manifest inputs. Never relax final qualification, revisions, paths, licenses,
+    artifact hashes, or any unknown source field.
+    """
+    if previous == current:
+        return True
+    records = (previous, current)
+    if any(r.get("qualification") != "private-diagnostic" for r in records):
+        return False
+    if not previous.get("artifacts") or not previous.get("expected_revision"):
+        return False
+    if {r.get("identity_kind") for r in records} != {
+        "git-checkout", "artifact-verified-source-snapshot"
+    }:
+        return False
+    for record in records:
+        expected = record.get("expected_revision")
+        if record["identity_kind"] == "git-checkout":
+            if record.get("revision") != expected:
+                return False
+        elif record.get("revision") is not None:
+            return False
+    metadata = {"identity_kind", "revision", "dirty", "dirty_entries",
+                "qualification_reasons"}
+    return ({k: v for k, v in previous.items() if k not in metadata}
+            == {k: v for k, v in current.items() if k not in metadata})
+
 def prepare_workspace(
     output: Path,
     tutorial: Path,
@@ -660,6 +759,8 @@ def prepare_workspace(
         previous.pop("created_utc", None)
         comparable = dict(manifest_record)
         comparable.pop("created_utc", None)
+        if source_provenance_matches(previous.get("source", {}), source_record):
+            comparable["source"] = previous["source"]
         if previous != comparable:
             raise ValueError(
                 f"source provenance differs from existing {provenance_path}; use a new output directory"
@@ -699,6 +800,8 @@ def render_lammps_input(
     restart_checkpoint_frequency: int = 0,
     stop_on_seed_acceptance: bool = False,
     thermostat_enabled: bool = True,
+    neighbor_every: int | None = None,
+    neighbor_check: bool | None = None,
     run_commands: Sequence[str] | None = None,
     execution_directory: Path | None = None,
 ) -> str:
@@ -743,6 +846,10 @@ def render_lammps_input(
         raise ValueError("model-deviation frequency must be nonnegative")
     if restart_checkpoint_frequency < 0:
         raise ValueError("restart-checkpoint frequency must be nonnegative")
+    if neighbor_every is not None and neighbor_every < 1:
+        raise ValueError("neighbor rebuild interval must be positive")
+    if neighbor_check is not None and not isinstance(neighbor_check, bool):
+        raise TypeError("neighbor displacement check must be boolean")
     if stop_on_seed_acceptance:
         if len(run_windows) != 1:
             raise ValueError("first-hit seed stopping requires exactly one window")
@@ -774,6 +881,16 @@ def render_lammps_input(
     def path_token(path: Path) -> str:
         return ensure_lammps_token(path, relative_to=execution_directory)
     dynamics = manifest["dynamics"]
+    effective_neighbor_every = (
+        int(dynamics["neighbor_every"])
+        if neighbor_every is None
+        else int(neighbor_every)
+    )
+    effective_neighbor_check = (
+        bool(dynamics.get("neighbor_check", True))
+        if neighbor_check is None
+        else neighbor_check
+    )
     system = manifest["system"]
     xtb = manifest["xtb"]
     contract = topology_contract(manifest, mode)
@@ -1010,14 +1127,9 @@ def render_lammps_input(
         )
         + "f_restraints"
     )
-    commands.extend([
-        (
-            "fix water_shake water shake/kk 1.0e-6 200 0 b 1 a 1"
-            if kokkos_device
-            else "fix water_shake water shake 1.0e-6 200 0 b 1 a 1"
-        ),
-        "fix integrate all nve/kk" if kokkos_device else "fix integrate all nve",
-    ])
+    commands.append(
+        "fix integrate all nve/kk" if kokkos_device else "fix integrate all nve"
+    )
     if thermostat_enabled:
         commands.extend([
             (
@@ -1041,6 +1153,16 @@ def render_lammps_input(
         ),
         "fix_modify restraints energy yes",
     ])
+    # SHAKE predicts constrained positions from the forces available at its
+    # post_force callback. Langevin (and any other force-modifying fix) must
+    # therefore run first. Adding thermostat forces after SHAKE violates the
+    # water constraints and creates a spurious energy drop on switching to NVE.
+    # Keep the same ordering for host/Kokkos and all Hamiltonians.
+    commands.append(
+        "fix water_shake water shake/kk 1.0e-6 200 0 b 1 a 1"
+        if kokkos_device
+        else "fix water_shake water shake 1.0e-6 200 0 b 1 a 1"
+    )
     if stop_on_seed_acceptance:
         item = run_windows[0]
         acceptance = manifest["protocol"]["seed_acceptance"]
@@ -1081,8 +1203,8 @@ def render_lammps_input(
         f"timestep {float(dynamics['timestep_fs']):.6f}",
         f"neighbor {dynamics['neighbor_skin_angstrom']} bin",
         (
-            f"neigh_modify every {dynamics['neighbor_every']} delay 0 check "
-            f"{'yes' if dynamics.get('neighbor_check', True) else 'no'}"
+            f"neigh_modify every {effective_neighbor_every} delay 0 check "
+            f"{'yes' if effective_neighbor_check else 'no'}"
         ),
         f"thermo {dynamics['thermo_frequency_steps']}",
         f"thermo_style custom {thermo_fields}",
@@ -3788,6 +3910,8 @@ def run_invocation(
     allow_unqualified_dpa4c_models: bool = False,
     lammps_execution_backend: str = "kokkos",
     thermostat_enabled: bool = True,
+    neighbor_every: int | None = None,
+    neighbor_check: bool | None = None,
     seed_attempt: dict[str, Any] | None = None,
     process_attempt: dict[str, int] | None = None,
 ) -> Path:
@@ -3825,6 +3949,8 @@ def run_invocation(
         restart_checkpoint_frequency=restart_checkpoint_frequency,
         stop_on_seed_acceptance=stop_on_seed_acceptance,
         thermostat_enabled=thermostat_enabled,
+        neighbor_every=neighbor_every,
+        neighbor_check=neighbor_check,
     )
     input_path = generated_lammps_input_path(output, name, input_text)
     write_generated(
@@ -4069,9 +4195,15 @@ def run_invocation(
         require_zero_dangerous = manifest["protocol"]["seed_acceptance"][
             "require_zero_dangerous_builds"
         ]
-        neighbor_every = int(manifest["dynamics"]["neighbor_every"])
+        neighbor_every = int(
+            manifest["dynamics"]["neighbor_every"]
+            if neighbor_every is None
+            else neighbor_every
+        )
         neighbor_check = bool(
             manifest["dynamics"].get("neighbor_check", True)
+            if neighbor_check is None
+            else neighbor_check
         )
         if require_zero_dangerous:
             if neighbor_check:
@@ -4389,8 +4521,12 @@ def require_nve_stability_qualification(
     output: Path,
     manifest_path: Path,
     deepmd_models: Sequence[Path],
+    *,
+    mode: str = "qmmm-dpa4c",
 ) -> dict[str, Any]:
-    """Require the fixed-threshold, hash-pinned NVE gate before DPRc production."""
+    """Require the fixed-threshold, hash-pinned NVE gate for one Hamiltonian."""
+    if mode not in {"qmmm", "qmmm-dpa4c"} or (mode == "qmmm" and deepmd_models):
+        raise ValueError("inconsistent NVE qualification Hamiltonian/models")
     path = output / "qualification/nve-stability.json"
     if not path.is_file():
         raise ValueError(f"required NVE stability qualification is missing: {path}")
@@ -4400,8 +4536,10 @@ def require_nve_stability_qualification(
         raise ValueError(f"could not read NVE qualification {path}: {error}") from error
     if result.get("status") != "passed":
         raise ValueError(f"NVE stability qualification did not pass: {path}")
-    if result.get("scope") != "three-window-qmmm-dpa4c-nve-stability":
+    if result.get("scope") != f"three-window-{mode}-nve-stability":
         raise ValueError(f"unexpected NVE qualification scope in {path}")
+    if result.get("analysis_protocol", {}).get("transient_steps", 0) != 0:
+        raise ValueError("production requires full-start NVE qualification, not a discarded transient")
 
     inputs = result.get("inputs")
     if not isinstance(inputs, dict):
@@ -4933,6 +5071,9 @@ def run_stage(
     lammps_execution_backend = str(
         getattr(arguments, "lammps_execution_backend", "kokkos")
     )
+    neighbor_check_argument = getattr(arguments, "neighbor_check", None)
+    if neighbor_check_argument is not None:
+        neighbor_check_argument = neighbor_check_argument == "yes"
     validate_execution_policy(
         mode=mode,
         deepmd_plugin=deepmd_plugin,
@@ -4962,11 +5103,34 @@ def run_stage(
         "dpa4c_models_qualified": dpa4c_models_qualified,
         "allow_unqualified_dpa4c_models": allow_unqualified_dpa4c_models,
         "lammps_execution_backend": lammps_execution_backend,
+        # Optional runtime override used for a separately qualified neighbor
+        # policy.  It deliberately leaves the manifest and already accepted
+        # anchor/seed records unchanged; only newly launched chunks use it.
+        "neighbor_every": getattr(arguments, "neighbor_every", None),
+        "neighbor_check": neighbor_check_argument,
     }
 
     def accepted_anchor() -> dict[str, Any]:
+        # ``maximum_chunk_steps`` is a per-stage provenance field. The
+        # anchor is a completed one-window first-hit invocation, so changing
+        # the chunk size for a later long stage must not invalidate it.
+        anchor_path = stage_record_path(output, "anchor")
+        if anchor_path.is_file():
+            try:
+                anchor_record = json.loads(anchor_path.read_text(encoding="utf-8"))
+                anchor_chunk_steps = int(
+                    anchor_record.get("maximum_chunk_steps", arguments.chunk_steps)
+                )
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"could not read anchor chunk policy from {anchor_path}"
+                ) from error
+        else:
+            # Focused callers may inject an already-validated anchor ledger;
+            # use the requested value when no on-disk ledger is available.
+            anchor_chunk_steps = arguments.chunk_steps
         return require_completed_stage(
-            stage_record_path(output, "anchor"),
+            anchor_path,
             stage="anchor",
             windows=[anchor_window],
             expected_start_data={anchor_window.tag: initial_data},
@@ -4974,7 +5138,7 @@ def run_stage(
                 anchor_window.tag: state_output(output, "anchor", anchor_window)
             },
             total_steps=int(protocol["anchor_relaxation_steps"]),
-            maximum_chunk_steps=arguments.chunk_steps,
+            maximum_chunk_steps=anchor_chunk_steps,
             trajectory_frequency=trajectory_frequency,
             common=common,
             # The anchor is an initialization gate, not a production sample.
@@ -5374,6 +5538,25 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--library-dir", type=Path, action="append", default=[])
     run.add_argument("--cuda-visible-devices", default="0")
     run.add_argument(
+        "--neighbor-every",
+        type=int,
+        default=None,
+        metavar="STEPS",
+        help=(
+            "override the manifest neighbor-list rebuild interval for newly "
+            "launched invocations; accepted prior records remain unchanged"
+        ),
+    )
+    run.add_argument(
+        "--neighbor-check",
+        choices=("yes", "no"),
+        default=None,
+        help=(
+            "override displacement-triggered neighbor checks for newly "
+            "launched invocations"
+        ),
+    )
+    run.add_argument(
         "--lammps-execution-backend",
         choices=("host", "kokkos"),
         default="kokkos",
@@ -5421,6 +5604,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     run.add_argument("--trial", type=int, action="append")
+    run.add_argument(
+        "--trial-scoped-lock",
+        action="store_true",
+        help=(
+            "lock only the selected production-trial subtree; valid only with "
+            "--stage production and exactly one --trial, allowing independent "
+            "trials to use separate GPUs concurrently"
+        ),
+    )
     run.add_argument(
         "--seed-max-attempts",
         type=int,
@@ -5476,7 +5668,12 @@ def main() -> int:
 
         output = arguments.output.resolve()
         output.mkdir(parents=True, exist_ok=True)
-        with WorkspaceLock(output, recover_stale=arguments.recover_stale_lock):
+        lock_root = workspace_lock_root(arguments, output)
+        lock_root.mkdir(parents=True, exist_ok=True)
+        with (
+            WorkflowAccess(output, shared=bool(getattr(arguments, "trial_scoped_lock", False))),
+            WorkspaceLock(lock_root, recover_stale=arguments.recover_stale_lock),
+        ):
             windows = prepare_workspace(
                 output,
                 arguments.tutorial,
