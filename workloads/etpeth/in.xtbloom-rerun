@@ -1,0 +1,72 @@
+# Recompute production frames without integration, thermostat, constraints,
+# umbrella restraints, or DPRc.  The caller supplies partition-specific
+# data_file, trajectory, qmmm_dump, qmmm_table, mm_dump, and mm_table variables.
+
+clear
+plugin load ${dprc_plugin}
+units real
+dimension 3
+boundary p p p
+atom_style full/kk
+atom_modify map array
+newton on
+
+read_data ${data_file}
+run_style verlet/kk
+reset_timestep 0
+group qm id 1:16
+
+bond_style harmonic/kk
+angle_style harmonic/kk
+pair_style hybrid/overlay/kk lj/cut/dprc/batch 9.0 &
+  tip4p/long/dprc/batch 6 7 1 1 0.125 9.0
+include ${forcefield_file}
+pair_coeff 6*7 6*7 tip4p/long/dprc/batch
+pair_modify pair lj/cut/dprc/batch tail yes
+special_bonds amber
+kspace_style pppm/tip4p/dprc/batch 1.0e-6
+kspace_modify mesh 50 50 50 order 4 gewald 0.348831617901729
+
+# Retain the pre-fix snapshot for diagnostics only. It includes QM-dependent
+# PPPM forces, so subtracting it does NOT isolate the full electronic force.
+# The separate zero-QM-charge rerun below supplies the true classical baseline.
+fix pre_xtb all store/force
+fix qmmm qm qmmm/xtb/dprc elements P O O C H O H cutoff 9.0 charge -2 &
+  uhf 0 method gfn2 accuracy 0.001 maxiter 250 etemp 300.0 mmhardness 0.0 &
+  kmax 8 8 8 ksqmax 100
+fix_modify qmmm energy yes
+
+neighbor 0.05 bin
+neigh_modify every 1 delay 0 check yes
+thermo 1
+thermo_style custom step pe f_qmmm elong
+thermo_modify format float %.17g lost error flush yes
+
+# Double quotes defer these immediate variables until each fix-print event.
+# The rerun advances only by reading snapshots, so an output frequency of one
+# means exactly one record per accepted snapshot regardless of its timestep.
+fix qmmm_trace all print 1 &
+  "$(step:%.0f) $(pe:%.17g) $(f_qmmm:%.17g) $(elong:%.17g) 1 $(lx:%.17g) $(ly:%.17g) $(lz:%.17g) $(xy:%.17g) $(xz:%.17g) $(yz:%.17g)" &
+  file ${qmmm_table} screen no &
+  title "step energy correction elong pair_reference_mm_only lx ly lz xy xz yz"
+dump qmmm_state all custom 1 ${qmmm_dump} id type q x y z fx fy fz &
+  f_pre_xtb[1] f_pre_xtb[2] f_pre_xtb[3]
+dump_modify qmmm_state sort id pbc yes format float %.17g
+rerun ${trajectory} first 1000 every 1000 post no dump x y z box yes
+
+unfix qmmm_trace
+undump qmmm_state
+unfix qmmm
+unfix pre_xtb
+
+# The reciprocal MM reference must keep QM charges at exact zero throughout
+# the second rerun.  LAMMPS native rerun does not import charge columns.
+set group qm charge 0.0
+reset_timestep 0
+fix classical all dprc/classical/batch
+thermo_style custom step pe elong
+dump mm_state all custom 1 ${mm_dump} id type q x y z fx fy fz
+dump_modify mm_state sort id pbc yes format float %.17g
+fix mm_trace all print 1 "$(step:%.0f) $(elong:%.17g)" &
+  file ${mm_table} screen no title "step mm_elong"
+rerun ${trajectory} first 1000 every 1000 post no dump x y z box yes

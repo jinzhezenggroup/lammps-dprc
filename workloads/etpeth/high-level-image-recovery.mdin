@@ -1,0 +1,53 @@
+ETP/ETH periodic PBE0/6-31G* QM/MM binary64 relabel
+&cntrl
+  imin = 6,
+  nstlim = 0,
+  ntx = 1,
+  ntxo = 1,
+  iwrap = 1,
+  ioutfm = 1,
+  ntb = 1,
+  ntp = 0,
+  ntt = 0,
+  ntc = 2,
+  ntf = 1,
+  noshakemask = ':1-2',
+  cut = 9.0,
+  ifqnt = 1,
+  nmropt = 0,
+  ntpr = 1,
+  ntwr = 0,
+  ntwx = 0,
+  ntwf = 1,
+  ntwe = 1,
+/
+&ewald
+  dsum_tol = 1.0e-6,
+/
+&qmmm
+  qm_theory = 'QUICK',
+  qmmask = ':1-2',
+  qmcharge = -2,
+  spin = 1,
+  qmmm_int = 1,
+  qm_ewald = 1,
+  qm_pme = 1,
+  qmmm_switch = 1,
+  qmshake = 0,
+/
+&quick
+  method = 'PBE0',
+  basis = '6-31G*',
+  outfprefix = 'quick-periodic-binary64',
+  scf_cyc = 250,
+  ncyc = 251,
+  denserms = 1.0d-8,
+  intcutoff = 1.0d-8,
+  xccutoff = 1.0d-10,
+  gradcutoff = 1.0d-7,
+  basiscutoff = 1.0d-10,
+  reuse_dmx = 1,
+  keywords = '',
+  export = '',
+  debug = 1,
+/

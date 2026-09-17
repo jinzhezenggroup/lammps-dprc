@@ -1,0 +1,37 @@
+# Same-engine classical force baseline for the MM-only Coulomb pair mapping.
+# No integration, SHAKE, umbrella, thermostat, or electronic evaluation.
+# The companion archived QM/MM rerun must use identical geometry and settings.
+clear
+plugin load ${dprc_plugin}
+units real
+dimension 3
+boundary p p p
+atom_style full/kk
+atom_modify map array
+newton on
+read_data ${data_file}
+run_style verlet/kk
+reset_timestep 0
+group qm id 1:16
+set group qm charge 0.0
+bond_style harmonic/kk
+angle_style harmonic/kk
+pair_style hybrid/overlay/kk lj/cut/dprc/batch 9.0 &
+  tip4p/long/dprc/batch 6 7 1 1 0.125 9.0
+include ${forcefield_file}
+pair_coeff 6*7 6*7 tip4p/long/dprc/batch
+pair_modify pair lj/cut/dprc/batch tail yes
+special_bonds amber
+kspace_style pppm/tip4p/dprc/batch 1.0e-6
+kspace_modify mesh 50 50 50 order 4 gewald 0.348831617901729
+fix classical all dprc/classical/batch
+neighbor 0.05 bin
+neigh_modify every 1 delay 0 check yes
+thermo 1
+thermo_style custom step pe elong
+thermo_modify format float %.17g lost error flush yes
+dump mm_state all custom 1 ${mm_dump} id type q x y z fx fy fz
+dump_modify mm_state sort id pbc yes format float %.17g
+fix mm_trace all print 1 "$(step:%.0f) $(elong:%.17g)" &
+  file ${mm_table} screen no title "step mm_elong"
+rerun ${trajectory} first 1000 every 1000 post no dump x y z box yes

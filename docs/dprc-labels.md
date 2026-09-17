@@ -1,5 +1,28 @@
 # DPRc label contract
 
+## Label-recovery update (2026-09-11)
+
+The historical qualification below does not qualify the former 5000-frame
+training labels. A water-image conversion defect changed Sander's reconstructed
+TIP4P charge sites; those labels and `component-v5` models are diagnostic only.
+The repaired conversion, selected full-density QUICK qualification, and v6
+retraining status are documented in
+[Water-image label recovery](label-image-recovery-2026-09-11.md).
+The historical evidence is preserved, not silently replaced.
+
+Use the recovery numerical profile in
+[`workloads/etpeth/high-level-image-recovery.mdin`](../workloads/etpeth/high-level-image-recovery.mdin)
+with the matching source patch and geometry checks. Before consuming a QUICK
+label stream, also check its complete appended log:
+
+```bash
+python3 tools/check_quick_scf_convergence.py \
+  --log /path/to/quick-periodic-binary64.out --expected-frames 1250
+```
+
+A successful process exit or `Normal Termination` message alone is insufficient:
+QUICK can return success and emit finite labels after exhausting SCF cycles.
+
 ## Production target
 
 The correction model must learn the difference between two evaluations of the

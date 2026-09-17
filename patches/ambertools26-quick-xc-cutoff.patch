@@ -1,0 +1,93 @@
+--- a/AmberTools/src/sander/quick_module.F90
++++ b/AmberTools/src/sander/quick_module.F90
+@@ -38,7 +38,9 @@
+   type quick_nml_type
+     character(len=256) :: keywords, outfprefix
+     character(80) :: method, basis, export
+-    integer :: scf_cyc
++    ! NCYC controls the start of QUICK's incremental-density Fock updates.
++    ! A value above SCF_CYC requests full-density builds throughout the solve.
++    integer :: scf_cyc, ncyc
+     _REAL_  :: denserms, intcutoff, xccutoff, gradcutoff, basiscutoff
+     logical :: debug ! print debug output
+     logical :: reuse_dmx
+@@ -85,9 +87,11 @@
+          candidate%scf_cyc == 250 .and. &
+          candidate%denserms == 1.0d-8 .and. &
+          candidate%intcutoff == 1.0d-8 .and. &
+-         candidate%xccutoff == 1.0d-8 .and. &
+          candidate%gradcutoff == 1.0d-7 .and. &
+-         candidate%basiscutoff == 1.0d-6 .and. &
++         ((candidate%xccutoff == 1.0d-8 .and. &
++           candidate%basiscutoff == 1.0d-6 .and. candidate%ncyc == 3) .or. &
++          (candidate%xccutoff == 1.0d-10 .and. &
++           candidate%basiscutoff == 1.0d-10 .and. candidate%ncyc == 251)) .and. &
+          candidate%reuse_dmx .and. len_trim(candidate%export) == 0
+     if (.not. quick_dprc_label_configuration_is_qualified .and. &
+         qmmm_mpi%commqmmm_master) then
+@@ -284,17 +288,25 @@
+          else
+             dftkey = 'DFT '
+          end if
+-         write(keys, '(5a,i0,4(a,f0.10),a,2(i0,a))') &
++         ! The declared XC screening cutoff must reach QUICK. The second
++         ! exact label profile also disables incremental Fock accumulation,
++         ! whose screened history otherwise introduces energy-derivative noise.
++         ! Scientific acceptance tolerances remain unchanged.
++         ! Scientific notation preserves small cutoffs within QUICK's fixed
++         ! 256-character keyword interface.
++         write(keys, '(5a,i0,5(a,es15.7),a,2(i0,a))') &
+               dftkey, trim(quick_nml%method), &
+               ' BASIS=', trim(quick_nml%basis), &
+               ' SCF=', quick_nml%scf_cyc, &
+               ' DENSERMS=', quick_nml%denserms, &
+               ' CUTOFF=', quick_nml%intcutoff, &
++              ' XCCUTOFF=', quick_nml%xccutoff, &
+               ' GRADCUTOFF=', quick_nml%gradcutoff, &
+               ' BASISCUTOFF=', quick_nml%basiscutoff, &
+               ' CHARGE=', qmmm_nml%qmcharge, &
+               ' MULT=', qmmm_nml%spin, &
+               ' GRADIENT'
++         write(keys, '(a,a,i0)') trim(keys), ' NCYC=', quick_nml%ncyc
+          if (nclatoms > 0) then
+             write(keys, '(a,a)') trim(keys), ' EXTCHARGES'
+          end if
+@@ -340,12 +352,12 @@
+     ! namelist variables
+     character(len=256) :: keywords, outfprefix
+     character(80) :: method, basis, export
+-    integer :: scf_cyc, debug, reuse_dmx
++    integer :: scf_cyc, ncyc, debug, reuse_dmx
+     _REAL_  :: denserms, intcutoff, xccutoff, gradcutoff, basiscutoff
+ 
+     namelist /quick/ outfprefix, method, basis, keywords, scf_cyc, denserms, &
+                      intcutoff, xccutoff, gradcutoff, basiscutoff, debug, reuse_dmx, &
+-                     export
++                     export, ncyc
+ 
+     ! Default namelist variable values
+     outfprefix = 'quick'
+@@ -353,6 +365,7 @@
+     basis = '6-31G'
+     keywords = ''
+     scf_cyc = 200
++    ncyc = 3
+     denserms = 1.0E-6
+     intcutoff = 1.0E-8
+     xccutoff = 1.0E-8
+@@ -383,6 +396,7 @@
+     quick_nml%basis      = basis
+     quick_nml%keywords   = keywords
+     quick_nml%scf_cyc    = scf_cyc
++    quick_nml%ncyc       = ncyc
+     quick_nml%denserms   = denserms
+     quick_nml%intcutoff  = intcutoff
+     quick_nml%xccutoff   = xccutoff
+@@ -420,6 +434,7 @@
+     write(6,'(a,i0)') ' charge (from qmmm namelist): ', qmmm_nml%qmcharge
+     write(6,'(a,i0)') ' mult   (from qmmm namelist): ', qmmm_nml%spin
+     write(6,'(a,i0)') ' scf_cyc                    : ', self%scf_cyc
++    write(6,'(a,i0)') ' ncyc (delta-density start) : ', self%ncyc
+     write(6,'(a,f15.10)') ' denserms               : ', self%denserms
+     write(6,'(a,f15.10)') ' intcutoff              : ', self%intcutoff
+     write(6,'(a,f15.10)') ' xccutoff               : ', self%xccutoff

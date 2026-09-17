@@ -168,6 +168,14 @@ build tree. Those bytes and their distribution boundary are recorded below.
   one-call-per-frame guards. It is derived from the same AmberTools Sander
   sources and is covered by `LICENSES/GPL-3.0-only.txt`; no patched source or
   executable is installed or bundled.
+- Retained label-recovery extension:
+  `patches/ambertools26-quick-xc-cutoff.patch`, SHA-256
+  `7e7fb98e298d4751e3ee7d923d1185d5992757585f7d07d91cf2dbda162e0e3a`.
+  The exact input/output Sander source hashes and reviewed numerical profile
+  are in `config/quick_pbe0_label_recovery.json`. The patch forwards
+  `XCCUTOFF` and exposes `NCYC` for explicitly selected full-density SCF.
+  It derives from the same AmberTools source and is covered by
+  `LICENSES/GPL-3.0-only.txt`; the linked qualification binary remains private.
 - The independent low-level oracle links AmberTools Sander against upstream
   xTB commit `edcfbbe39d411edc225e27315fbda3a204ddb023`, whose source reports
   version 6.7.0 and is licensed LGPL-3.0-or-later. The external xTB build uses

@@ -1160,6 +1160,13 @@ if(DPRC_BUILD_TESTING)
   add_test(NAME workload.dprc_correction_io
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/dprc_correction_io_test.py")
+  foreach(script publish_xtbloom_label publish_xtbloom_labels render_xtbloom_rerun build_dpa4c_dataset
+      lammps_data_to_dprc_frames lammps_dump_to_dprc_frames check_quick_scf_convergence
+      quick_label_recovery_profile)
+    add_test(NAME workload.${script}
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/${script}_test.py")
+  endforeach()
   add_test(NAME workload.lammps_xtb_oracle_compare
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/lammps_xtb_oracle_compare_test.py")

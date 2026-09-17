@@ -39,3 +39,18 @@ SHA-256 values are pinned in `config/quick_pbe0_engine.json`. The patch is
 distributed as reviewed GPL-3.0-only derived build-system source, accompanied
 by `LICENSES/GPL-3.0-only.txt`. AmberTools/QUICK sources and binaries are not
 vendored or installed by this repository.
+
+## QUICK label cutoff forwarding and full-density SCF
+
+`ambertools26-quick-xc-cutoff.patch` applies after the retained AmberTools 26
+update.1 binary64 label interface. Its exact input/output source hashes, license,
+patch hash, numerical profile, and selected GPU checks are recorded in
+`config/quick_pbe0_label_recovery.json`.
+
+The patch forwards the previously omitted `XCCUTOFF` keyword and exposes
+QUICK's `NCYC` setting through the Sander namelist. The default remains 3;
+the recovery profile explicitly sets 251 with at most 250 SCF cycles, avoiding
+incremental Fock accumulation. It retains the original SCF/integral/gradient
+thresholds and tightens XC/basis screening to `1e-10`. No scientific acceptance
+tolerance is relaxed. The same GPL-3.0-only source-patch terms apply; neither
+AmberTools nor QUICK sources or binaries are bundled.

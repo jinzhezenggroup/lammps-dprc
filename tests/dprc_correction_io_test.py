@@ -92,6 +92,21 @@ class DPRcCorrectionIOTest(unittest.TestCase):
                 CORR.write_correction(path, correction)
             self.assertFalse(path.with_name(path.name + ".partial").exists())
 
+    def test_shared_baseline_requires_exact_reconstruction(self) -> None:
+        high = self.label(total=1e8 + 0.1, qmmm=0.1, force=2.0)
+        low = self.label(total=1e8 + 0.2, qmmm=0.2, force=1.0)
+        correction, residual = CORR.subtract_labels(
+            high, low, {1}, classical_tolerance_kcal_mol=0.0,
+            shared_classical_reference_kcal_mol=1e8,
+        )
+        self.assertEqual(correction.total_energy_kcal_mol, -0.1)
+        self.assertEqual(residual, 0.0)
+        with self.assertRaisesRegex(ValueError, "not constructed"):
+            CORR.subtract_labels(high, low._replace(total_potential_energy_kcal_mol=np.nextafter(low.total_potential_energy_kcal_mol, np.inf)),
+                                 {1}, shared_classical_reference_kcal_mol=1e8)
+        with self.assertRaisesRegex(ValueError, "differs"):
+            CORR.subtract_labels(high, low, {1}, shared_classical_reference_kcal_mol=1e8 + 1)
+
 
 if __name__ == "__main__":
     unittest.main()
