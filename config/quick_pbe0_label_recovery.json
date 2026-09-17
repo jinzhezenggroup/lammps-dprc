@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "id": "quick-pbe0-whole-water-full-density-20260911",
+  "status": "selected-label-recovery-checks-passed",
+  "source_engine_manifest": "config/quick_pbe0_engine.json",
+  "source": {
+    "version": "AmberTools 26.0.0 update.1 with the retained binary64 label interface",
+    "file": "AmberTools/src/sander/quick_module.F90",
+    "input_sha256": "590ec6feac304b2fd43c4630961e32ec4a70e058357916a1191b60c9d560f7c6",
+    "output_sha256": "7b4a11a7bb9c18c8666bbb0bbe1cb022e6b7e448e1ff7158caa4b837df752169",
+    "license": "GPL-3.0-only",
+    "license_file": "LICENSES/GPL-3.0-only.txt",
+    "review": "The source patch was inspected for cutoff forwarding, explicit NCYC namelist propagation, fixed-size keyword formatting, and the exact label-profile guard; the resulting isolated binary passed the recorded GPU gate."
+  },
+  "patch": {
+    "path": "patches/ambertools26-quick-xc-cutoff.patch",
+    "sha256": "7e7fb98e298d4751e3ee7d923d1185d5992757585f7d07d91cf2dbda162e0e3a"
+  },
+  "input": {
+    "path": "workloads/etpeth/high-level-image-recovery.mdin",
+    "sha256": "aa57ee0b93cf9a82725bc8322588e450d6abf8401230ab50046a287f390f8839"
+  },
+  "profile": {
+    "method": "PBE0",
+    "basis": "6-31G*",
+    "scf_cyc": 250,
+    "ncyc": 251,
+    "denserms": 1e-8,
+    "intcutoff": 1e-8,
+    "xccutoff": 1e-10,
+    "gradcutoff": 1e-7,
+    "basiscutoff": 1e-10,
+    "reuse_dmx": true
+  },
+  "qualification": {
+    "date": "2026-09-11",
+    "slurm_array_job": 1712,
+    "private_binary_sha256": "c56a8cdaca81035afbdec757c27bf45284103fe102de2ae8079fc349fd68c617",
+    "private_report_sha256": "07bd94a9fe363f3a09d9ac8f15dd510ab404d51bd4971911e6eed8bd9b301d9b",
+    "cold_evaluations": 12,
+    "warm_stream_evaluations": 4,
+    "force_tolerance_kcal_mol_A": 0.003,
+    "energy_image_tolerance_kcal_mol": 0.001,
+    "maximum_image_energy_error_kcal_mol": 3.3760443329811096e-9,
+    "maximum_image_force_error_kcal_mol_A": 1.7672228125320544e-9,
+    "phosphorus_derivative_errors_kcal_mol_A": {
+      "h_0.001_A": 0.00016088119070900575,
+      "h_0.0005_A": 0.00013125349130405084
+    },
+    "rigid_water_derivative_error_kcal_mol_A": 1.7473332434292388e-6,
+    "maximum_warm_cold_force_error_kcal_mol_A": 8.303783805985177e-5,
+    "SCF_convergence_checked_for_every_evaluation": true,
+    "limitation": "Selected label checks only; not an independent PBE0 oracle, model qualification, free-energy result, or performance claim."
+  },
+  "distribution": "Source patch and reviewed derived metadata only; runtime binaries and raw frames remain private."
+}

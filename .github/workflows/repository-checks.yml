@@ -45,6 +45,9 @@ jobs:
           python tests/quick_pbe0_qualification_test.py
           python tests/dprc_binary64_io_test.py
           python tests/dprc_correction_io_test.py
+          for script in publish_xtbloom_label publish_xtbloom_labels render_xtbloom_rerun build_dpa4c_dataset lammps_data_to_dprc_frames lammps_dump_to_dprc_frames check_quick_scf_convergence quick_label_recovery_profile; do
+            python "tests/${script}_test.py"
+          done
           python tests/lammps_xtb_oracle_compare_test.py
           python tests/deepmd_overlay_input_test.py
           python tests/deepmd_center_mask_input_test.py

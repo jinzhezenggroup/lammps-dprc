@@ -105,8 +105,14 @@ def subtract_labels(
     classical_tolerance_kcal_mol: float = (
         DEFAULT_CLASSICAL_CANCELLATION_TOLERANCE_KCAL_MOL
     ),
+    shared_classical_reference_kcal_mol: float | None = None,
 ) -> tuple[Correction, float]:
-    """Form a correction after exact identity and classical-cancellation gates."""
+    """Form a correction after exact identity and classical-cancellation gates.
+
+    A component-assembled producer may pass its shared classical reference.
+    This requires exact binary64 reconstruction of the normalized low total,
+    not a relaxed tolerance for subtracting large absolute energies.
+    """
     if (
         not math.isfinite(classical_tolerance_kcal_mol)
         or classical_tolerance_kcal_mol < 0.0
@@ -119,7 +125,19 @@ def subtract_labels(
     total = high.total_potential_energy_kcal_mol - low.total_potential_energy_kcal_mol
     qmmm = high.qmmm_scf_energy_kcal_mol - low.qmmm_scf_energy_kcal_mol
     residual = total - qmmm
-    if abs(residual) > classical_tolerance_kcal_mol:
+    if shared_classical_reference_kcal_mol is not None:
+        reference = float(shared_classical_reference_kcal_mol)
+        if not math.isfinite(reference):
+            raise ValueError("shared classical reference must be finite")
+        high_classical = high.total_potential_energy_kcal_mol - high.qmmm_scf_energy_kcal_mol
+        if np.float64(high_classical).tobytes() != np.float64(reference).tobytes():
+            raise ValueError("shared classical reference differs from the high-level label")
+        expected_low_total = reference + low.qmmm_scf_energy_kcal_mol
+        if np.float64(low.total_potential_energy_kcal_mol).tobytes() != np.float64(expected_low_total).tobytes():
+            raise ValueError("low-level total energy was not constructed from the shared classical reference")
+        total = qmmm
+        residual = 0.0
+    elif abs(residual) > classical_tolerance_kcal_mol:
         raise ValueError(
             "classical energy does not cancel between labels: "
             f"residual={residual:.17g} kcal/mol exceeds "
