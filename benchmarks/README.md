@@ -15,6 +15,15 @@ process.  For a partitioned sample, the denominator is the maximum synchronized
 LAMMPS loop time across windows, so startup and fast-but-idle partitions cannot
 inflate aggregate throughput.
 
+For the corrected, equilibrated production states,
+[`production_scaling.py`](production-scaling.md) measures every integer B from
+1 through 48 for QM/MM and QM/MM+DPRc. The main protocol requires both xTB and
+DeePMD inference batch sizes to equal B, rejects two-frame subcalls, and blocks
+timing on full-batch parity failures. It keeps runtime numerical qualification
+separate from clean-revision publication eligibility. The current
+[full-batch inference diagnosis](../docs/full-batch-inference-diagnosis.md)
+explains why the DPRc main matrix is not yet eligible for timing.
+
 An inventory that proves matrix completeness without launching LAMMPS is:
 
 ```bash

@@ -1142,6 +1142,9 @@ if(DPRC_BUILD_TESTING)
   add_test(NAME benchmark.etpeth_matrix
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/test_run.py")
+  add_test(NAME benchmark.production_scaling
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/test_production_scaling.py")
   add_test(NAME workload.nve_stability
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/qualify_nve_stability_test.py")

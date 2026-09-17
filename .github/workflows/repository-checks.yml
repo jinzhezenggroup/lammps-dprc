@@ -39,6 +39,7 @@ jobs:
           python tests/etpeth_workload_test.py
           python tests/qualify_nve_stability_test.py
           python benchmarks/test_run.py
+          python benchmarks/test_production_scaling.py
           python tests/deepmd_artifact_manifest_test.py
           python tests/etpeth_pmf_test.py
           python tests/dprc_labels_test.py
