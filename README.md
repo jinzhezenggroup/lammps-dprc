@@ -12,6 +12,38 @@ The reference workload is the ETP/ETH system from `../dprc-tutorial`:
 - triclinic TIP4P-Ew solvent and a 50 x 50 x 50 PPPM mesh;
 - xTBloom GFN2-xTB QM/MM followed by one DPA4c DPRc primary every step.
 
+## Citation
+
+If you use LAMMPS-DPRc for batched xTB QM/MM or multi-window umbrella sampling,
+please cite the [xTBloom preprint](https://arxiv.org/abs/2611.24807), which
+describes the LAMMPS integration. If you use the DPRc correction, please also
+cite the [original DPRc method paper](https://doi.org/10.1021/acs.jctc.1c00201).
+
+```bibtex
+@misc{lu2026xtbloom,
+  title = {{xTBloom}: {GPU} Batching for High-Throughput {GFN-xTB} Calculations},
+  author = {Lu, Zitian and Xu, Shengrui and Zhu, Tong and Gu, Qiangqiang and Zeng, Jinzhe},
+  year = {2026},
+  eprint = {2611.24807},
+  archivePrefix = {arXiv},
+  primaryClass = {physics.chem-ph},
+  url = {https://arxiv.org/abs/2611.24807}
+}
+
+@article{zeng2021dprc,
+  title = {Development of Range-Corrected Deep Learning Potentials for Fast,
+           Accurate Quantum Mechanical/Molecular Mechanical Simulations
+           of Chemical Reactions in Solution},
+  author = {Zeng, Jinzhe and Giese, Timothy J. and Ekesan, {\c S}{\"o}len and York, Darrin M.},
+  journal = {Journal of Chemical Theory and Computation},
+  year = {2021},
+  volume = {17},
+  number = {11},
+  pages = {6993--7009},
+  doi = {10.1021/acs.jctc.1c00201}
+}
+```
+
 ## Start here
 
 - [User guide](docs/user-guide.md): build, runtime compatibility, smoke tests,
